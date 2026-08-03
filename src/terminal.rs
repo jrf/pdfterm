@@ -17,12 +17,16 @@ pub struct Viewport {
     pub rows: u16,
     pub pixel_width: u16,
     pub pixel_height: u16,
+    pub top: u16,
+    pub status_row: u16,
 }
 
 impl Viewport {
-    pub fn detect() -> io::Result<Self> {
+    pub fn detect(header_rows: u16) -> io::Result<Self> {
         let size = terminal::window_size()?;
-        let content_rows = size.rows.saturating_sub(1).max(1);
+        let status_row = size.rows.saturating_sub(1);
+        let top = header_rows.min(status_row);
+        let content_rows = status_row.saturating_sub(top).max(1);
         let cell_width = if size.columns == 0 {
             8
         } else {
@@ -48,6 +52,8 @@ impl Viewport {
                 .max(size.columns.saturating_mul(cell_width))
                 .max(1),
             pixel_height: content_rows.saturating_mul(cell_height).max(1),
+            top,
+            status_row,
         })
     }
 
@@ -113,6 +119,8 @@ mod tests {
             rows: 40,
             pixel_width: 1000,
             pixel_height: 800,
+            top: 0,
+            status_row: 40,
         };
 
         assert_eq!(viewport.placement_for(600, 800), (20, 60, 40));

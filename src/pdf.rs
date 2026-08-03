@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,8 +8,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
 use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 
+pub type DocumentId = u64;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RenderKey {
+    pub document_id: DocumentId,
     pub page: u32,
     pub width: u16,
     pub height: u16,
@@ -33,20 +37,43 @@ pub struct Frame {
 
 #[derive(Debug)]
 pub enum WorkerMessage {
-    Ready { pages: u32 },
-    Opened { pages: u32 },
-    OpenError(String),
+    Ready {
+        pages: u32,
+    },
+    Opened {
+        document_id: DocumentId,
+        pages: u32,
+    },
+    OpenError {
+        document_id: DocumentId,
+        error: String,
+    },
     Frame(Frame),
     Error(String),
 }
 
 enum WorkerCommand {
-    Open(PathBuf),
+    Open {
+        document_id: DocumentId,
+        path: PathBuf,
+    },
+    Close(DocumentId),
 }
 
 enum WorkerTask {
-    Open(PathBuf),
+    Open {
+        document_id: DocumentId,
+        path: PathBuf,
+    },
+    Close(DocumentId),
     Render(RenderRequest),
+}
+
+struct WorkerChannels {
+    priority_rx: Receiver<RenderRequest>,
+    prefetch_rx: Receiver<RenderRequest>,
+    command_rx: Receiver<WorkerCommand>,
+    message_tx: Sender<WorkerMessage>,
 }
 
 pub struct RenderWorker {
@@ -58,7 +85,7 @@ pub struct RenderWorker {
 }
 
 impl RenderWorker {
-    pub fn spawn(path: PathBuf, pdfium_library: Option<PathBuf>) -> Self {
+    pub fn spawn(document_id: DocumentId, path: PathBuf, pdfium_library: Option<PathBuf>) -> Self {
         let (priority_tx, priority_rx) = unbounded();
         let (prefetch_tx, prefetch_rx) = unbounded();
         let (command_tx, command_rx) = unbounded();
@@ -69,11 +96,14 @@ impl RenderWorker {
         thread::spawn(move || {
             run_worker(
                 path,
+                document_id,
                 pdfium_library.as_deref(),
-                priority_rx,
-                prefetch_rx,
-                command_rx,
-                message_tx,
+                WorkerChannels {
+                    priority_rx,
+                    prefetch_rx,
+                    command_rx,
+                    message_tx,
+                },
                 worker_generation,
             );
         });
@@ -93,7 +123,7 @@ impl RenderWorker {
             Ok(WorkerMessage::Error(error)) => Err(error),
             Ok(
                 WorkerMessage::Opened { .. }
-                | WorkerMessage::OpenError(_)
+                | WorkerMessage::OpenError { .. }
                 | WorkerMessage::Frame(_),
             ) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
@@ -114,10 +144,14 @@ impl RenderWorker {
         self.latest_generation.store(generation, Ordering::Release);
     }
 
-    pub fn open(&self, path: PathBuf) -> Result<(), String> {
+    pub fn open(&self, document_id: DocumentId, path: PathBuf) -> Result<(), String> {
         self.command_tx
-            .send(WorkerCommand::Open(path))
+            .send(WorkerCommand::Open { document_id, path })
             .map_err(|_| "renderer stopped".into())
+    }
+
+    pub fn close(&self, document_id: DocumentId) {
+        let _ = self.command_tx.send(WorkerCommand::Close(document_id));
     }
 
     pub fn try_recv(&self) -> Result<WorkerMessage, TryRecvError> {
@@ -126,17 +160,21 @@ impl RenderWorker {
 }
 
 fn run_worker(
-    mut path: PathBuf,
+    path: PathBuf,
+    initial_document_id: DocumentId,
     pdfium_library: Option<&Path>,
-    priority_rx: Receiver<RenderRequest>,
-    prefetch_rx: Receiver<RenderRequest>,
-    command_rx: Receiver<WorkerCommand>,
-    message_tx: Sender<WorkerMessage>,
+    channels: WorkerChannels,
     latest_generation: Arc<AtomicU64>,
 ) {
+    let WorkerChannels {
+        priority_rx,
+        prefetch_rx,
+        command_rx,
+        message_tx,
+    } = channels;
     let result = (|| -> Result<(), String> {
         let pdfium = load_pdfium(pdfium_library)?;
-        let mut document = pdfium
+        let document = pdfium
             .load_pdf_from_file(&path, None)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
         let pages = u32::try_from(document.pages().len())
@@ -147,10 +185,11 @@ fn run_worker(
         message_tx
             .send(WorkerMessage::Ready { pages })
             .map_err(|_| "viewer stopped".to_string())?;
+        let mut documents = HashMap::from([(initial_document_id, document)]);
 
         loop {
             let task = match command_rx.try_recv() {
-                Ok(WorkerCommand::Open(path)) => WorkerTask::Open(path),
+                Ok(command) => command.into(),
                 Err(TryRecvError::Disconnected | TryRecvError::Empty) => match priority_rx
                     .try_recv()
                 {
@@ -160,7 +199,7 @@ fn run_worker(
                         Ok(request) => WorkerTask::Render(request),
                         Err(TryRecvError::Disconnected | TryRecvError::Empty) => select_biased! {
                             recv(command_rx) -> command => match command {
-                                Ok(WorkerCommand::Open(path)) => WorkerTask::Open(path),
+                                Ok(command) => command.into(),
                                 Err(_) => break,
                             },
                             recv(priority_rx) -> request => match request {
@@ -177,7 +216,10 @@ fn run_worker(
             };
 
             let request = match task {
-                WorkerTask::Open(new_path) => {
+                WorkerTask::Open {
+                    document_id,
+                    path: new_path,
+                } => {
                     match pdfium.load_pdf_from_file(&new_path, None) {
                         Ok(replacement) => {
                             let pages = u32::try_from(replacement.pages().len()).map_err(|_| {
@@ -186,28 +228,34 @@ fn run_worker(
                             })?;
                             if pages == 0 {
                                 message_tx
-                                    .send(WorkerMessage::OpenError(format!(
-                                        "{} has no pages",
-                                        new_path.display()
-                                    )))
+                                    .send(WorkerMessage::OpenError {
+                                        document_id,
+                                        error: format!("{} has no pages", new_path.display()),
+                                    })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             } else {
-                                document = replacement;
-                                path = new_path;
+                                documents.insert(document_id, replacement);
                                 message_tx
-                                    .send(WorkerMessage::Opened { pages })
+                                    .send(WorkerMessage::Opened { document_id, pages })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             }
                         }
                         Err(error) => {
                             message_tx
-                                .send(WorkerMessage::OpenError(format!(
-                                    "could not open {}: {error}",
-                                    new_path.display()
-                                )))
+                                .send(WorkerMessage::OpenError {
+                                    document_id,
+                                    error: format!(
+                                        "could not open {}: {error}",
+                                        new_path.display()
+                                    ),
+                                })
                                 .map_err(|_| "viewer stopped".to_string())?;
                         }
                     }
+                    continue;
+                }
+                WorkerTask::Close(document_id) => {
+                    documents.remove(&document_id);
                     continue;
                 }
                 WorkerTask::Render(request) => request,
@@ -220,6 +268,9 @@ fn run_worker(
             let page_index = i32::try_from(request.key.page).map_err(|_| {
                 format!("page {} exceeds PDFium's index range", request.key.page + 1)
             })?;
+            let Some(document) = documents.get(&request.key.document_id) else {
+                continue;
+            };
             let page = document.pages().get(page_index).map_err(|error| {
                 format!("could not load page {}: {error}", request.key.page + 1)
             })?;
@@ -272,6 +323,15 @@ fn run_worker(
 
     if let Err(error) = result {
         let _ = message_tx.send(WorkerMessage::Error(error));
+    }
+}
+
+impl From<WorkerCommand> for WorkerTask {
+    fn from(command: WorkerCommand) -> Self {
+        match command {
+            WorkerCommand::Open { document_id, path } => Self::Open { document_id, path },
+            WorkerCommand::Close(document_id) => Self::Close(document_id),
+        }
     }
 }
 

@@ -21,13 +21,14 @@ use thiserror::Error;
 
 use crate::browser::BrowserState;
 use crate::kitty::{self, Placement};
-use crate::pdf::{Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage};
+use crate::pdf::{DocumentId, Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage};
 use crate::terminal::{TerminalGuard, Viewport};
 use crate::theme::TOKYO_NIGHT_MOON;
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
+const INITIAL_DOCUMENT_ID: DocumentId = 1;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -57,7 +58,7 @@ pub fn run(
             None => return Ok(()),
         },
     };
-    let worker = RenderWorker::spawn(path.clone(), pdfium_library);
+    let worker = RenderWorker::spawn(INITIAL_DOCUMENT_ID, path.clone(), pdfium_library);
     let page_count = worker.wait_until_ready().map_err(AppError::Renderer)?;
     let watcher = FileWatcher::new(&path)?;
     let mut app = App::new(
@@ -75,8 +76,12 @@ pub fn run(
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
                 WorkerMessage::Error(error) => return Err(AppError::Renderer(error)),
                 WorkerMessage::Ready { .. } => {}
-                WorkerMessage::Opened { pages } => app.finish_open(pages, &mut output)?,
-                WorkerMessage::OpenError(error) => app.fail_open(&error, &mut output)?,
+                WorkerMessage::Opened { document_id, pages } => {
+                    app.finish_open(document_id, pages, &mut output)?
+                }
+                WorkerMessage::OpenError { document_id, error } => {
+                    app.fail_open(document_id, &error, &mut output)?
+                }
             }
         }
         app.poll_file_change(&mut output)?;
@@ -100,21 +105,34 @@ pub fn run(
 struct App {
     worker: RenderWorker,
     pending_open: Option<PendingOpen>,
-    path: PathBuf,
-    watcher: FileWatcher,
-    page_count: u32,
-    page: u32,
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    next_document_id: DocumentId,
     generation: u64,
     desired_key: Option<RenderKey>,
-    cache: HashMap<RenderKey, Arc<Frame>>,
     pending: HashSet<RenderKey>,
     visible_image_id: Option<u32>,
     next_image_id: u32,
 }
 
+struct Tab {
+    document_id: DocumentId,
+    path: PathBuf,
+    watcher: FileWatcher,
+    page_count: u32,
+    page: u32,
+    cache: HashMap<RenderKey, Arc<Frame>>,
+}
+
 enum PendingOpen {
-    Reload(FileFingerprint),
-    Selection(PathBuf),
+    Reload {
+        document_id: DocumentId,
+        fingerprint: FileFingerprint,
+    },
+    Selection {
+        document_id: DocumentId,
+        path: PathBuf,
+    },
 }
 
 impl App {
@@ -128,13 +146,18 @@ impl App {
         Self {
             worker,
             pending_open: None,
-            path,
-            watcher,
-            page_count,
-            page,
+            tabs: vec![Tab {
+                document_id: INITIAL_DOCUMENT_ID,
+                path,
+                watcher,
+                page_count,
+                page,
+                cache: HashMap::new(),
+            }],
+            active_tab: 0,
+            next_document_id: INITIAL_DOCUMENT_ID + 1,
             generation: 0,
             desired_key: None,
-            cache: HashMap::new(),
             pending: HashSet::new(),
             visible_image_id: None,
             next_image_id: 1,
@@ -145,47 +168,101 @@ impl App {
         if self.pending_open.is_some() {
             return Ok(());
         }
-        let Some(fingerprint) = self.watcher.poll(&self.path) else {
+        let change = self.tabs.iter_mut().find_map(|tab| {
+            tab.watcher
+                .poll(&tab.path)
+                .map(|fingerprint| (tab.document_id, tab.path.clone(), fingerprint))
+        });
+        let Some((document_id, path, fingerprint)) = change else {
             return Ok(());
         };
 
         self.worker
-            .open(self.path.clone())
+            .open(document_id, path)
             .map_err(AppError::Renderer)?;
-        self.pending_open = Some(PendingOpen::Reload(fingerprint));
-        self.draw_status(output, Viewport::detect()?, "reloading")?;
-        Ok(())
-    }
-
-    fn finish_open(&mut self, pages: u32, output: &mut impl Write) -> Result<(), AppError> {
-        match self.pending_open.take() {
-            Some(PendingOpen::Reload(fingerprint)) => self.watcher.accept(fingerprint),
-            Some(PendingOpen::Selection(path)) => {
-                self.path = path;
-                self.watcher = FileWatcher::new(&self.path)?;
-                self.page = 0;
-            }
-            None => {}
+        self.pending_open = Some(PendingOpen::Reload {
+            document_id,
+            fingerprint,
+        });
+        if self.tab().document_id == document_id {
+            self.draw_status(output, self.viewport()?, "reloading")?;
         }
-        self.page_count = pages;
-        self.page = self.page.min(pages - 1);
-        self.desired_key = None;
-        self.cache.clear();
-        self.pending.clear();
-        self.request_current(output)?;
         Ok(())
     }
 
-    fn fail_open(&mut self, error: &str, output: &mut impl Write) -> Result<(), AppError> {
+    fn finish_open(
+        &mut self,
+        document_id: DocumentId,
+        pages: u32,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some(pending) = self.pending_open.take() else {
+            return Ok(());
+        };
+        match pending {
+            PendingOpen::Reload {
+                document_id: expected,
+                fingerprint,
+            } if expected == document_id => {
+                let Some(index) = self.tab_index(document_id) else {
+                    return Ok(());
+                };
+                let tab = &mut self.tabs[index];
+                tab.watcher.accept(fingerprint);
+                tab.page_count = pages;
+                tab.page = tab.page.min(pages - 1);
+                tab.cache.clear();
+                if index == self.active_tab {
+                    self.reset_render_state();
+                    self.request_current(output)?;
+                }
+            }
+            PendingOpen::Selection {
+                document_id: expected,
+                path,
+            } if expected == document_id => {
+                let watcher = FileWatcher::new(&path)?;
+                self.tabs.push(Tab {
+                    document_id,
+                    path,
+                    watcher,
+                    page_count: pages,
+                    page: 0,
+                    cache: HashMap::new(),
+                });
+                self.active_tab = self.tabs.len() - 1;
+                self.reset_render_state();
+                self.request_current(output)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn fail_open(
+        &mut self,
+        document_id: DocumentId,
+        error: &str,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
         let state = match self.pending_open.take() {
-            Some(PendingOpen::Reload(_)) => {
-                self.watcher.defer(RELOAD_RETRY_DELAY);
+            Some(PendingOpen::Reload {
+                document_id: expected,
+                ..
+            }) if expected == document_id => {
+                if let Some(index) = self.tab_index(document_id) {
+                    self.tabs[index].watcher.defer(RELOAD_RETRY_DELAY);
+                }
                 format!("reload failed: {error}; retrying")
             }
-            Some(PendingOpen::Selection(_)) | None => format!("open failed: {error}"),
+            Some(PendingOpen::Selection {
+                document_id: expected,
+                ..
+            }) if expected == document_id => format!("open failed: {error}"),
+            _ => return Ok(()),
         };
         self.request_current(output)?;
-        self.draw_status(output, Viewport::detect()?, &state)?;
+        self.draw_status(output, self.viewport()?, &state)?;
         Ok(())
     }
 
@@ -193,60 +270,79 @@ impl App {
         if self.pending_open.is_some() {
             return Ok(());
         }
-        kitty::delete_all(output)?;
-        self.visible_image_id = None;
+        self.clear_viewer(output)?;
         let directory = self
+            .tab()
             .path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         match pick_pdf(directory, output)? {
-            Some(path) if path != self.path => {
-                self.worker.open(path.clone()).map_err(AppError::Renderer)?;
-                self.pending_open = Some(PendingOpen::Selection(path));
-                self.draw_status(output, Viewport::detect()?, "opening")?;
+            Some(path) => {
+                let path = path.canonicalize()?;
+                if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+                    self.active_tab = index;
+                    self.reset_render_state();
+                    self.request_current(output)?;
+                } else {
+                    let document_id = self.next_document_id;
+                    self.next_document_id = self.next_document_id.wrapping_add(1).max(1);
+                    self.worker
+                        .open(document_id, path.clone())
+                        .map_err(AppError::Renderer)?;
+                    self.pending_open = Some(PendingOpen::Selection { document_id, path });
+                    self.draw_status(output, self.viewport()?, "opening")?;
+                }
             }
-            Some(_) | None => self.request_current(output)?,
+            None => self.request_current(output)?,
         }
         Ok(())
     }
 
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('q') => return self.close_current(output),
+            KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
+            KeyCode::Tab => self.switch_tab(1, output)?,
+            KeyCode::BackTab => self.switch_tab(-1, output)?,
             KeyCode::Right
             | KeyCode::Down
             | KeyCode::PageDown
             | KeyCode::Char('j')
             | KeyCode::Char('l')
-            | KeyCode::Char(' ') => self.set_page(self.page.saturating_add(1), output)?,
+            | KeyCode::Char(' ') => self.set_page(self.tab().page.saturating_add(1), output)?,
             KeyCode::Left
             | KeyCode::Up
             | KeyCode::PageUp
             | KeyCode::Backspace
             | KeyCode::Char('h')
-            | KeyCode::Char('k') => self.set_page(self.page.saturating_sub(1), output)?,
+            | KeyCode::Char('k') => self.set_page(self.tab().page.saturating_sub(1), output)?,
             KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
-            KeyCode::Char('G') | KeyCode::End => self.set_page(self.page_count - 1, output)?,
+            KeyCode::Char('G') | KeyCode::End => {
+                self.set_page(self.tab().page_count - 1, output)?
+            }
             _ => {}
         }
         Ok(false)
     }
 
     fn set_page(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
-        let page = page.min(self.page_count - 1);
-        if page != self.page {
-            self.page = page;
+        let page = page.min(self.tab().page_count - 1);
+        if page != self.tab().page {
+            self.tab_mut().page = page;
             self.request_current(output)?;
         }
         Ok(())
     }
 
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let viewport = Viewport::detect()?;
+        let viewport = self.viewport()?;
+        self.draw_tab_bar(output)?;
+        let tab = self.tab();
         let key = RenderKey {
-            page: self.page,
+            document_id: tab.document_id,
+            page: tab.page,
             width: viewport.pixel_width,
             height: viewport.pixel_height,
         };
@@ -255,7 +351,7 @@ impl App {
         self.worker.begin_generation(self.generation);
         self.pending.clear();
 
-        if let Some(frame) = self.cache.get(&key).cloned() {
+        if let Some(frame) = self.tab().cache.get(&key).cloned() {
             self.draw_frame(&frame, viewport, output)?;
             self.prefetch_neighbors(key);
         } else {
@@ -276,13 +372,23 @@ impl App {
         let key = frame.key;
         self.pending.remove(&key);
         let frame = Arc::new(frame);
-        self.cache.insert(key, Arc::clone(&frame));
-        self.prune_cache(key);
+        let Some(index) = self.tab_index(key.document_id) else {
+            return Ok(());
+        };
+        let current_page = self.tabs[index].page;
+        self.tabs[index].cache.insert(key, Arc::clone(&frame));
+        self.tabs[index].cache.retain(|cached, _| {
+            cached.width == key.width
+                && cached.height == key.height
+                && cached.page.abs_diff(current_page) <= 1
+        });
 
         if self.desired_key == Some(key) {
-            let viewport = Viewport::detect()?;
+            let viewport = self.viewport()?;
+            let tab = self.tab();
             let current_key = RenderKey {
-                page: self.page,
+                document_id: tab.document_id,
+                page: tab.page,
                 width: viewport.pixel_width,
                 height: viewport.pixel_height,
             };
@@ -304,7 +410,7 @@ impl App {
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
 
-        execute!(output, MoveTo(left, 0))?;
+        execute!(output, MoveTo(left, viewport.top))?;
         let transfer_started = Instant::now();
         kitty::transmit_compressed_rgba(
             output,
@@ -338,24 +444,25 @@ impl App {
         state: &str,
     ) -> io::Result<()> {
         let theme = TOKYO_NIGHT_MOON;
+        let tab = self.tab();
         execute!(
             output,
-            MoveTo(0, viewport.rows),
+            MoveTo(0, viewport.status_row),
             SetBackgroundColor(theme.bg_dark),
             SetForegroundColor(theme.fg),
             Clear(ClearType::CurrentLine),
             Print(" "),
             SetForegroundColor(theme.blue),
-            Print(self.page + 1),
+            Print(tab.page + 1),
             SetForegroundColor(theme.fg_dark),
             Print("/"),
             SetForegroundColor(theme.magenta),
-            Print(self.page_count),
+            Print(tab.page_count),
             Print("  "),
             SetForegroundColor(theme.green),
             Print(state),
             SetForegroundColor(theme.comment),
-            Print("  j/k: page  g/G: first/last  f: files  q: quit"),
+            Print("  j/k: page  f: new tab  tab/S-tab: switch  q: close"),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;
@@ -363,13 +470,15 @@ impl App {
     }
 
     fn prefetch_neighbors(&mut self, key: RenderKey) {
+        let page_count = self.tab().page_count;
         for page in [key.page.checked_sub(1), key.page.checked_add(1)]
             .into_iter()
             .flatten()
-            .filter(|page| *page < self.page_count)
+            .filter(|page| *page < page_count)
         {
             let neighbor = RenderKey { page, ..key };
-            if !self.cache.contains_key(&neighbor) && self.pending.insert(neighbor) {
+            let cached = self.tab().cache.contains_key(&neighbor);
+            if !cached && self.pending.insert(neighbor) {
                 self.worker.prefetch(RenderRequest {
                     key: neighbor,
                     generation: self.generation,
@@ -378,12 +487,128 @@ impl App {
         }
     }
 
-    fn prune_cache(&mut self, current: RenderKey) {
-        self.cache.retain(|key, _| {
-            key.width == current.width
-                && key.height == current.height
-                && key.page.abs_diff(self.page) <= 1
-        });
+    fn switch_tab(&mut self, direction: i32, output: &mut impl Write) -> Result<(), AppError> {
+        if self.tabs.len() < 2 || self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.active_tab = cycled_tab_index(self.active_tab, self.tabs.len(), direction);
+        self.clear_viewer(output)?;
+        self.reset_render_state();
+        self.request_current(output)
+    }
+
+    fn close_current(&mut self, output: &mut impl Write) -> Result<bool, AppError> {
+        if self.pending_open.is_some() {
+            return Ok(false);
+        }
+        if self.tabs.len() == 1 {
+            return Ok(true);
+        }
+        let removed = self.tabs.remove(self.active_tab);
+        self.worker.close(removed.document_id);
+        if self.active_tab == self.tabs.len() {
+            self.active_tab -= 1;
+        }
+        self.clear_viewer(output)?;
+        self.reset_render_state();
+        self.request_current(output)?;
+        Ok(false)
+    }
+
+    fn clear_viewer(&mut self, output: &mut impl Write) -> io::Result<()> {
+        let theme = TOKYO_NIGHT_MOON;
+        kitty::delete_all(output)?;
+        self.visible_image_id = None;
+        execute!(
+            output,
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.fg),
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        output.flush()
+    }
+
+    fn draw_tab_bar(&self, output: &mut impl Write) -> io::Result<()> {
+        if self.tabs.len() < 2 {
+            return Ok(());
+        }
+        let theme = TOKYO_NIGHT_MOON;
+        let columns = usize::from(crossterm::terminal::size()?.0);
+        execute!(
+            output,
+            MoveTo(0, 0),
+            SetBackgroundColor(theme.bg_dark),
+            Clear(ClearType::CurrentLine)
+        )?;
+        let mut used = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let name = tab
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_else(|| tab.path.to_string_lossy());
+            let label = format!(" {}:{} ", index + 1, name);
+            let label: String = label.chars().take(columns.saturating_sub(used)).collect();
+            if label.is_empty() {
+                break;
+            }
+            if index == self.active_tab {
+                execute!(
+                    output,
+                    SetBackgroundColor(theme.bg_highlight),
+                    SetForegroundColor(theme.fg),
+                    Print(&label)
+                )?;
+            } else {
+                execute!(
+                    output,
+                    SetBackgroundColor(theme.bg_dark),
+                    SetForegroundColor(theme.fg_dark),
+                    Print(&label)
+                )?;
+            }
+            used += label.chars().count();
+        }
+        execute!(
+            output,
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.fg)
+        )?;
+        output.flush()
+    }
+
+    fn reset_render_state(&mut self) {
+        self.desired_key = None;
+        self.pending.clear();
+    }
+
+    fn viewport(&self) -> io::Result<Viewport> {
+        Viewport::detect(u16::from(self.tabs.len() > 1))
+    }
+
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    fn tab_index(&self, document_id: DocumentId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.document_id == document_id)
+    }
+}
+
+fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
+    if direction > 0 {
+        (active + 1) % len
+    } else if active == 0 {
+        len - 1
+    } else {
+        active - 1
     }
 }
 
@@ -725,7 +950,7 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        clear_picker, draw_picker, picker_rect,
+        clear_picker, cycled_tab_index, draw_picker, picker_rect,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -738,6 +963,14 @@ mod tests {
     fn page_navigation_bounds_are_saturating() {
         assert_eq!(0_u32.saturating_sub(1), 0);
         assert_eq!(u32::MAX.saturating_add(1), u32::MAX);
+    }
+
+    #[test]
+    fn tab_switching_wraps_in_both_directions() {
+        assert_eq!(cycled_tab_index(0, 3, 1), 1);
+        assert_eq!(cycled_tab_index(2, 3, 1), 0);
+        assert_eq!(cycled_tab_index(2, 3, -1), 1);
+        assert_eq!(cycled_tab_index(0, 3, -1), 2);
     }
 
     #[test]
