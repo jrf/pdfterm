@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::style::{Print, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
 use thiserror::Error;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::browser::BrowserState;
 use crate::kitty::{self, Placement};
 use crate::pdf::{Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage};
 use crate::terminal::{TerminalGuard, Viewport};
@@ -32,7 +34,7 @@ pub enum AppError {
 }
 
 pub fn run(
-    path: PathBuf,
+    path: Option<PathBuf>,
     pdfium_library: Option<PathBuf>,
     start_page: u32,
 ) -> Result<(), AppError> {
@@ -40,11 +42,18 @@ pub fn run(
         return Err(AppError::NotInteractive);
     }
 
-    let worker = RenderWorker::spawn(path.clone(), pdfium_library.clone());
-    let page_count = worker.wait_until_ready().map_err(AppError::Renderer)?;
-    let watcher = FileWatcher::new(&path)?;
     let mut output = io::stdout();
     let _terminal = TerminalGuard::enter(&mut output)?;
+    let path = match path {
+        Some(path) => path.canonicalize()?,
+        None => match pick_pdf(std::env::current_dir()?, &mut output)? {
+            Some(path) => path,
+            None => return Ok(()),
+        },
+    };
+    let worker = RenderWorker::spawn(path.clone(), pdfium_library);
+    let page_count = worker.wait_until_ready().map_err(AppError::Renderer)?;
+    let watcher = FileWatcher::new(&path)?;
     let mut app = App::new(
         worker,
         page_count,
@@ -60,8 +69,8 @@ pub fn run(
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
                 WorkerMessage::Error(error) => return Err(AppError::Renderer(error)),
                 WorkerMessage::Ready { .. } => {}
-                WorkerMessage::Reloaded { pages } => app.finish_reload(pages, &mut output)?,
-                WorkerMessage::ReloadError(error) => app.fail_reload(&error, &mut output)?,
+                WorkerMessage::Opened { pages } => app.finish_open(pages, &mut output)?,
+                WorkerMessage::OpenError(error) => app.fail_open(&error, &mut output)?,
             }
         }
         app.poll_file_change(&mut output)?;
@@ -84,8 +93,7 @@ pub fn run(
 
 struct App {
     worker: RenderWorker,
-    reload_in_flight: bool,
-    reload_fingerprint: Option<FileFingerprint>,
+    pending_open: Option<PendingOpen>,
     path: PathBuf,
     watcher: FileWatcher,
     page_count: u32,
@@ -98,6 +106,11 @@ struct App {
     next_image_id: u32,
 }
 
+enum PendingOpen {
+    Reload(FileFingerprint),
+    Selection(PathBuf),
+}
+
 impl App {
     fn new(
         worker: RenderWorker,
@@ -108,8 +121,7 @@ impl App {
     ) -> Self {
         Self {
             worker,
-            reload_in_flight: false,
-            reload_fingerprint: None,
+            pending_open: None,
             path,
             watcher,
             page_count,
@@ -124,24 +136,30 @@ impl App {
     }
 
     fn poll_file_change(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.reload_in_flight {
+        if self.pending_open.is_some() {
             return Ok(());
         }
         let Some(fingerprint) = self.watcher.poll(&self.path) else {
             return Ok(());
         };
 
-        self.worker.reload().map_err(AppError::Renderer)?;
-        self.reload_in_flight = true;
-        self.reload_fingerprint = Some(fingerprint);
+        self.worker
+            .open(self.path.clone())
+            .map_err(AppError::Renderer)?;
+        self.pending_open = Some(PendingOpen::Reload(fingerprint));
         self.draw_status(output, Viewport::detect()?, "reloading")?;
         Ok(())
     }
 
-    fn finish_reload(&mut self, pages: u32, output: &mut impl Write) -> Result<(), AppError> {
-        self.reload_in_flight = false;
-        if let Some(fingerprint) = self.reload_fingerprint.take() {
-            self.watcher.accept(fingerprint);
+    fn finish_open(&mut self, pages: u32, output: &mut impl Write) -> Result<(), AppError> {
+        match self.pending_open.take() {
+            Some(PendingOpen::Reload(fingerprint)) => self.watcher.accept(fingerprint),
+            Some(PendingOpen::Selection(path)) => {
+                self.path = path;
+                self.watcher = FileWatcher::new(&self.path)?;
+                self.page = 0;
+            }
+            None => {}
         }
         self.page_count = pages;
         self.page = self.page.min(pages - 1);
@@ -152,21 +170,46 @@ impl App {
         Ok(())
     }
 
-    fn fail_reload(&mut self, error: &str, output: &mut impl Write) -> Result<(), AppError> {
-        self.reload_in_flight = false;
-        self.reload_fingerprint = None;
-        self.watcher.defer(RELOAD_RETRY_DELAY);
-        self.draw_status(
-            output,
-            Viewport::detect()?,
-            &format!("reload failed: {error}; retrying"),
-        )?;
+    fn fail_open(&mut self, error: &str, output: &mut impl Write) -> Result<(), AppError> {
+        let state = match self.pending_open.take() {
+            Some(PendingOpen::Reload(_)) => {
+                self.watcher.defer(RELOAD_RETRY_DELAY);
+                format!("reload failed: {error}; retrying")
+            }
+            Some(PendingOpen::Selection(_)) | None => format!("open failed: {error}"),
+        };
+        self.request_current(output)?;
+        self.draw_status(output, Viewport::detect()?, &state)?;
+        Ok(())
+    }
+
+    fn open_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        if let Some(image_id) = self.visible_image_id.take() {
+            kitty::delete_image(output, image_id)?;
+        }
+        let directory = self
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        match pick_pdf(directory, output)? {
+            Some(path) if path != self.path => {
+                self.worker.open(path.clone()).map_err(AppError::Renderer)?;
+                self.pending_open = Some(PendingOpen::Selection(path));
+                self.draw_status(output, Viewport::detect()?, "opening")?;
+            }
+            Some(_) | None => self.request_current(output)?,
+        }
         Ok(())
     }
 
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('f') => self.open_picker(output)?,
             KeyCode::Right
             | KeyCode::Down
             | KeyCode::PageDown
@@ -307,7 +350,7 @@ impl App {
             SetForegroundColor(theme.green),
             Print(state),
             SetForegroundColor(theme.comment),
-            Print("  j/k: page  g/G: first/last  q: quit"),
+            Print("  j/k: page  g/G: first/last  f: files  q: quit"),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;
@@ -337,6 +380,176 @@ impl App {
                 && key.page.abs_diff(self.page) <= 1
         });
     }
+}
+
+fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBuf>, AppError> {
+    let mut browser = BrowserState::new(directory);
+    browser.preload_recursive();
+    let mut redraw = true;
+
+    loop {
+        if browser.poll_recursive() {
+            redraw = true;
+        }
+        let viewport = Viewport::detect()?;
+        let visible_height = usize::from(viewport.rows.saturating_sub(2).max(1));
+        browser.adjust_scroll(visible_height);
+        if redraw {
+            draw_picker(&browser, viewport, output)?;
+            redraw = false;
+        }
+
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            redraw = true;
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Enter => {
+                if let Some(path) = browser.enter_selected() {
+                    return Ok(Some(path));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if control => browser.select_down(),
+            KeyCode::Up | KeyCode::Char('k') if control => browser.select_up(),
+            KeyCode::Home => browser.select_first(),
+            KeyCode::End => browser.select_last(),
+            KeyCode::PageDown => browser.page_down(visible_height),
+            KeyCode::PageUp => browser.page_up(visible_height),
+            KeyCode::Backspace => {
+                browser.filter.pop();
+                browser.rebuild_filter();
+                browser.select_first();
+                browser.scroll_offset = 0;
+            }
+            KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                browser.filter.push(character);
+                browser.rebuild_filter();
+                browser.select_first();
+                browser.scroll_offset = 0;
+            }
+            _ => {}
+        }
+        redraw = true;
+    }
+}
+
+fn draw_picker(
+    browser: &BrowserState,
+    viewport: Viewport,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let theme = TOKYO_NIGHT_MOON;
+    let width = usize::from(viewport.columns);
+    execute!(
+        output,
+        SetBackgroundColor(theme.bg),
+        SetForegroundColor(theme.fg),
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        SetForegroundColor(theme.blue)
+    )?;
+    write_padded(
+        output,
+        &format!(" PDF  {}", browser.current_dir.display()),
+        width,
+    )?;
+
+    execute!(output, MoveTo(0, 1), SetForegroundColor(theme.fg_dark))?;
+    let filter = if browser.filter.is_empty() {
+        " type to filter...".to_string()
+    } else {
+        format!(" > {}", browser.filter)
+    };
+    write_padded(output, &filter, width)?;
+
+    let visible_height = usize::from(viewport.rows.saturating_sub(2).max(1));
+    let entries: Vec<_> = browser.filtered_entries().collect();
+    for row in 0..visible_height {
+        let terminal_row = u16::try_from(row).unwrap_or(u16::MAX).saturating_add(2);
+        execute!(
+            output,
+            MoveTo(0, terminal_row),
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.fg),
+            Clear(ClearType::CurrentLine)
+        )?;
+        let entry_index = browser.scroll_offset + row;
+        let Some(entry) = entries.get(entry_index) else {
+            if row == 0 && entries.is_empty() {
+                execute!(output, SetForegroundColor(theme.comment))?;
+                write_padded(output, "   No PDF files found", width)?;
+            }
+            continue;
+        };
+        let selected = entry_index == browser.selected;
+        if selected {
+            execute!(
+                output,
+                SetBackgroundColor(theme.bg_highlight),
+                SetForegroundColor(theme.fg)
+            )?;
+        } else if entry.is_dir {
+            execute!(output, SetForegroundColor(theme.blue))?;
+        }
+        let marker = if selected { " > " } else { "   " };
+        write_padded(output, &format!("{marker}{}", entry.name), width)?;
+    }
+
+    execute!(
+        output,
+        MoveTo(0, viewport.rows),
+        SetBackgroundColor(theme.bg_dark),
+        SetForegroundColor(theme.comment),
+        Clear(ClearType::CurrentLine)
+    )?;
+    let hint = if browser.recursive_loading() {
+        " enter: open  esc: close  ctrl-j/k: move  loading..."
+    } else {
+        " enter: open  esc: close  ctrl-j/k: move"
+    };
+    write_padded(output, hint, width)?;
+    execute!(
+        output,
+        SetBackgroundColor(theme.bg),
+        SetForegroundColor(theme.fg)
+    )?;
+    output.flush()
+}
+
+fn write_padded(output: &mut impl Write, text: &str, width: usize) -> io::Result<()> {
+    let (text, used_width) = truncate_to_width(text, width);
+    execute!(output, Print(text), Print(" ".repeat(width - used_width)))
+}
+
+fn truncate_to_width(text: &str, width: usize) -> (String, usize) {
+    if UnicodeWidthStr::width(text) <= width {
+        return (text.to_string(), UnicodeWidthStr::width(text));
+    }
+    if width == 0 {
+        return (String::new(), 0);
+    }
+
+    let target = width - 1;
+    let mut result = String::new();
+    let mut used_width = 0;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used_width + character_width > target {
+            break;
+        }
+        result.push(character);
+        used_width += character_width;
+    }
+    result.push('…');
+    (result, used_width + 1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

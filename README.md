@@ -2,7 +2,7 @@
 
 `pdfterm` is a low-latency PDF viewer for Kitty terminals. It renders on the machine where the command runs, compresses each page once, and sends the bitmap through Kitty's graphics protocol. Direct SSH sessions need no local helper.
 
-The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads the document automatically when the PDF changes while preserving the current page.
+The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads the document automatically when the PDF changes while preserving the current page. Run it without a path or press `f` to open a fuzzy PDF picker.
 
 ## Requirements
 
@@ -29,12 +29,13 @@ cargo build --release
 ## Run
 
 ```console
+pdfterm
 pdfterm document.pdf
 ```
 
 Use `--pdfium-library PATH` to override the embedded PDFium library.
 
-Keys: `j`, `l`, arrows, space, or Page Down move forward. `k`, `h`, arrows, Backspace, or Page Up move backward. `g` and `G` jump to the first and last pages. `q` or Escape quits.
+Keys: `j`, `l`, arrows, space, or Page Down move forward. `k`, `h`, arrows, Backspace, or Page Up move backward. `g` and `G` jump to the first and last pages. `f` opens the file picker. `q` or Escape quits.
 
 ## Checks
 

@@ -6,8 +6,8 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PDF file to open.
-    path: PathBuf,
+    /// PDF file to open. Omit to open the file picker.
+    path: Option<PathBuf>,
 
     /// Path to libpdfium.dylib, libpdfium.so, or pdfium.dll.
     #[arg(long)]
