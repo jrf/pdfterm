@@ -8,7 +8,9 @@ use std::time::{Duration, Instant, SystemTime};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::style::{Print, SetBackgroundColor, SetForegroundColor};
+use crossterm::style::{
+    Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::terminal::{Clear, ClearType};
 use thiserror::Error;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -187,9 +189,8 @@ impl App {
         if self.pending_open.is_some() {
             return Ok(());
         }
-        if let Some(image_id) = self.visible_image_id.take() {
-            kitty::delete_image(output, image_id)?;
-        }
+        kitty::delete_all(output)?;
+        self.visible_image_id = None;
         let directory = self
             .path
             .parent()
@@ -392,7 +393,7 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
             redraw = true;
         }
         let viewport = Viewport::detect()?;
-        let visible_height = usize::from(viewport.rows.saturating_sub(2).max(1));
+        let visible_height = picker_rect(viewport).visible_height();
         browser.adjust_scroll(visible_height);
         if redraw {
             draw_picker(&browser, viewport, output)?;
@@ -409,6 +410,10 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if apply_picker_navigation(&mut browser, key, visible_height) {
+            redraw = true;
+            continue;
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => return Ok(None),
@@ -417,12 +422,6 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
                     return Ok(Some(path));
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') if control => browser.select_down(),
-            KeyCode::Up | KeyCode::Char('k') if control => browser.select_up(),
-            KeyCode::Home => browser.select_first(),
-            KeyCode::End => browser.select_last(),
-            KeyCode::PageDown => browser.page_down(visible_height),
-            KeyCode::PageUp => browser.page_up(visible_height),
             KeyCode::Backspace => {
                 browser.filter.pop();
                 browser.rebuild_filter();
@@ -441,87 +440,193 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
     }
 }
 
+fn apply_picker_navigation(
+    browser: &mut BrowserState,
+    key: KeyEvent,
+    visible_height: usize,
+) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Down => browser.select_down(),
+        KeyCode::Up => browser.select_up(),
+        KeyCode::Char('j') if control => browser.select_down(),
+        KeyCode::Char('k') if control => browser.select_up(),
+        KeyCode::Home => browser.select_first(),
+        KeyCode::End => browser.select_last(),
+        KeyCode::PageDown => browser.page_down(visible_height),
+        KeyCode::PageUp => browser.page_up(visible_height),
+        _ => return false,
+    }
+    true
+}
+
 fn draw_picker(
     browser: &BrowserState,
     viewport: Viewport,
     output: &mut impl Write,
 ) -> io::Result<()> {
     let theme = TOKYO_NIGHT_MOON;
-    let width = usize::from(viewport.columns);
+    let popup = picker_rect(viewport);
+    let inner_width = usize::from(popup.width.saturating_sub(2));
     execute!(
         output,
         SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.fg),
-        Clear(ClearType::All),
-        MoveTo(0, 0),
-        SetForegroundColor(theme.blue)
-    )?;
-    write_padded(
-        output,
-        &format!(" PDF  {}", browser.current_dir.display()),
-        width,
+        Clear(ClearType::All)
     )?;
 
-    execute!(output, MoveTo(0, 1), SetForegroundColor(theme.fg_dark))?;
+    let title = format!(" {} ", browser.current_dir.display());
+    let (title, title_width) = truncate_to_width(&title, inner_width);
+    execute!(
+        output,
+        MoveTo(popup.x, popup.y),
+        SetForegroundColor(theme.blue),
+        SetAttribute(Attribute::Bold),
+        Print("┌"),
+        Print(title),
+        Print("─".repeat(inner_width.saturating_sub(title_width))),
+        Print("┐"),
+        SetAttribute(Attribute::Reset)
+    )?;
+
     let filter = if browser.filter.is_empty() {
         " type to filter...".to_string()
     } else {
         format!(" > {}", browser.filter)
     };
-    write_padded(output, &filter, width)?;
+    draw_picker_row(output, popup, 0, &filter, theme.fg_dark, theme.bg)?;
 
-    let visible_height = usize::from(viewport.rows.saturating_sub(2).max(1));
+    let visible_height = popup.visible_height();
     let entries: Vec<_> = browser.filtered_entries().collect();
     for row in 0..visible_height {
-        let terminal_row = u16::try_from(row).unwrap_or(u16::MAX).saturating_add(2);
-        execute!(
-            output,
-            MoveTo(0, terminal_row),
-            SetBackgroundColor(theme.bg),
-            SetForegroundColor(theme.fg),
-            Clear(ClearType::CurrentLine)
-        )?;
         let entry_index = browser.scroll_offset + row;
         let Some(entry) = entries.get(entry_index) else {
             if row == 0 && entries.is_empty() {
-                execute!(output, SetForegroundColor(theme.comment))?;
-                write_padded(output, "   No PDF files found", width)?;
+                let message = if browser.filter.is_empty() {
+                    "   No PDF files found"
+                } else {
+                    "   No matches"
+                };
+                draw_picker_row(output, popup, row + 1, message, theme.comment, theme.bg)?;
+            } else {
+                draw_picker_row(output, popup, row + 1, "", theme.fg, theme.bg)?;
             }
             continue;
         };
         let selected = entry_index == browser.selected;
-        if selected {
-            execute!(
-                output,
-                SetBackgroundColor(theme.bg_highlight),
-                SetForegroundColor(theme.fg)
-            )?;
+        let foreground = if selected {
+            theme.fg
         } else if entry.is_dir {
-            execute!(output, SetForegroundColor(theme.blue))?;
-        }
+            theme.blue
+        } else {
+            theme.fg
+        };
+        let background = if selected {
+            theme.bg_highlight
+        } else {
+            theme.bg
+        };
         let marker = if selected { " > " } else { "   " };
-        write_padded(output, &format!("{marker}{}", entry.name), width)?;
+        draw_picker_row(
+            output,
+            popup,
+            row + 1,
+            &format!("{marker}{}", entry.name),
+            foreground,
+            background,
+        )?;
     }
 
-    execute!(
-        output,
-        MoveTo(0, viewport.rows),
-        SetBackgroundColor(theme.bg_dark),
-        SetForegroundColor(theme.comment),
-        Clear(ClearType::CurrentLine)
-    )?;
     let hint = if browser.recursive_loading() {
-        " enter: open  esc: close  ctrl-j/k: move  loading..."
+        " enter:open  esc:close  (loading...)"
     } else {
-        " enter: open  esc: close  ctrl-j/k: move"
+        " enter:open  esc:close"
     };
-    write_padded(output, hint, width)?;
+    draw_picker_row(
+        output,
+        popup,
+        usize::from(popup.height.saturating_sub(3)),
+        hint,
+        theme.comment,
+        theme.bg,
+    )?;
     execute!(
         output,
+        MoveTo(popup.x, popup.y + popup.height - 1),
+        SetForegroundColor(theme.blue),
+        Print("└"),
+        Print("─".repeat(inner_width)),
+        Print("┘"),
         SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.fg)
     )?;
     output.flush()
+}
+
+#[derive(Clone, Copy)]
+struct PickerRect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl PickerRect {
+    fn visible_height(self) -> usize {
+        usize::from(self.height.saturating_sub(4).max(1))
+    }
+}
+
+fn picker_rect(viewport: Viewport) -> PickerRect {
+    let terminal_height = viewport.rows.saturating_add(1);
+    let width = if viewport.columns > 4 {
+        (viewport.columns * 3 / 4).max(50).min(viewport.columns - 4)
+    } else {
+        viewport.columns.max(1)
+    };
+    let height = if terminal_height > 4 {
+        (terminal_height * 3 / 4).max(6).min(terminal_height - 2)
+    } else {
+        terminal_height.max(1)
+    };
+    PickerRect {
+        x: viewport.columns.saturating_sub(width) / 2,
+        y: terminal_height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn draw_picker_row(
+    output: &mut impl Write,
+    popup: PickerRect,
+    inner_row: usize,
+    text: &str,
+    foreground: Color,
+    background: Color,
+) -> io::Result<()> {
+    let row = popup
+        .y
+        .saturating_add(1)
+        .saturating_add(u16::try_from(inner_row).unwrap_or(u16::MAX));
+    let right = popup.x.saturating_add(popup.width.saturating_sub(1));
+    execute!(
+        output,
+        MoveTo(popup.x, row),
+        SetBackgroundColor(TOKYO_NIGHT_MOON.bg),
+        SetForegroundColor(TOKYO_NIGHT_MOON.blue),
+        Print("│"),
+        SetBackgroundColor(background),
+        SetForegroundColor(foreground)
+    )?;
+    write_padded(output, text, usize::from(popup.width.saturating_sub(2)))?;
+    execute!(
+        output,
+        MoveTo(right, row),
+        SetBackgroundColor(TOKYO_NIGHT_MOON.bg),
+        SetForegroundColor(TOKYO_NIGHT_MOON.blue),
+        Print("│")
+    )
 }
 
 fn write_padded(output: &mut impl Write, text: &str, width: usize) -> io::Result<()> {
@@ -637,7 +742,11 @@ impl FileWatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{FILE_STABLE_FOR, FileFingerprint, FileWatcher};
+    use super::{
+        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fs;
     use std::time::{Duration, Instant, SystemTime};
 
     #[test]
@@ -670,5 +779,26 @@ mod tests {
         );
         watcher.accept(changed);
         assert_eq!(watcher.observe(changed, started + FILE_STABLE_FOR), None);
+    }
+
+    #[test]
+    fn picker_plain_arrow_keys_change_selection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("one.pdf"), b"synthetic").expect("first PDF");
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+
+        assert_eq!(browser.selected, 0);
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            10,
+        ));
+        assert_eq!(browser.selected, 1);
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            10,
+        ));
+        assert_eq!(browser.selected, 0);
     }
 }
