@@ -1,0 +1,20 @@
+[package]
+name = "pdfterm"
+version = "0.1.0"
+edition = "2024"
+description = "A low-latency PDF viewer for Kitty terminals"
+license = "MIT"
+
+[dependencies]
+base64 = "0.23.0"
+clap = { version = "4.6.5", features = ["derive"] }
+crossterm = "0.29.0"
+crossbeam-channel = "0.5.15"
+flate2 = "1.1.9"
+pdfium-render = { version = "0.9.3", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+thiserror = "2.0.17"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

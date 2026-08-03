@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pdfium_revision=7881
+os=$(uname -s)
+arch=$(uname -m)
+
+case "$os/$arch" in
+  Darwin/arm64) asset=pdfium-mac-arm64 ;;
+  Linux/x86_64) asset=pdfium-linux-x64 ;;
+  Linux/aarch64|Linux/arm64) asset=pdfium-linux-arm64 ;;
+  *)
+    echo "unsupported platform: $os/$arch" >&2
+    exit 1
+    ;;
+esac
+
+pdfium_tmp=$(mktemp -d)
+trap 'rm -rf "$pdfium_tmp"' EXIT
+archive="$pdfium_tmp/$asset.tgz"
+url="https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F$pdfium_revision/$asset.tgz"
+
+curl --fail-with-body --location "$url" --output "$archive"
+mkdir -p target/pdfium
+tar -xzf "$archive" -C target/pdfium
+
+echo "PDFium $pdfium_revision extracted to target/pdfium/lib"
+

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scripts/lint
+scripts/test
+cargo build --release
+
