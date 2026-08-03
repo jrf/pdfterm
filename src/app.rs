@@ -390,24 +390,19 @@ impl App {
 fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBuf>, AppError> {
     let mut browser = BrowserState::new(directory);
     browser.preload_recursive();
-    let backend = CrosstermBackend::new(output);
+    let backend = CrosstermBackend::new(&mut *output);
     let mut terminal = Terminal::new(backend)?;
     let mut redraw = true;
     let mut visible_height = 1;
 
-    loop {
+    let selection = loop {
         if browser.poll_recursive() {
             redraw = true;
         }
         if redraw {
             terminal.autoresize()?;
             let area = terminal.size()?;
-            visible_height = usize::from(
-                picker_rect(area.into(), browser.filtered_indices.len())
-                    .height
-                    .saturating_sub(4)
-                    .max(1),
-            );
+            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
             browser.adjust_scroll(visible_height);
             terminal.draw(|frame| draw_picker(frame, &browser))?;
             redraw = false;
@@ -433,10 +428,10 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => return Ok(None),
+            KeyCode::Esc => break None,
             KeyCode::Enter => {
                 if let Some(path) = browser.enter_selected() {
-                    return Ok(Some(path));
+                    break Some(path);
                 }
             }
             KeyCode::Backspace => {
@@ -454,7 +449,22 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
             _ => {}
         }
         redraw = true;
-    }
+    };
+    drop(terminal);
+    clear_picker(output)?;
+    Ok(selection)
+}
+
+fn clear_picker(output: &mut impl Write) -> io::Result<()> {
+    let theme = TOKYO_NIGHT_MOON;
+    execute!(
+        output,
+        SetBackgroundColor(theme.bg),
+        SetForegroundColor(theme.fg),
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
+    output.flush()
 }
 
 fn apply_picker_navigation(
@@ -481,7 +491,7 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
     let theme = TOKYO_NIGHT_MOON;
     let entries: Vec<_> = browser.filtered_entries().collect();
     let area = frame.area();
-    let popup = picker_rect(area, entries.len());
+    let popup = picker_rect(area);
     frame.render_widget(
         Block::default().style(Style::default().bg(picker_color(theme.bg))),
         area,
@@ -593,19 +603,14 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
     );
 }
 
-fn picker_rect(area: Rect, entry_count: usize) -> Rect {
+fn picker_rect(area: Rect) -> Rect {
     let width = if area.width > 4 {
         (area.width * 3 / 4).max(50).min(area.width - 4)
     } else {
         area.width.max(1)
     };
     let height = if area.height > 4 {
-        let maximum = (area.height * 3 / 4).max(6).min(area.height - 2);
-        u16::try_from(entry_count)
-            .unwrap_or(u16::MAX)
-            .saturating_add(4)
-            .max(6)
-            .min(maximum)
+        (area.height * 3 / 4).max(6).min(area.height - 2)
     } else {
         area.height.max(1)
     };
@@ -720,7 +725,7 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        draw_picker, picker_rect,
+        clear_picker, draw_picker, picker_rect,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -783,11 +788,10 @@ mod tests {
     }
 
     #[test]
-    fn picker_height_tracks_content_and_stays_capped() {
+    fn picker_uses_mdr_three_quarter_layout() {
         let area = Rect::new(0, 0, 100, 40);
 
-        assert_eq!(picker_rect(area, 7), Rect::new(12, 14, 75, 11));
-        assert_eq!(picker_rect(area, 100), Rect::new(12, 5, 75, 30));
+        assert_eq!(picker_rect(area), Rect::new(12, 5, 75, 30));
     }
 
     #[test]
@@ -797,7 +801,7 @@ mod tests {
         fs::create_dir(&nested).expect("nested directory");
         let browser = BrowserState::new(nested);
         let area = Rect::new(0, 0, 80, 30);
-        let popup = picker_rect(area, browser.filtered_indices.len());
+        let popup = picker_rect(area);
         let mut terminal =
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
@@ -812,5 +816,14 @@ mod tests {
         assert_eq!(buffer[(right, popup.y)].symbol(), "┐");
         assert_eq!(buffer[(popup.x, bottom)].symbol(), "└");
         assert_eq!(buffer[(right, bottom)].symbol(), "┘");
+    }
+
+    #[test]
+    fn closing_picker_clears_its_terminal_buffer() {
+        let mut output = Vec::new();
+
+        clear_picker(&mut output).expect("clear picker");
+
+        assert!(output.windows(4).any(|window| window == b"\x1b[2J"));
     }
 }
