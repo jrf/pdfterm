@@ -7,7 +7,7 @@
 
 ## Next
 
-- [ ] Package the release binary with PDFium for macOS arm64 and Linux x86_64/aarch64. #chore
+- [ ] Publish release archives for macOS arm64 and Linux x86_64/aarch64. #chore
 - [ ] Add zoom and viewport panning without rerendering unchanged pages. #feature
 
 ## Later
@@ -20,7 +20,7 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 
 ## Done
 
+- [x] Embed checksummed PDFium builds for one-command Cargo installation. #chore
 - [x] Render fitted pages through PDFium on a background worker. #feature
 - [x] Send zlib-compressed RGBA data through Kitty's chunked graphics protocol. #feature
 - [x] Cache adjacent pages and prioritize foreground render requests. #improvement
-

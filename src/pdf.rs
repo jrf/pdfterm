@@ -219,12 +219,17 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
             .and_then(|path| Pdfium::bind_to_library(path).ok())
         {
             Some(bindings) => bindings,
-            None => Pdfium::bind_to_system_library().map_err(|error| {
-                format!(
-                    "could not load {}: place it beside pdfterm, install it system-wide, or pass --pdfium-library: {error}",
-                    Pdfium::pdfium_platform_library_name().to_string_lossy()
-                )
-            })?,
+            None => {
+                let embedded = crate::embedded_pdfium::materialize().map_err(|error| {
+                    format!("could not extract embedded PDFium to the user cache: {error}")
+                })?;
+                Pdfium::bind_to_library(&embedded).map_err(|embedded_error| {
+                    format!(
+                        "could not load embedded PDFium from {}: {embedded_error}",
+                        embedded.display()
+                    )
+                })?
+            }
         }
     };
 
