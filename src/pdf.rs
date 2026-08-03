@@ -34,13 +34,20 @@ pub struct Frame {
 #[derive(Debug)]
 pub enum WorkerMessage {
     Ready { pages: u32 },
+    Reloaded { pages: u32 },
+    ReloadError(String),
     Frame(Frame),
     Error(String),
+}
+
+enum WorkerCommand {
+    Reload,
 }
 
 pub struct RenderWorker {
     priority_tx: Sender<RenderRequest>,
     prefetch_tx: Sender<RenderRequest>,
+    command_tx: Sender<WorkerCommand>,
     message_rx: Receiver<WorkerMessage>,
     latest_generation: Arc<AtomicU64>,
 }
@@ -49,6 +56,7 @@ impl RenderWorker {
     pub fn spawn(path: PathBuf, pdfium_library: Option<PathBuf>) -> Self {
         let (priority_tx, priority_rx) = unbounded();
         let (prefetch_tx, prefetch_rx) = unbounded();
+        let (command_tx, command_rx) = unbounded();
         let (message_tx, message_rx) = unbounded();
         let latest_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = Arc::clone(&latest_generation);
@@ -59,6 +67,7 @@ impl RenderWorker {
                 pdfium_library.as_deref(),
                 priority_rx,
                 prefetch_rx,
+                command_rx,
                 message_tx,
                 worker_generation,
             );
@@ -67,6 +76,7 @@ impl RenderWorker {
         Self {
             priority_tx,
             prefetch_tx,
+            command_tx,
             message_rx,
             latest_generation,
         }
@@ -76,9 +86,11 @@ impl RenderWorker {
         match self.message_rx.recv() {
             Ok(WorkerMessage::Ready { pages }) => Ok(pages),
             Ok(WorkerMessage::Error(error)) => Err(error),
-            Ok(WorkerMessage::Frame(_)) => {
-                Err("renderer sent a frame before initialization".into())
-            }
+            Ok(
+                WorkerMessage::Reloaded { .. }
+                | WorkerMessage::ReloadError(_)
+                | WorkerMessage::Frame(_),
+            ) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
         }
     }
@@ -97,6 +109,12 @@ impl RenderWorker {
         self.latest_generation.store(generation, Ordering::Release);
     }
 
+    pub fn reload(&self) -> Result<(), String> {
+        self.command_tx
+            .send(WorkerCommand::Reload)
+            .map_err(|_| "renderer stopped".into())
+    }
+
     pub fn try_recv(&self) -> Result<WorkerMessage, TryRecvError> {
         self.message_rx.try_recv()
     }
@@ -107,12 +125,13 @@ fn run_worker(
     pdfium_library: Option<&Path>,
     priority_rx: Receiver<RenderRequest>,
     prefetch_rx: Receiver<RenderRequest>,
+    command_rx: Receiver<WorkerCommand>,
     message_tx: Sender<WorkerMessage>,
     latest_generation: Arc<AtomicU64>,
 ) {
     let result = (|| -> Result<(), String> {
         let pdfium = load_pdfium(pdfium_library)?;
-        let document = pdfium
+        let mut document = pdfium
             .load_pdf_from_file(path, None)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
         let pages = u32::try_from(document.pages().len())
@@ -125,12 +144,64 @@ fn run_worker(
             .map_err(|_| "viewer stopped".to_string())?;
 
         loop {
+            if let Ok(WorkerCommand::Reload) = command_rx.try_recv() {
+                match pdfium.load_pdf_from_file(path, None) {
+                    Ok(replacement) => {
+                        let pages = u32::try_from(replacement.pages().len()).map_err(|_| {
+                            "PDFium returned a negative page count while reloading".to_string()
+                        })?;
+                        if pages == 0 {
+                            message_tx
+                                .send(WorkerMessage::ReloadError(format!(
+                                    "{} has no pages",
+                                    path.display()
+                                )))
+                                .map_err(|_| "viewer stopped".to_string())?;
+                        } else {
+                            document = replacement;
+                            message_tx
+                                .send(WorkerMessage::Reloaded { pages })
+                                .map_err(|_| "viewer stopped".to_string())?;
+                        }
+                    }
+                    Err(error) => {
+                        message_tx
+                            .send(WorkerMessage::ReloadError(format!(
+                                "could not open {}: {error}",
+                                path.display()
+                            )))
+                            .map_err(|_| "viewer stopped".to_string())?;
+                    }
+                }
+                continue;
+            }
+
             let request = match priority_rx.try_recv() {
                 Ok(request) => request,
                 Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => match prefetch_rx.try_recv() {
                     Ok(request) => request,
                     Err(TryRecvError::Disconnected | TryRecvError::Empty) => select_biased! {
+                        recv(command_rx) -> command => match command {
+                            Ok(WorkerCommand::Reload) => {
+                                match pdfium.load_pdf_from_file(path, None) {
+                                    Ok(replacement) => {
+                                        let pages = u32::try_from(replacement.pages().len()).map_err(|_| "PDFium returned a negative page count while reloading".to_string())?;
+                                        if pages == 0 {
+                                            message_tx.send(WorkerMessage::ReloadError(format!("{} has no pages", path.display()))).map_err(|_| "viewer stopped".to_string())?;
+                                        } else {
+                                            document = replacement;
+                                            message_tx.send(WorkerMessage::Reloaded { pages }).map_err(|_| "viewer stopped".to_string())?;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        message_tx.send(WorkerMessage::ReloadError(format!("could not open {}: {error}", path.display()))).map_err(|_| "viewer stopped".to_string())?;
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(_) => break,
+                        },
                         recv(priority_rx) -> request => match request {
                             Ok(request) => request,
                             Err(_) => break,

@@ -20,6 +20,7 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 
 ## Done
 
+- [x] Reload changed PDFs without interrupting navigation or displaying partial writes. #feature
 - [x] Embed checksummed PDFium builds for one-command Cargo installation. #chore
 - [x] Render fitted pages through PDFium on a background worker. #feature
 - [x] Send zlib-compressed RGBA data through Kitty's chunked graphics protocol. #feature

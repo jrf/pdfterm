@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -15,6 +16,10 @@ use crate::kitty::{self, Placement};
 use crate::pdf::{Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage};
 use crate::terminal::{TerminalGuard, Viewport};
 use crate::theme::TOKYO_NIGHT_MOON;
+
+const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
+const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -35,11 +40,18 @@ pub fn run(
         return Err(AppError::NotInteractive);
     }
 
-    let worker = RenderWorker::spawn(path, pdfium_library);
+    let worker = RenderWorker::spawn(path.clone(), pdfium_library.clone());
     let page_count = worker.wait_until_ready().map_err(AppError::Renderer)?;
+    let watcher = FileWatcher::new(&path)?;
     let mut output = io::stdout();
     let _terminal = TerminalGuard::enter(&mut output)?;
-    let mut app = App::new(worker, page_count, start_page.min(page_count - 1));
+    let mut app = App::new(
+        worker,
+        page_count,
+        start_page.min(page_count - 1),
+        path,
+        watcher,
+    );
     app.request_current(&mut output)?;
 
     loop {
@@ -48,8 +60,11 @@ pub fn run(
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
                 WorkerMessage::Error(error) => return Err(AppError::Renderer(error)),
                 WorkerMessage::Ready { .. } => {}
+                WorkerMessage::Reloaded { pages } => app.finish_reload(pages, &mut output)?,
+                WorkerMessage::ReloadError(error) => app.fail_reload(&error, &mut output)?,
             }
         }
+        app.poll_file_change(&mut output)?;
 
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
@@ -69,6 +84,10 @@ pub fn run(
 
 struct App {
     worker: RenderWorker,
+    reload_in_flight: bool,
+    reload_fingerprint: Option<FileFingerprint>,
+    path: PathBuf,
+    watcher: FileWatcher,
     page_count: u32,
     page: u32,
     generation: u64,
@@ -80,9 +99,19 @@ struct App {
 }
 
 impl App {
-    fn new(worker: RenderWorker, page_count: u32, page: u32) -> Self {
+    fn new(
+        worker: RenderWorker,
+        page_count: u32,
+        page: u32,
+        path: PathBuf,
+        watcher: FileWatcher,
+    ) -> Self {
         Self {
             worker,
+            reload_in_flight: false,
+            reload_fingerprint: None,
+            path,
+            watcher,
             page_count,
             page,
             generation: 0,
@@ -92,6 +121,47 @@ impl App {
             visible_image_id: None,
             next_image_id: 1,
         }
+    }
+
+    fn poll_file_change(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.reload_in_flight {
+            return Ok(());
+        }
+        let Some(fingerprint) = self.watcher.poll(&self.path) else {
+            return Ok(());
+        };
+
+        self.worker.reload().map_err(AppError::Renderer)?;
+        self.reload_in_flight = true;
+        self.reload_fingerprint = Some(fingerprint);
+        self.draw_status(output, Viewport::detect()?, "reloading")?;
+        Ok(())
+    }
+
+    fn finish_reload(&mut self, pages: u32, output: &mut impl Write) -> Result<(), AppError> {
+        self.reload_in_flight = false;
+        if let Some(fingerprint) = self.reload_fingerprint.take() {
+            self.watcher.accept(fingerprint);
+        }
+        self.page_count = pages;
+        self.page = self.page.min(pages - 1);
+        self.desired_key = None;
+        self.cache.clear();
+        self.pending.clear();
+        self.request_current(output)?;
+        Ok(())
+    }
+
+    fn fail_reload(&mut self, error: &str, output: &mut impl Write) -> Result<(), AppError> {
+        self.reload_in_flight = false;
+        self.reload_fingerprint = None;
+        self.watcher.defer(RELOAD_RETRY_DELAY);
+        self.draw_status(
+            output,
+            Viewport::detect()?,
+            &format!("reload failed: {error}; retrying"),
+        )?;
+        Ok(())
     }
 
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
@@ -269,11 +339,123 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    length: u64,
+    modified: SystemTime,
+}
+
+impl FileFingerprint {
+    fn read(path: &Path) -> io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
+}
+
+struct FileWatcher {
+    accepted: FileFingerprint,
+    candidate: Option<(FileFingerprint, Instant)>,
+    next_poll: Instant,
+}
+
+impl FileWatcher {
+    fn new(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            accepted: FileFingerprint::read(path)?,
+            candidate: None,
+            next_poll: Instant::now() + FILE_POLL_INTERVAL,
+        })
+    }
+
+    fn poll(&mut self, path: &Path) -> Option<FileFingerprint> {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return None;
+        }
+        self.next_poll = now + FILE_POLL_INTERVAL;
+
+        let fingerprint = match FileFingerprint::read(path) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                self.candidate = None;
+                return None;
+            }
+        };
+        self.observe(fingerprint, now)
+    }
+
+    fn observe(&mut self, fingerprint: FileFingerprint, now: Instant) -> Option<FileFingerprint> {
+        if fingerprint == self.accepted {
+            self.candidate = None;
+            return None;
+        }
+
+        match self.candidate {
+            Some((candidate, since))
+                if candidate == fingerprint && now.duration_since(since) >= FILE_STABLE_FOR =>
+            {
+                Some(fingerprint)
+            }
+            Some((candidate, _)) if candidate == fingerprint => None,
+            _ => {
+                self.candidate = Some((fingerprint, now));
+                None
+            }
+        }
+    }
+
+    fn accept(&mut self, fingerprint: FileFingerprint) {
+        self.accepted = fingerprint;
+        if self
+            .candidate
+            .is_some_and(|(candidate, _)| candidate == fingerprint)
+        {
+            self.candidate = None;
+        }
+    }
+
+    fn defer(&mut self, duration: Duration) {
+        self.next_poll = Instant::now() + duration;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{FILE_STABLE_FOR, FileFingerprint, FileWatcher};
+    use std::time::{Duration, Instant, SystemTime};
+
     #[test]
     fn page_navigation_bounds_are_saturating() {
         assert_eq!(0_u32.saturating_sub(1), 0);
         assert_eq!(u32::MAX.saturating_add(1), u32::MAX);
+    }
+
+    #[test]
+    fn file_changes_must_stabilize_before_reload() {
+        let initial = FileFingerprint {
+            length: 10,
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        let changed = FileFingerprint {
+            length: 20,
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let started = Instant::now();
+        let mut watcher = FileWatcher {
+            accepted: initial,
+            candidate: None,
+            next_poll: started,
+        };
+
+        assert_eq!(watcher.observe(changed, started), None);
+        assert_eq!(
+            watcher.observe(changed, started + FILE_STABLE_FOR),
+            Some(changed)
+        );
+        watcher.accept(changed);
+        assert_eq!(watcher.observe(changed, started + FILE_STABLE_FOR), None);
     }
 }
