@@ -387,6 +387,7 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
     let mut browser = BrowserState::new(directory);
     browser.preload_recursive();
     let mut redraw = true;
+    let mut clear_background = true;
 
     loop {
         if browser.poll_recursive() {
@@ -396,16 +397,22 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
         let visible_height = picker_rect(viewport).visible_height();
         browser.adjust_scroll(visible_height);
         if redraw {
-            draw_picker(&browser, viewport, output)?;
+            draw_picker(&browser, viewport, clear_background, output)?;
             redraw = false;
+            clear_background = false;
         }
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            redraw = true;
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                redraw = true;
+                clear_background = true;
+                continue;
+            }
+            _ => continue,
         };
         if key.kind != KeyEventKind::Press {
             continue;
@@ -463,6 +470,7 @@ fn apply_picker_navigation(
 fn draw_picker(
     browser: &BrowserState,
     viewport: Viewport,
+    clear_background: bool,
     output: &mut impl Write,
 ) -> io::Result<()> {
     let theme = TOKYO_NIGHT_MOON;
@@ -471,9 +479,11 @@ fn draw_picker(
     execute!(
         output,
         SetBackgroundColor(theme.bg),
-        SetForegroundColor(theme.fg),
-        Clear(ClearType::All)
+        SetForegroundColor(theme.fg)
     )?;
+    if clear_background {
+        execute!(output, Clear(ClearType::All))?;
+    }
 
     let title = format!(" {} ", browser.current_dir.display());
     let (title, title_width) = truncate_to_width(&title, inner_width);
@@ -743,7 +753,8 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
+        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, Viewport,
+        apply_picker_navigation, draw_picker,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::fs;
@@ -800,5 +811,29 @@ mod tests {
             10,
         ));
         assert_eq!(browser.selected, 0);
+    }
+
+    #[test]
+    fn picker_clears_terminal_only_on_initial_draw() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let browser = BrowserState::new(directory.path().to_path_buf());
+        let viewport = Viewport {
+            columns: 100,
+            rows: 39,
+            pixel_width: 800,
+            pixel_height: 640,
+        };
+        let mut output = Vec::new();
+
+        draw_picker(&browser, viewport, true, &mut output).expect("initial draw");
+        draw_picker(&browser, viewport, false, &mut output).expect("incremental draw");
+
+        assert_eq!(
+            output
+                .windows(b"\x1b[2J".len())
+                .filter(|window| *window == b"\x1b[2J")
+                .count(),
+            1
+        );
     }
 }
