@@ -13,8 +13,8 @@ crossbeam-channel = "0.5.15"
 flate2 = "1.1.9"
 nucleo-matcher = "0.3.1"
 pdfium-render = { version = "0.9.3", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_29"] }
 thiserror = "2.0.17"
-unicode-width = "0.2.2"
 
 [build-dependencies]
 flate2 = "1.1.9"

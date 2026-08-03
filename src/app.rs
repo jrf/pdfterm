@@ -8,12 +8,16 @@ use std::time::{Duration, Instant, SystemTime};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::style::{
-    Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
+use crossterm::style::{Print, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
+use ratatui::Frame as RatatuiFrame;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color as RatatuiColor, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph};
 use thiserror::Error;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::browser::BrowserState;
 use crate::kitty::{self, Placement};
@@ -386,20 +390,27 @@ impl App {
 fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBuf>, AppError> {
     let mut browser = BrowserState::new(directory);
     browser.preload_recursive();
+    let backend = CrosstermBackend::new(output);
+    let mut terminal = Terminal::new(backend)?;
     let mut redraw = true;
-    let mut clear_background = true;
+    let mut visible_height = 1;
 
     loop {
         if browser.poll_recursive() {
             redraw = true;
         }
-        let viewport = Viewport::detect()?;
-        let visible_height = picker_rect(viewport).visible_height();
-        browser.adjust_scroll(visible_height);
         if redraw {
-            draw_picker(&browser, viewport, clear_background, output)?;
+            terminal.autoresize()?;
+            let area = terminal.size()?;
+            visible_height = usize::from(
+                picker_rect(area.into(), browser.filtered_indices.len())
+                    .height
+                    .saturating_sub(4)
+                    .max(1),
+            );
+            browser.adjust_scroll(visible_height);
+            terminal.draw(|frame| draw_picker(frame, &browser))?;
             redraw = false;
-            clear_background = false;
         }
 
         if !event::poll(Duration::from_millis(50))? {
@@ -409,7 +420,6 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
             Event::Key(key) => key,
             Event::Resize(_, _) => {
                 redraw = true;
-                clear_background = true;
                 continue;
             }
             _ => continue,
@@ -467,204 +477,160 @@ fn apply_picker_navigation(
     true
 }
 
-fn draw_picker(
-    browser: &BrowserState,
-    viewport: Viewport,
-    clear_background: bool,
-    output: &mut impl Write,
-) -> io::Result<()> {
+fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
     let theme = TOKYO_NIGHT_MOON;
-    let popup = picker_rect(viewport);
-    let inner_width = usize::from(popup.width.saturating_sub(2));
-    execute!(
-        output,
-        SetBackgroundColor(theme.bg),
-        SetForegroundColor(theme.fg)
-    )?;
-    if clear_background {
-        execute!(output, Clear(ClearType::All))?;
-    }
+    let entries: Vec<_> = browser.filtered_entries().collect();
+    let area = frame.area();
+    let popup = picker_rect(area, entries.len());
+    frame.render_widget(
+        Block::default().style(Style::default().bg(picker_color(theme.bg))),
+        area,
+    );
+    frame.render_widget(RatatuiClear, popup);
 
-    let title = format!(" {} ", browser.current_dir.display());
-    let (title, title_width) = truncate_to_width(&title, inner_width);
-    execute!(
-        output,
-        MoveTo(popup.x, popup.y),
-        SetForegroundColor(theme.blue),
-        SetAttribute(Attribute::Bold),
-        Print("┌"),
-        Print(title),
-        Print("─".repeat(inner_width.saturating_sub(title_width))),
-        Print("┐"),
-        SetAttribute(Attribute::Reset)
-    )?;
+    let directory = shorten_path(&browser.current_dir.display().to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(picker_color(theme.blue)))
+        .title(format!(" {directory} "))
+        .title_style(
+            Style::default()
+                .fg(picker_color(theme.blue))
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
     let filter = if browser.filter.is_empty() {
-        " type to filter...".to_string()
+        Line::from(Span::styled(
+            " type to filter...",
+            Style::default().fg(picker_color(theme.comment)),
+        ))
     } else {
-        format!(" > {}", browser.filter)
+        Line::from(vec![
+            Span::styled(" > ", Style::default().fg(picker_color(theme.blue))),
+            Span::styled(
+                browser.filter.as_str(),
+                Style::default().fg(picker_color(theme.fg)),
+            ),
+        ])
     };
-    draw_picker_row(output, popup, 0, &filter, theme.fg_dark, theme.bg)?;
+    frame.render_widget(Paragraph::new(filter), rows[0]);
 
-    let visible_height = popup.visible_height();
-    let entries: Vec<_> = browser.filtered_entries().collect();
-    for row in 0..visible_height {
-        let entry_index = browser.scroll_offset + row;
-        let Some(entry) = entries.get(entry_index) else {
-            if row == 0 && entries.is_empty() {
-                let message = if browser.filter.is_empty() {
-                    "   No PDF files found"
-                } else {
-                    "   No matches"
-                };
-                draw_picker_row(output, popup, row + 1, message, theme.comment, theme.bg)?;
+    let visible_height = usize::from(rows[1].height);
+    let mut lines: Vec<Line> = entries
+        .iter()
+        .enumerate()
+        .skip(browser.scroll_offset)
+        .take(visible_height)
+        .map(|(index, entry)| {
+            let selected = index == browser.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(picker_color(theme.fg))
+                    .bg(picker_color(theme.bg_highlight))
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.name == "../" {
+                Style::default().fg(picker_color(theme.fg_dark))
+            } else if entry.is_dir {
+                Style::default().fg(picker_color(theme.blue))
             } else {
-                draw_picker_row(output, popup, row + 1, "", theme.fg, theme.bg)?;
+                Style::default().fg(picker_color(theme.fg))
+            };
+            let icon = if entry.name == "../" {
+                "^ "
+            } else if entry.is_dir {
+                "/ "
+            } else {
+                "  "
+            };
+            let mut line = Line::from(vec![
+                Span::styled("   ", style),
+                Span::styled(icon, style),
+                Span::styled(entry.name.as_str(), style),
+            ]);
+            if selected {
+                let used = line.width();
+                let width = usize::from(rows[1].width);
+                if used < width {
+                    line.spans
+                        .push(Span::styled(" ".repeat(width - used), style));
+                }
             }
-            continue;
-        };
-        let selected = entry_index == browser.selected;
-        let foreground = if selected {
-            theme.fg
-        } else if entry.is_dir {
-            theme.blue
+            line
+        })
+        .collect();
+    if lines.is_empty() {
+        let message = if browser.filter.is_empty() {
+            "   No PDF files found"
         } else {
-            theme.fg
+            "   No matches"
         };
-        let background = if selected {
-            theme.bg_highlight
-        } else {
-            theme.bg
-        };
-        let marker = if selected { " > " } else { "   " };
-        draw_picker_row(
-            output,
-            popup,
-            row + 1,
-            &format!("{marker}{}", entry.name),
-            foreground,
-            background,
-        )?;
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(picker_color(theme.comment)),
+        )));
     }
+    frame.render_widget(Paragraph::new(lines), rows[1]);
 
     let hint = if browser.recursive_loading() {
         " enter:open  esc:close  (loading...)"
     } else {
         " enter:open  esc:close"
     };
-    draw_picker_row(
-        output,
-        popup,
-        usize::from(popup.height.saturating_sub(3)),
-        hint,
-        theme.comment,
-        theme.bg,
-    )?;
-    execute!(
-        output,
-        MoveTo(popup.x, popup.y + popup.height - 1),
-        SetForegroundColor(theme.blue),
-        Print("└"),
-        Print("─".repeat(inner_width)),
-        Print("┘"),
-        SetBackgroundColor(theme.bg),
-        SetForegroundColor(theme.fg)
-    )?;
-    output.flush()
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(picker_color(theme.comment)),
+        ))),
+        rows[2],
+    );
 }
 
-#[derive(Clone, Copy)]
-struct PickerRect {
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
-}
-
-impl PickerRect {
-    fn visible_height(self) -> usize {
-        usize::from(self.height.saturating_sub(4).max(1))
-    }
-}
-
-fn picker_rect(viewport: Viewport) -> PickerRect {
-    let terminal_height = viewport.rows.saturating_add(1);
-    let width = if viewport.columns > 4 {
-        (viewport.columns * 3 / 4).max(50).min(viewport.columns - 4)
+fn picker_rect(area: Rect, entry_count: usize) -> Rect {
+    let width = if area.width > 4 {
+        (area.width * 3 / 4).max(50).min(area.width - 4)
     } else {
-        viewport.columns.max(1)
+        area.width.max(1)
     };
-    let height = if terminal_height > 4 {
-        (terminal_height * 3 / 4).max(6).min(terminal_height - 2)
+    let height = if area.height > 4 {
+        let maximum = (area.height * 3 / 4).max(6).min(area.height - 2);
+        u16::try_from(entry_count)
+            .unwrap_or(u16::MAX)
+            .saturating_add(4)
+            .max(6)
+            .min(maximum)
     } else {
-        terminal_height.max(1)
+        area.height.max(1)
     };
-    PickerRect {
-        x: viewport.columns.saturating_sub(width) / 2,
-        y: terminal_height.saturating_sub(height) / 2,
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
-    }
-}
-
-fn draw_picker_row(
-    output: &mut impl Write,
-    popup: PickerRect,
-    inner_row: usize,
-    text: &str,
-    foreground: Color,
-    background: Color,
-) -> io::Result<()> {
-    let row = popup
-        .y
-        .saturating_add(1)
-        .saturating_add(u16::try_from(inner_row).unwrap_or(u16::MAX));
-    let right = popup.x.saturating_add(popup.width.saturating_sub(1));
-    execute!(
-        output,
-        MoveTo(popup.x, row),
-        SetBackgroundColor(TOKYO_NIGHT_MOON.bg),
-        SetForegroundColor(TOKYO_NIGHT_MOON.blue),
-        Print("│"),
-        SetBackgroundColor(background),
-        SetForegroundColor(foreground)
-    )?;
-    write_padded(output, text, usize::from(popup.width.saturating_sub(2)))?;
-    execute!(
-        output,
-        MoveTo(right, row),
-        SetBackgroundColor(TOKYO_NIGHT_MOON.bg),
-        SetForegroundColor(TOKYO_NIGHT_MOON.blue),
-        Print("│")
     )
 }
 
-fn write_padded(output: &mut impl Write, text: &str, width: usize) -> io::Result<()> {
-    let (text, used_width) = truncate_to_width(text, width);
-    execute!(output, Print(text), Print(" ".repeat(width - used_width)))
+fn shorten_path(path: &str) -> String {
+    std::env::var_os("HOME")
+        .and_then(|home| {
+            path.strip_prefix(home.to_string_lossy().as_ref())
+                .map(|suffix| format!("~{suffix}"))
+        })
+        .unwrap_or_else(|| path.to_string())
 }
 
-fn truncate_to_width(text: &str, width: usize) -> (String, usize) {
-    if UnicodeWidthStr::width(text) <= width {
-        return (text.to_string(), UnicodeWidthStr::width(text));
+fn picker_color(color: crossterm::style::Color) -> RatatuiColor {
+    match color {
+        crossterm::style::Color::Rgb { r, g, b } => RatatuiColor::Rgb(r, g, b),
+        _ => RatatuiColor::Reset,
     }
-    if width == 0 {
-        return (String::new(), 0);
-    }
-
-    let target = width - 1;
-    let mut result = String::new();
-    let mut used_width = 0;
-    for character in text.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used_width + character_width > target {
-            break;
-        }
-        result.push(character);
-        used_width += character_width;
-    }
-    result.push('…');
-    (result, used_width + 1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -753,10 +719,13 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, Viewport,
-        apply_picker_navigation, draw_picker,
+        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
+        draw_picker, picker_rect,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use std::fs;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -814,26 +783,34 @@ mod tests {
     }
 
     #[test]
-    fn picker_clears_terminal_only_on_initial_draw() {
+    fn picker_height_tracks_content_and_stays_capped() {
+        let area = Rect::new(0, 0, 100, 40);
+
+        assert_eq!(picker_rect(area, 7), Rect::new(12, 14, 75, 11));
+        assert_eq!(picker_rect(area, 100), Rect::new(12, 5, 75, 30));
+    }
+
+    #[test]
+    fn picker_preserves_all_four_border_corners_with_long_paths() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let browser = BrowserState::new(directory.path().to_path_buf());
-        let viewport = Viewport {
-            columns: 100,
-            rows: 39,
-            pixel_width: 800,
-            pixel_height: 640,
-        };
-        let mut output = Vec::new();
+        let nested = directory.path().join("a".repeat(100));
+        fs::create_dir(&nested).expect("nested directory");
+        let browser = BrowserState::new(nested);
+        let area = Rect::new(0, 0, 80, 30);
+        let popup = picker_rect(area, browser.filtered_indices.len());
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
-        draw_picker(&browser, viewport, true, &mut output).expect("initial draw");
-        draw_picker(&browser, viewport, false, &mut output).expect("incremental draw");
+        terminal
+            .draw(|frame| draw_picker(frame, &browser))
+            .expect("draw picker");
+        let buffer = terminal.backend().buffer();
+        let right = popup.x + popup.width - 1;
+        let bottom = popup.y + popup.height - 1;
 
-        assert_eq!(
-            output
-                .windows(b"\x1b[2J".len())
-                .filter(|window| *window == b"\x1b[2J")
-                .count(),
-            1
-        );
+        assert_eq!(buffer[(popup.x, popup.y)].symbol(), "┌");
+        assert_eq!(buffer[(right, popup.y)].symbol(), "┐");
+        assert_eq!(buffer[(popup.x, bottom)].symbol(), "└");
+        assert_eq!(buffer[(right, bottom)].symbol(), "┘");
     }
 }
