@@ -113,6 +113,7 @@ struct App {
     pending: HashSet<RenderKey>,
     visible_image_id: Option<u32>,
     next_image_id: u32,
+    last_status_row: Option<u16>,
 }
 
 struct Tab {
@@ -161,6 +162,7 @@ impl App {
             pending: HashSet::new(),
             visible_image_id: None,
             next_image_id: 1,
+            last_status_row: None,
         }
     }
 
@@ -185,7 +187,8 @@ impl App {
             fingerprint,
         });
         if self.tab().document_id == document_id {
-            self.draw_status(output, self.viewport()?, "reloading")?;
+            let viewport = self.prepare_viewport(output)?;
+            self.draw_status(output, viewport, "reloading")?;
         }
         Ok(())
     }
@@ -291,7 +294,8 @@ impl App {
                         .open(document_id, path.clone())
                         .map_err(AppError::Renderer)?;
                     self.pending_open = Some(PendingOpen::Selection { document_id, path });
-                    self.draw_status(output, self.viewport()?, "opening")?;
+                    let viewport = self.prepare_viewport(output)?;
+                    self.draw_status(output, viewport, "opening")?;
                 }
             }
             None => self.request_current(output)?,
@@ -337,7 +341,7 @@ impl App {
     }
 
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let viewport = self.viewport()?;
+        let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
         let tab = self.tab();
         let key = RenderKey {
@@ -519,6 +523,7 @@ impl App {
         let theme = TOKYO_NIGHT_MOON;
         kitty::delete_all(output)?;
         self.visible_image_id = None;
+        self.last_status_row = None;
         execute!(
             output,
             SetBackgroundColor(theme.bg),
@@ -527,6 +532,22 @@ impl App {
             MoveTo(0, 0)
         )?;
         output.flush()
+    }
+
+    fn prepare_viewport(&mut self, output: &mut impl Write) -> io::Result<Viewport> {
+        let viewport = self.viewport()?;
+        if let Some(row) = stale_status_row(self.last_status_row, viewport.status_row) {
+            let theme = TOKYO_NIGHT_MOON;
+            execute!(
+                output,
+                MoveTo(0, row),
+                SetBackgroundColor(theme.bg),
+                SetForegroundColor(theme.fg),
+                Clear(ClearType::CurrentLine)
+            )?;
+        }
+        self.last_status_row = Some(viewport.status_row);
+        Ok(viewport)
     }
 
     fn draw_tab_bar(&self, output: &mut impl Write) -> io::Result<()> {
@@ -600,6 +621,10 @@ impl App {
             .iter()
             .position(|tab| tab.document_id == document_id)
     }
+}
+
+fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
+    previous.filter(|row| *row < current)
 }
 
 fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
@@ -950,7 +975,7 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        clear_picker, cycled_tab_index, draw_picker, picker_rect,
+        clear_picker, cycled_tab_index, draw_picker, picker_rect, stale_status_row,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -971,6 +996,14 @@ mod tests {
         assert_eq!(cycled_tab_index(2, 3, 1), 0);
         assert_eq!(cycled_tab_index(2, 3, -1), 1);
         assert_eq!(cycled_tab_index(0, 3, -1), 2);
+    }
+
+    #[test]
+    fn growing_viewport_clears_the_previous_status_row() {
+        assert_eq!(stale_status_row(Some(20), 40), Some(20));
+        assert_eq!(stale_status_row(Some(40), 20), None);
+        assert_eq!(stale_status_row(Some(40), 40), None);
+        assert_eq!(stale_status_row(None, 40), None);
     }
 
     #[test]
