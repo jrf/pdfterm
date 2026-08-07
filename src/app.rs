@@ -124,6 +124,7 @@ struct App {
     last_status_row: Option<u16>,
     default_fit: FitMode,
     default_invert: bool,
+    goto_input: Option<String>,
 }
 
 struct Tab {
@@ -208,6 +209,7 @@ impl App {
             last_status_row: None,
             default_fit,
             default_invert,
+            goto_input: None,
         }
     }
 
@@ -379,9 +381,87 @@ impl App {
         self.request_current(output)
     }
 
+    fn begin_goto(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.goto_input = Some(String::new());
+        let viewport = self.viewport()?;
+        self.draw_goto(output, viewport)?;
+        Ok(())
+    }
+
+    fn handle_goto_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<(), AppError> {
+        match key.code {
+            KeyCode::Esc => {
+                self.goto_input = None;
+                self.redraw_current(output)?;
+            }
+            KeyCode::Enter => {
+                let input = self.goto_input.take().unwrap_or_default();
+                let target = input
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|number| *number >= 1)
+                    .map(|number| (number - 1).min(self.tab().page_count - 1));
+                match target {
+                    Some(page) if page != self.tab().page => self.set_page(page, output)?,
+                    _ => self.redraw_current(output)?,
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buffer) = self.goto_input.as_mut() {
+                    buffer.pop();
+                }
+                let viewport = self.viewport()?;
+                self.draw_goto(output, viewport)?;
+            }
+            KeyCode::Char(character) if character.is_ascii_digit() => {
+                if let Some(buffer) = self.goto_input.as_mut().filter(|buffer| buffer.len() < 9) {
+                    buffer.push(character);
+                }
+                let viewport = self.viewport()?;
+                self.draw_goto(output, viewport)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn draw_goto(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+        let theme = TOKYO_NIGHT_MOON;
+        let input = self.goto_input.as_deref().unwrap_or_default();
+        let hint = format!(
+            "  (1-{}, enter to jump, esc to cancel)",
+            self.tab().page_count
+        );
+        execute!(
+            output,
+            MoveTo(0, viewport.status_row),
+            SetBackgroundColor(theme.bg_dark),
+            Clear(ClearType::CurrentLine),
+            Print(" "),
+            SetForegroundColor(theme.yellow),
+            Print("go to page: "),
+            SetForegroundColor(theme.fg),
+            Print(input),
+            SetForegroundColor(theme.comment),
+            Print(hint),
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.fg)
+        )?;
+        output.flush()
+    }
+
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
+        if self.goto_input.is_some() {
+            self.handle_goto_key(key, output)?;
+            return Ok(false);
+        }
         match key.code {
             KeyCode::Char('q') => return self.close_current(output),
+            KeyCode::Char(':') => self.begin_goto(output)?,
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
             KeyCode::Tab => self.switch_tab(1, output)?,
