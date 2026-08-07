@@ -384,25 +384,6 @@ impl From<WorkerCommand> for WorkerTask {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{FitMode, invert_rgb};
-
-    #[test]
-    fn invert_flips_color_channels_but_keeps_alpha() {
-        let mut pixels = [0, 10, 245, 128, 255, 255, 255, 64];
-        invert_rgb(&mut pixels);
-        assert_eq!(pixels, [255, 245, 10, 128, 0, 0, 0, 64]);
-    }
-
-    #[test]
-    fn fit_mode_cycles_page_width_height() {
-        assert_eq!(FitMode::Page.cycle(), FitMode::Width);
-        assert_eq!(FitMode::Width.cycle(), FitMode::Height);
-        assert_eq!(FitMode::Height.cycle(), FitMode::Page);
-    }
-}
-
 fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
     let bindings = if let Some(path) = library {
         Pdfium::bind_to_library(path)
@@ -432,4 +413,23 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
     };
 
     Ok(Pdfium::new(bindings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FitMode, invert_rgb};
+
+    #[test]
+    fn invert_flips_color_channels_but_keeps_alpha() {
+        let mut pixels = [0, 10, 245, 128, 255, 255, 255, 64];
+        invert_rgb(&mut pixels);
+        assert_eq!(pixels, [255, 245, 10, 128, 0, 0, 0, 64]);
+    }
+
+    #[test]
+    fn fit_mode_cycles_page_width_height() {
+        assert_eq!(FitMode::Page.cycle(), FitMode::Width);
+        assert_eq!(FitMode::Width.cycle(), FitMode::Height);
+        assert_eq!(FitMode::Height.cycle(), FitMode::Page);
+    }
 }
