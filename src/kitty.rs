@@ -45,7 +45,10 @@ pub fn transmit_compressed_rgba(
     }
 
     let crop = match placement.crop {
-        Some(crop) => format!(",x={},y={},w={},h={}", crop.x, crop.y, crop.width, crop.height),
+        Some(crop) => format!(
+            ",x={},y={},w={},h={}",
+            crop.x, crop.y, crop.width, crop.height
+        ),
         None => String::new(),
     };
     let encoded = STANDARD.encode(compressed_rgba);

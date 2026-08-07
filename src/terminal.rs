@@ -184,7 +184,10 @@ mod tests {
     fn centers_image_without_exceeding_viewport() {
         let placement = sample_viewport().place(600, 800, 0, 0);
 
-        assert_eq!((placement.left, placement.columns, placement.rows), (20, 60, 40));
+        assert_eq!(
+            (placement.left, placement.columns, placement.rows),
+            (20, 60, 40)
+        );
         assert_eq!(placement.crop, None);
     }
 

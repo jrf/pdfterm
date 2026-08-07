@@ -88,8 +88,7 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_ignored() {
-        let config: Config =
-            toml::from_str("future_option = 42\ninvert = true\n").expect("config");
+        let config: Config = toml::from_str("future_option = 42\ninvert = true\n").expect("config");
         assert!(config.invert());
     }
 }

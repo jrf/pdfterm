@@ -2,7 +2,9 @@
 
 `pdfterm` is a low-latency PDF viewer for Kitty terminals. It renders on the machine where the command runs, compresses each page once, and sends the bitmap through Kitty's graphics protocol. Direct SSH sessions need no local helper.
 
-The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab.
+The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top of the picker.
+
+You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, invert colors for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52).
 
 ## Requirements
 
@@ -33,9 +35,45 @@ pdfterm
 pdfterm document.pdf
 ```
 
-Use `--pdfium-library PATH` to override the embedded PDFium library.
+Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page N` to open at a specific page.
 
-Keys: `j`, `l`, arrows, space, or Page Down move forward. `k`, `h`, arrows, Backspace, or Page Up move backward. `g` and `G` jump to the first and last pages. `f` opens a PDF in a new tab, while `Tab` and `Shift-Tab` switch tabs. `q` closes the current tab and exits after the last tab; Escape exits immediately.
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `j` `l` arrows space `PageDown` | forward — page, or scroll when the page overflows the viewport |
+| `k` `h` arrows `Backspace` `PageUp` | backward — page, or scroll when the page overflows |
+| `g` / `G` | first / last page |
+| `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
+| `m` | cycle fit mode: fit-page → fit-width → fit-height |
+| `i` | invert (dark-mode) rendering |
+| `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
+| `y` | copy the current page's text to the clipboard |
+| `f` | open a PDF in a new tab |
+| `Tab` / `Shift-Tab` | switch tabs |
+| `q` | close the current tab, exiting after the last tab |
+| `Esc` | exit immediately |
+
+In fit-width and fit-height modes, the movement keys scroll within a page that is
+larger than the viewport and cross into the adjacent page at the edges. The `h`/`l`
+keys and left/right arrows scroll horizontally in fit-height mode.
+
+## Configuration
+
+`pdfterm` reads an optional config file from `$XDG_CONFIG_HOME/pdfterm/config.toml`
+(falling back to `~/.config/pdfterm/config.toml`). A missing file uses the defaults;
+a malformed file is reported once and ignored. Supported keys:
+
+```toml
+# fit-page (default), fit-width, or fit-height
+fit_mode = "page"
+
+# invert page colors by default (dark mode)
+invert = false
+```
+
+Recently opened documents are tracked in `$XDG_CACHE_HOME/pdfterm/recent`
+(or `~/.cache/pdfterm/recent`).
 
 ## Checks
 

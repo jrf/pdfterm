@@ -604,7 +604,10 @@ impl App {
             return Ok(());
         }
         write_clipboard_osc52(output, content)?;
-        let message = format!("copied {} characters to the clipboard", content.chars().count());
+        let message = format!(
+            "copied {} characters to the clipboard",
+            content.chars().count()
+        );
         self.draw_status(output, viewport, &message)?;
         Ok(())
     }
