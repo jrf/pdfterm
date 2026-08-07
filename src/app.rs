@@ -64,6 +64,7 @@ pub fn run(
     };
     let worker = RenderWorker::spawn(INITIAL_DOCUMENT_ID, path.clone(), pdfium_library);
     let (page_count, outline) = worker.wait_until_ready().map_err(AppError::Renderer)?;
+    crate::recent::record(&path);
     let watcher = FileWatcher::new(&path)?;
     let mut app = App::new(
         worker,
@@ -276,6 +277,7 @@ impl App {
                 document_id: expected,
                 path,
             } if expected == document_id => {
+                crate::recent::record(&path);
                 let watcher = FileWatcher::new(&path)?;
                 self.tabs.push(Tab {
                     document_id,
@@ -938,6 +940,7 @@ fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
 
 fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBuf>, AppError> {
     let mut browser = BrowserState::new(directory);
+    browser.set_recents(crate::recent::load());
     browser.preload_recursive();
     let backend = CrosstermBackend::new(&mut *output);
     let mut terminal = Terminal::new(backend)?;

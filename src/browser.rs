@@ -21,6 +21,8 @@ pub struct BrowserState {
     pub scroll_offset: usize,
     pub filter: String,
     pub filtered_indices: Vec<usize>,
+    root_dir: PathBuf,
+    recents: Vec<PathBuf>,
     recursive_entries: Vec<BrowserEntry>,
     recursive_loaded: bool,
     recursive_rx: Option<Receiver<Vec<BrowserEntry>>>,
@@ -29,18 +31,27 @@ pub struct BrowserState {
 impl BrowserState {
     pub fn new(dir: PathBuf) -> Self {
         let mut state = Self {
-            current_dir: dir,
+            current_dir: dir.clone(),
             entries: Vec::new(),
             selected: 0,
             scroll_offset: 0,
             filter: String::new(),
             filtered_indices: Vec::new(),
+            root_dir: dir,
+            recents: Vec::new(),
             recursive_entries: Vec::new(),
             recursive_loaded: false,
             recursive_rx: None,
         };
         state.load_dir();
         state
+    }
+
+    /// Supplies the recently opened documents, which are listed first in the
+    /// starting directory when no filter is active.
+    pub fn set_recents(&mut self, recents: Vec<PathBuf>) {
+        self.recents = recents;
+        self.load_dir();
     }
 
     pub fn load_dir(&mut self) {
@@ -89,9 +100,45 @@ impl BrowserState {
         files.sort_by(|left, right| left.name.cmp(&right.name));
         self.entries.extend(directories);
         self.entries.extend(files);
+        self.prepend_recents();
         self.selected = 0;
         self.scroll_offset = 0;
         self.rebuild_filter();
+    }
+
+    /// Inserts recent documents that still exist at the top of the listing, but
+    /// only in the directory the picker started in and only when they are not
+    /// already shown there.
+    fn prepend_recents(&mut self) {
+        if self.current_dir != self.root_dir || self.recents.is_empty() {
+            return;
+        }
+        let insert_at = usize::from(
+            self.entries
+                .first()
+                .is_some_and(|entry| entry.name == "../"),
+        );
+        let mut recent_entries = Vec::new();
+        for path in &self.recents {
+            if !path.is_file() || !is_pdf(path) {
+                continue;
+            }
+            if self.entries.iter().any(|entry| &entry.path == path) {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            recent_entries.push(BrowserEntry {
+                name: format!("★ {file_name}"),
+                path: path.clone(),
+                is_dir: false,
+            });
+        }
+        for (offset, entry) in recent_entries.into_iter().enumerate() {
+            self.entries.insert(insert_at + offset, entry);
+        }
     }
 
     pub fn preload_recursive(&mut self) {
@@ -322,5 +369,46 @@ mod tests {
         assert!(names.contains(&"docs/"));
         assert!(names.contains(&"one.pdf"));
         assert!(!names.contains(&"notes.txt"));
+    }
+
+    #[test]
+    fn recents_from_other_directories_are_listed_first() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("b.pdf"), b"synthetic").expect("pdf");
+        let other = tempfile::tempdir().expect("other directory");
+        let recent = other.path().join("z-recent.pdf");
+        fs::write(&recent, b"synthetic").expect("recent pdf");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.set_recents(vec![recent.clone()]);
+
+        let starred = browser
+            .entries
+            .iter()
+            .position(|entry| entry.name == "★ z-recent.pdf")
+            .expect("recent entry present");
+        let listed = browser
+            .entries
+            .iter()
+            .position(|entry| entry.name == "b.pdf")
+            .expect("directory entry present");
+        assert!(starred < listed);
+    }
+
+    #[test]
+    fn recents_already_in_the_directory_are_not_duplicated() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("here.pdf");
+        fs::write(&path, b"synthetic").expect("pdf");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.set_recents(vec![path]);
+
+        let count = browser
+            .entries
+            .iter()
+            .filter(|entry| entry.name.contains("here.pdf"))
+            .count();
+        assert_eq!(count, 1);
     }
 }
