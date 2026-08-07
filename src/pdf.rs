@@ -6,9 +6,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
-use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
+use pdfium_render::prelude::{PdfBookmark, PdfDocument, PdfRenderConfig, Pdfium};
 
 pub type DocumentId = u64;
+
+/// One entry in a document's outline (table of contents).
+#[derive(Clone, Debug)]
+pub struct OutlineItem {
+    pub title: String,
+    pub page: u32,
+    pub depth: u16,
+}
 
 /// How a page is scaled to the terminal viewport.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -71,10 +79,12 @@ pub struct Frame {
 pub enum WorkerMessage {
     Ready {
         pages: u32,
+        outline: Vec<OutlineItem>,
     },
     Opened {
         document_id: DocumentId,
         pages: u32,
+        outline: Vec<OutlineItem>,
     },
     OpenError {
         document_id: DocumentId,
@@ -149,9 +159,9 @@ impl RenderWorker {
         }
     }
 
-    pub fn wait_until_ready(&self) -> Result<u32, String> {
+    pub fn wait_until_ready(&self) -> Result<(u32, Vec<OutlineItem>), String> {
         match self.message_rx.recv() {
-            Ok(WorkerMessage::Ready { pages }) => Ok(pages),
+            Ok(WorkerMessage::Ready { pages, outline }) => Ok((pages, outline)),
             Ok(WorkerMessage::Error(error)) => Err(error),
             Ok(
                 WorkerMessage::Opened { .. }
@@ -214,8 +224,9 @@ fn run_worker(
         if pages == 0 {
             return Err(format!("{} has no pages", path.display()));
         }
+        let outline = extract_outline(&document);
         message_tx
-            .send(WorkerMessage::Ready { pages })
+            .send(WorkerMessage::Ready { pages, outline })
             .map_err(|_| "viewer stopped".to_string())?;
         let mut documents = HashMap::from([(initial_document_id, document)]);
 
@@ -266,9 +277,14 @@ fn run_worker(
                                     })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             } else {
+                                let outline = extract_outline(&replacement);
                                 documents.insert(document_id, replacement);
                                 message_tx
-                                    .send(WorkerMessage::Opened { document_id, pages })
+                                    .send(WorkerMessage::Opened {
+                                        document_id,
+                                        pages,
+                                        outline,
+                                    })
                                     .map_err(|_| "viewer stopped".to_string())?;
                             }
                         }
@@ -360,6 +376,42 @@ fn run_worker(
 
     if let Err(error) = result {
         let _ = message_tx.send(WorkerMessage::Error(error));
+    }
+}
+
+/// Reads a document's bookmark tree into a flat, depth-tagged outline in
+/// prefix (reading) order. Bookmarks without a resolvable destination page are
+/// skipped, but their children are still visited.
+fn extract_outline(document: &PdfDocument) -> Vec<OutlineItem> {
+    let mut items = Vec::new();
+    if let Some(root) = document.bookmarks().root() {
+        collect_bookmarks(root, 0, &mut items);
+    }
+    items
+}
+
+fn collect_bookmarks(mut bookmark: PdfBookmark, depth: u16, items: &mut Vec<OutlineItem>) {
+    loop {
+        if let Some(page) = bookmark
+            .destination()
+            .and_then(|destination| destination.page_index().ok())
+            .and_then(|index| u32::try_from(index).ok())
+        {
+            let title = bookmark.title().unwrap_or_default();
+            let title = if title.trim().is_empty() {
+                "(untitled)".to_string()
+            } else {
+                title
+            };
+            items.push(OutlineItem { title, page, depth });
+        }
+        if let Some(child) = bookmark.first_child() {
+            collect_bookmarks(child, depth.saturating_add(1), items);
+        }
+        match bookmark.next_sibling() {
+            Some(sibling) => bookmark = sibling,
+            None => break,
+        }
     }
 }
 

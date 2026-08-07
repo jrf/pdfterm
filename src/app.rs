@@ -23,7 +23,7 @@ use crate::browser::BrowserState;
 use crate::config::Config;
 use crate::kitty::{self, Placement};
 use crate::pdf::{
-    DocumentId, FitMode, Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage,
+    DocumentId, FitMode, Frame, OutlineItem, RenderKey, RenderRequest, RenderWorker, WorkerMessage,
 };
 use crate::terminal::{TerminalGuard, Viewport};
 use crate::theme::TOKYO_NIGHT_MOON;
@@ -63,7 +63,7 @@ pub fn run(
         },
     };
     let worker = RenderWorker::spawn(INITIAL_DOCUMENT_ID, path.clone(), pdfium_library);
-    let page_count = worker.wait_until_ready().map_err(AppError::Renderer)?;
+    let (page_count, outline) = worker.wait_until_ready().map_err(AppError::Renderer)?;
     let watcher = FileWatcher::new(&path)?;
     let mut app = App::new(
         worker,
@@ -71,8 +71,8 @@ pub fn run(
         start_page.min(page_count - 1),
         path,
         watcher,
-        config.fit_mode(),
-        config.invert(),
+        outline,
+        config,
     );
     app.request_current(&mut output)?;
 
@@ -82,9 +82,11 @@ pub fn run(
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
                 WorkerMessage::Error(error) => return Err(AppError::Renderer(error)),
                 WorkerMessage::Ready { .. } => {}
-                WorkerMessage::Opened { document_id, pages } => {
-                    app.finish_open(document_id, pages, &mut output)?
-                }
+                WorkerMessage::Opened {
+                    document_id,
+                    pages,
+                    outline,
+                } => app.finish_open(document_id, pages, outline, &mut output)?,
                 WorkerMessage::OpenError { document_id, error } => {
                     app.fail_open(document_id, &error, &mut output)?
                 }
@@ -134,6 +136,7 @@ struct Tab {
     invert: bool,
     scroll_x: u32,
     scroll_y: u32,
+    outline: Arc<Vec<OutlineItem>>,
     cache: HashMap<RenderKey, Arc<Frame>>,
 }
 
@@ -174,9 +177,11 @@ impl App {
         page: u32,
         path: PathBuf,
         watcher: FileWatcher,
-        default_fit: FitMode,
-        default_invert: bool,
+        outline: Vec<OutlineItem>,
+        config: &Config,
     ) -> Self {
+        let default_fit = config.fit_mode();
+        let default_invert = config.invert();
         Self {
             worker,
             pending_open: None,
@@ -190,6 +195,7 @@ impl App {
                 invert: default_invert,
                 scroll_x: 0,
                 scroll_y: 0,
+                outline: Arc::new(outline),
                 cache: HashMap::new(),
             }],
             active_tab: 0,
@@ -236,6 +242,7 @@ impl App {
         &mut self,
         document_id: DocumentId,
         pages: u32,
+        outline: Vec<OutlineItem>,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let Some(pending) = self.pending_open.take() else {
@@ -255,6 +262,7 @@ impl App {
                 tab.page = tab.page.min(pages - 1);
                 tab.scroll_x = 0;
                 tab.scroll_y = 0;
+                tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 if index == self.active_tab {
                     self.reset_render_state();
@@ -276,6 +284,7 @@ impl App {
                     invert: self.default_invert,
                     scroll_x: 0,
                     scroll_y: 0,
+                    outline: Arc::new(outline),
                     cache: HashMap::new(),
                 });
                 self.active_tab = self.tabs.len() - 1;
@@ -348,6 +357,28 @@ impl App {
         Ok(())
     }
 
+    fn open_outline(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        let outline = Arc::clone(&self.tab().outline);
+        if outline.is_empty() {
+            let viewport = self.prepare_viewport(output)?;
+            self.draw_status(output, viewport, "no outline in this document")?;
+            return Ok(());
+        }
+        self.clear_viewer(output)?;
+        let selection = pick_outline(&outline, self.tab().page, output)?;
+        if let Some(page) = selection {
+            let page = page.min(self.tab().page_count - 1);
+            self.tab_mut().page = page;
+            self.tab_mut().scroll_x = 0;
+            self.tab_mut().scroll_y = 0;
+        }
+        self.reset_render_state();
+        self.request_current(output)
+    }
+
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
         match key.code {
             KeyCode::Char('q') => return self.close_current(output),
@@ -379,6 +410,7 @@ impl App {
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
+            KeyCode::Char('t') => self.open_outline(output)?,
             _ => {}
         }
         Ok(false)
@@ -867,6 +899,225 @@ fn clear_picker(output: &mut impl Write) -> io::Result<()> {
     output.flush()
 }
 
+fn pick_outline(
+    items: &[OutlineItem],
+    current_page: u32,
+    output: &mut impl Write,
+) -> Result<Option<u32>, AppError> {
+    let mut filter = String::new();
+    let mut filtered: Vec<usize> = (0..items.len()).collect();
+    let mut selected = outline_start_index(items, current_page);
+    let mut scroll_offset = 0usize;
+    let backend = CrosstermBackend::new(&mut *output);
+    let mut terminal = Terminal::new(backend)?;
+    let mut redraw = true;
+    let mut visible_height = 1;
+
+    let selection = loop {
+        if redraw {
+            terminal.autoresize()?;
+            let area = terminal.size()?;
+            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
+            if selected < scroll_offset {
+                scroll_offset = selected;
+            } else if selected >= scroll_offset + visible_height {
+                scroll_offset = selected - visible_height + 1;
+            }
+            terminal.draw(|frame| {
+                draw_outline(frame, items, &filtered, selected, scroll_offset, &filter)
+            })?;
+            redraw = false;
+        }
+
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                redraw = true;
+                continue;
+            }
+            _ => continue,
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = filtered.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => break None,
+            KeyCode::Enter => {
+                if let Some(index) = filtered.get(selected) {
+                    break Some(items[*index].page);
+                }
+            }
+            KeyCode::Down => selected = (selected + 1).min(last),
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Char('j') if control => selected = (selected + 1).min(last),
+            KeyCode::Char('k') if control => selected = selected.saturating_sub(1),
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = last,
+            KeyCode::PageDown => selected = (selected + visible_height).min(last),
+            KeyCode::PageUp => selected = selected.saturating_sub(visible_height),
+            KeyCode::Backspace => {
+                filter.pop();
+                filtered = filter_outline(items, &filter);
+                selected = 0;
+                scroll_offset = 0;
+            }
+            KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                filter.push(character);
+                filtered = filter_outline(items, &filter);
+                selected = 0;
+                scroll_offset = 0;
+            }
+            _ => {}
+        }
+        redraw = true;
+    };
+    drop(terminal);
+    clear_picker(output)?;
+    Ok(selection)
+}
+
+fn outline_start_index(items: &[OutlineItem], current_page: u32) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, item)| item.page <= current_page)
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn filter_outline(items: &[OutlineItem], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..items.len()).collect();
+    }
+    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+    use nucleo_matcher::{Config, Matcher, Utf32Str};
+    let pattern = Pattern::parse(filter, CaseMatching::Ignore, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buffer = Vec::new();
+    let mut scored: Vec<_> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let haystack = Utf32Str::new(&item.title, &mut buffer);
+            pattern
+                .score(haystack, &mut matcher)
+                .map(|score| (index, score))
+        })
+        .collect();
+    scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(index, _)| index).collect()
+}
+
+fn draw_outline(
+    frame: &mut RatatuiFrame,
+    items: &[OutlineItem],
+    filtered: &[usize],
+    selected: usize,
+    scroll_offset: usize,
+    filter: &str,
+) {
+    let theme = TOKYO_NIGHT_MOON;
+    let area = frame.area();
+    let popup = picker_rect(area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(picker_color(theme.bg))),
+        area,
+    );
+    frame.render_widget(RatatuiClear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(picker_color(theme.blue)))
+        .title(" Outline ")
+        .title_style(
+            Style::default()
+                .fg(picker_color(theme.blue))
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let filter_line = if filter.is_empty() {
+        Line::from(Span::styled(
+            " type to filter...",
+            Style::default().fg(picker_color(theme.comment)),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(" > ", Style::default().fg(picker_color(theme.blue))),
+            Span::styled(filter, Style::default().fg(picker_color(theme.fg))),
+        ])
+    };
+    frame.render_widget(Paragraph::new(filter_line), rows[0]);
+
+    let visible_height = usize::from(rows[1].height);
+    let width = usize::from(rows[1].width);
+    let mut lines: Vec<Line> = filtered
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(position, item_index)| {
+            let item = &items[*item_index];
+            let is_selected = position == selected;
+            let style = if is_selected {
+                Style::default()
+                    .fg(picker_color(theme.fg))
+                    .bg(picker_color(theme.bg_highlight))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(picker_color(theme.fg))
+            };
+            let indent = "  ".repeat(usize::from(item.depth).min(6) + 1);
+            let page_label = format!(" {} ", item.page + 1);
+            let mut line = Line::from(vec![
+                Span::styled(indent, style),
+                Span::styled(item.title.clone(), style),
+            ]);
+            let used = line.width();
+            let page_width = page_label.chars().count();
+            if used + page_width < width {
+                let page_style = if is_selected {
+                    style
+                } else {
+                    Style::default().fg(picker_color(theme.comment))
+                };
+                line.spans
+                    .push(Span::styled(" ".repeat(width - used - page_width), style));
+                line.spans.push(Span::styled(page_label, page_style));
+            }
+            line
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No matches",
+            Style::default().fg(picker_color(theme.comment)),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), rows[1]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " enter:jump  esc:close",
+            Style::default().fg(picker_color(theme.comment)),
+        ))),
+        rows[2],
+    );
+}
+
 fn apply_picker_navigation(
     browser: &mut BrowserState,
     key: KeyEvent,
@@ -1125,8 +1376,10 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        clear_picker, cycled_tab_index, draw_picker, picker_rect, stale_status_row,
+        clear_picker, cycled_tab_index, draw_picker, filter_outline, outline_start_index,
+        picker_rect, stale_status_row,
     };
+    use crate::pdf::OutlineItem;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1180,6 +1433,44 @@ mod tests {
         );
         watcher.accept(changed);
         assert_eq!(watcher.observe(changed, started + FILE_STABLE_FOR), None);
+    }
+
+    fn outline_fixture() -> Vec<OutlineItem> {
+        vec![
+            OutlineItem {
+                title: "Introduction".into(),
+                page: 0,
+                depth: 0,
+            },
+            OutlineItem {
+                title: "Background".into(),
+                page: 4,
+                depth: 1,
+            },
+            OutlineItem {
+                title: "Results".into(),
+                page: 9,
+                depth: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn outline_start_index_selects_nearest_preceding_entry() {
+        let items = outline_fixture();
+
+        assert_eq!(outline_start_index(&items, 0), 0);
+        assert_eq!(outline_start_index(&items, 6), 1);
+        assert_eq!(outline_start_index(&items, 20), 2);
+    }
+
+    #[test]
+    fn filter_outline_matches_titles_and_passes_all_when_empty() {
+        let items = outline_fixture();
+
+        assert_eq!(filter_outline(&items, ""), vec![0, 1, 2]);
+        assert_eq!(filter_outline(&items, "result"), vec![2]);
+        assert!(filter_outline(&items, "zzz").is_empty());
     }
 
     #[test]
