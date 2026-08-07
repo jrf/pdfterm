@@ -10,12 +10,44 @@ use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 
 pub type DocumentId = u64;
 
+/// How a page is scaled to the terminal viewport.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum FitMode {
+    /// Fit the whole page within the viewport (no scrolling).
+    #[default]
+    Page,
+    /// Match the page width to the viewport; scroll vertically when taller.
+    Width,
+    /// Match the page height to the viewport; scroll horizontally when wider.
+    Height,
+}
+
+impl FitMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Page => Self::Width,
+            Self::Width => Self::Height,
+            Self::Height => Self::Page,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Page => "fit-page",
+            Self::Width => "fit-width",
+            Self::Height => "fit-height",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RenderKey {
     pub document_id: DocumentId,
     pub page: u32,
     pub width: u16,
     pub height: u16,
+    pub fit: FitMode,
+    pub invert: bool,
 }
 
 #[derive(Debug)]
@@ -274,31 +306,36 @@ fn run_worker(
             let page = document.pages().get(page_index).map_err(|error| {
                 format!("could not load page {}: {error}", request.key.page + 1)
             })?;
+            let target_width = i32::from(request.key.width);
+            let target_height = i32::from(request.key.height);
+            let base_config = PdfRenderConfig::new()
+                .set_reverse_byte_order(true)
+                .use_lcd_text_rendering(true)
+                .force_half_tone(false)
+                .use_print_quality(false);
+            let config = match request.key.fit {
+                FitMode::Page => {
+                    base_config.scale_page_to_display_size(target_width, target_height)
+                }
+                FitMode::Width => base_config.set_target_width(target_width),
+                FitMode::Height => base_config.set_target_height(target_height),
+            };
             let render_started = Instant::now();
-            let bitmap = page
-                .render_with_config(
-                    &PdfRenderConfig::new()
-                        .scale_page_to_display_size(
-                            i32::from(request.key.width),
-                            i32::from(request.key.height),
-                        )
-                        .set_reverse_byte_order(true)
-                        .use_lcd_text_rendering(true)
-                        .force_half_tone(false)
-                        .use_print_quality(false),
-                )
-                .map_err(|error| {
-                    format!("could not render page {}: {error}", request.key.page + 1)
-                })?;
+            let bitmap = page.render_with_config(&config).map_err(|error| {
+                format!("could not render page {}: {error}", request.key.page + 1)
+            })?;
             let render_elapsed = render_started.elapsed();
 
             let width = bitmap.width() as u32;
             let height = bitmap.height() as u32;
+            let mut raw_rgba = bitmap.as_raw_bytes();
+            if request.key.invert {
+                invert_rgb(&mut raw_rgba);
+            }
             let compression_started = Instant::now();
-            let compressed_rgba =
-                crate::kitty::compress_rgba(&bitmap.as_raw_bytes()).map_err(|error| {
-                    format!("could not compress page {}: {error}", request.key.page + 1)
-                })?;
+            let compressed_rgba = crate::kitty::compress_rgba(&raw_rgba).map_err(|error| {
+                format!("could not compress page {}: {error}", request.key.page + 1)
+            })?;
             let compression_elapsed = compression_started.elapsed();
 
             if request.generation != latest_generation.load(Ordering::Acquire) {
@@ -326,12 +363,43 @@ fn run_worker(
     }
 }
 
+/// Inverts the red, green, and blue channels of an RGBA buffer, leaving alpha
+/// untouched, so light documents render comfortably on a dark terminal.
+fn invert_rgb(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_mut(4) {
+        if let [r, g, b, _alpha] = pixel {
+            *r = 255 - *r;
+            *g = 255 - *g;
+            *b = 255 - *b;
+        }
+    }
+}
+
 impl From<WorkerCommand> for WorkerTask {
     fn from(command: WorkerCommand) -> Self {
         match command {
             WorkerCommand::Open { document_id, path } => Self::Open { document_id, path },
             WorkerCommand::Close(document_id) => Self::Close(document_id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FitMode, invert_rgb};
+
+    #[test]
+    fn invert_flips_color_channels_but_keeps_alpha() {
+        let mut pixels = [0, 10, 245, 128, 255, 255, 255, 64];
+        invert_rgb(&mut pixels);
+        assert_eq!(pixels, [255, 245, 10, 128, 0, 0, 0, 64]);
+    }
+
+    #[test]
+    fn fit_mode_cycles_page_width_height() {
+        assert_eq!(FitMode::Page.cycle(), FitMode::Width);
+        assert_eq!(FitMode::Width.cycle(), FitMode::Height);
+        assert_eq!(FitMode::Height.cycle(), FitMode::Page);
     }
 }
 

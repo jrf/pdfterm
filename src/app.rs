@@ -21,7 +21,9 @@ use thiserror::Error;
 
 use crate::browser::BrowserState;
 use crate::kitty::{self, Placement};
-use crate::pdf::{DocumentId, Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage};
+use crate::pdf::{
+    DocumentId, FitMode, Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage,
+};
 use crate::terminal::{TerminalGuard, Viewport};
 use crate::theme::TOKYO_NIGHT_MOON;
 
@@ -67,6 +69,8 @@ pub fn run(
         start_page.min(page_count - 1),
         path,
         watcher,
+        FitMode::default(),
+        false,
     );
     app.request_current(&mut output)?;
 
@@ -114,6 +118,8 @@ struct App {
     visible_image_id: Option<u32>,
     next_image_id: u32,
     last_status_row: Option<u16>,
+    default_fit: FitMode,
+    default_invert: bool,
 }
 
 struct Tab {
@@ -122,7 +128,30 @@ struct Tab {
     watcher: FileWatcher,
     page_count: u32,
     page: u32,
+    fit: FitMode,
+    invert: bool,
+    scroll_x: u32,
+    scroll_y: u32,
     cache: HashMap<RenderKey, Arc<Frame>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Axis {
+    Vertical,
+    Horizontal,
+}
+
+impl Tab {
+    fn render_key(&self, viewport: Viewport) -> RenderKey {
+        RenderKey {
+            document_id: self.document_id,
+            page: self.page,
+            width: viewport.pixel_width,
+            height: viewport.pixel_height,
+            fit: self.fit,
+            invert: self.invert,
+        }
+    }
 }
 
 enum PendingOpen {
@@ -143,6 +172,8 @@ impl App {
         page: u32,
         path: PathBuf,
         watcher: FileWatcher,
+        default_fit: FitMode,
+        default_invert: bool,
     ) -> Self {
         Self {
             worker,
@@ -153,6 +184,10 @@ impl App {
                 watcher,
                 page_count,
                 page,
+                fit: default_fit,
+                invert: default_invert,
+                scroll_x: 0,
+                scroll_y: 0,
                 cache: HashMap::new(),
             }],
             active_tab: 0,
@@ -163,6 +198,8 @@ impl App {
             visible_image_id: None,
             next_image_id: 1,
             last_status_row: None,
+            default_fit,
+            default_invert,
         }
     }
 
@@ -214,6 +251,8 @@ impl App {
                 tab.watcher.accept(fingerprint);
                 tab.page_count = pages;
                 tab.page = tab.page.min(pages - 1);
+                tab.scroll_x = 0;
+                tab.scroll_y = 0;
                 tab.cache.clear();
                 if index == self.active_tab {
                     self.reset_render_state();
@@ -231,6 +270,10 @@ impl App {
                     watcher,
                     page_count: pages,
                     page: 0,
+                    fit: self.default_fit,
+                    invert: self.default_invert,
+                    scroll_x: 0,
+                    scroll_y: 0,
                     cache: HashMap::new(),
                 });
                 self.active_tab = self.tabs.len() - 1;
@@ -310,22 +353,30 @@ impl App {
             KeyCode::Char('f') => self.open_picker(output)?,
             KeyCode::Tab => self.switch_tab(1, output)?,
             KeyCode::BackTab => self.switch_tab(-1, output)?,
-            KeyCode::Right
-            | KeyCode::Down
-            | KeyCode::PageDown
-            | KeyCode::Char('j')
-            | KeyCode::Char('l')
-            | KeyCode::Char(' ') => self.set_page(self.tab().page.saturating_add(1), output)?,
-            KeyCode::Left
-            | KeyCode::Up
-            | KeyCode::PageUp
-            | KeyCode::Backspace
-            | KeyCode::Char('h')
-            | KeyCode::Char('k') => self.set_page(self.tab().page.saturating_sub(1), output)?,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_view(Axis::Vertical, true, false, output)?
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_view(Axis::Vertical, false, false, output)?
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.move_view(Axis::Vertical, true, true, output)?
+            }
+            KeyCode::PageUp | KeyCode::Backspace => {
+                self.move_view(Axis::Vertical, false, true, output)?
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.move_view(Axis::Horizontal, true, false, output)?
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.move_view(Axis::Horizontal, false, false, output)?
+            }
             KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
                 self.set_page(self.tab().page_count - 1, output)?
             }
+            KeyCode::Char('m') => self.cycle_fit(output)?,
+            KeyCode::Char('i') => self.toggle_invert(output)?,
             _ => {}
         }
         Ok(false)
@@ -335,21 +386,103 @@ impl App {
         let page = page.min(self.tab().page_count - 1);
         if page != self.tab().page {
             self.tab_mut().page = page;
+            self.tab_mut().scroll_x = 0;
+            self.tab_mut().scroll_y = 0;
             self.request_current(output)?;
         }
         Ok(())
     }
 
+    /// Moves along one axis: scrolls the rendered page when it overflows the
+    /// viewport on that axis, and changes page at the far edge (or immediately
+    /// when the page already fits).
+    fn move_view(
+        &mut self,
+        axis: Axis,
+        forward: bool,
+        large: bool,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let viewport = self.viewport()?;
+        let key = self.tab().render_key(viewport);
+        let Some(frame) = self.tab().cache.get(&key).cloned() else {
+            return self.page_step(forward, output);
+        };
+        let (max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
+        let (axis_max, current) = match axis {
+            Axis::Vertical => (max_y, self.tab().scroll_y),
+            Axis::Horizontal => (max_x, self.tab().scroll_x),
+        };
+        if axis_max == 0 {
+            return self.page_step(forward, output);
+        }
+
+        let span = match axis {
+            Axis::Vertical => u32::from(viewport.pixel_height),
+            Axis::Horizontal => u32::from(viewport.pixel_width),
+        };
+        let step = if large {
+            (span * 85 / 100).max(1)
+        } else {
+            (span / 8).max(1)
+        };
+
+        let next = if forward {
+            if current >= axis_max {
+                return self.page_step(true, output);
+            }
+            (current + step).min(axis_max)
+        } else {
+            if current == 0 {
+                return self.page_step(false, output);
+            }
+            current.saturating_sub(step)
+        };
+        match axis {
+            Axis::Vertical => self.tab_mut().scroll_y = next,
+            Axis::Horizontal => self.tab_mut().scroll_x = next,
+        }
+        self.redraw_current(output)
+    }
+
+    fn page_step(&mut self, forward: bool, output: &mut impl Write) -> Result<(), AppError> {
+        let page = if forward {
+            self.tab().page.saturating_add(1)
+        } else {
+            self.tab().page.saturating_sub(1)
+        };
+        self.set_page(page, output)
+    }
+
+    /// Redraws the current page from cache with the current scroll offset,
+    /// without asking the worker to render again.
+    fn redraw_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let viewport = self.viewport()?;
+        let key = self.tab().render_key(viewport);
+        if let Some(frame) = self.tab().cache.get(&key).cloned() {
+            self.draw_frame(&frame, viewport, output)?;
+        }
+        Ok(())
+    }
+
+    fn cycle_fit(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let next = self.tab().fit.cycle();
+        self.tab_mut().fit = next;
+        self.tab_mut().scroll_x = 0;
+        self.tab_mut().scroll_y = 0;
+        self.request_current(output)
+    }
+
+    fn toggle_invert(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let inverted = !self.tab().invert;
+        self.tab_mut().invert = inverted;
+        self.request_current(output)
+    }
+
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
-        let tab = self.tab();
-        let key = RenderKey {
-            document_id: tab.document_id,
-            page: tab.page,
-            width: viewport.pixel_width,
-            height: viewport.pixel_height,
-        };
+        let key = self.tab().render_key(viewport);
         self.desired_key = Some(key);
         self.generation = self.generation.wrapping_add(1);
         self.worker.begin_generation(self.generation);
@@ -384,18 +517,14 @@ impl App {
         self.tabs[index].cache.retain(|cached, _| {
             cached.width == key.width
                 && cached.height == key.height
+                && cached.fit == key.fit
+                && cached.invert == key.invert
                 && cached.page.abs_diff(current_page) <= 1
         });
 
         if self.desired_key == Some(key) {
             let viewport = self.viewport()?;
-            let tab = self.tab();
-            let current_key = RenderKey {
-                document_id: tab.document_id,
-                page: tab.page,
-                width: viewport.pixel_width,
-                height: viewport.pixel_height,
-            };
+            let current_key = self.tab().render_key(viewport);
             if current_key == key {
                 self.draw_frame(&frame, viewport, output)?;
                 self.prefetch_neighbors(key);
@@ -410,11 +539,14 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let (left, columns, rows) = viewport.placement_for(frame.width, frame.height);
+        let tab = self.tab();
+        let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
+        self.tab_mut().scroll_x = placement.scroll_x;
+        self.tab_mut().scroll_y = placement.scroll_y;
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
 
-        execute!(output, MoveTo(left, viewport.top))?;
+        execute!(output, MoveTo(placement.left, viewport.top))?;
         let transfer_started = Instant::now();
         kitty::transmit_compressed_rgba(
             output,
@@ -423,8 +555,9 @@ impl App {
             frame.height,
             Placement {
                 image_id,
-                columns,
-                rows,
+                columns: placement.columns,
+                rows: placement.rows,
+                crop: placement.crop,
             },
         )?;
         let transfer_elapsed = transfer_started.elapsed();
@@ -449,6 +582,19 @@ impl App {
     ) -> io::Result<()> {
         let theme = TOKYO_NIGHT_MOON;
         let tab = self.tab();
+        let mut mode = String::new();
+        if tab.fit != FitMode::Page {
+            mode.push_str(tab.fit.label());
+        }
+        if tab.invert {
+            if !mode.is_empty() {
+                mode.push(' ');
+            }
+            mode.push_str("invert");
+        }
+        if !mode.is_empty() {
+            mode.push_str("  ");
+        }
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -463,10 +609,12 @@ impl App {
             SetForegroundColor(theme.magenta),
             Print(tab.page_count),
             Print("  "),
+            SetForegroundColor(theme.yellow),
+            Print(&mode),
             SetForegroundColor(theme.green),
             Print(state),
             SetForegroundColor(theme.comment),
-            Print("  j/k: page  f: new tab  tab/S-tab: switch  q: close"),
+            Print("  t: toc  :: goto  m: fit  i: invert  y: copy  f: tab  q: close"),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;

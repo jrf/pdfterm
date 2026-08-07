@@ -11,6 +11,17 @@ pub struct Placement {
     pub image_id: u32,
     pub columns: u16,
     pub rows: u16,
+    /// Source rectangle to display, in image pixels. `None` shows the whole image.
+    pub crop: Option<Crop>,
+}
+
+/// A pixel rectangle within a source image, used to display a scrolled crop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub fn compress_rgba(rgba: &[u8]) -> io::Result<Vec<u8>> {
@@ -33,6 +44,10 @@ pub fn transmit_compressed_rgba(
         ));
     }
 
+    let crop = match placement.crop {
+        Some(crop) => format!(",x={},y={},w={},h={}", crop.x, crop.y, crop.width, crop.height),
+        None => String::new(),
+    };
     let encoded = STANDARD.encode(compressed_rgba);
     let chunks = encoded.as_bytes().chunks(PAYLOAD_CHUNK_SIZE);
     let chunk_count = chunks.len();
@@ -42,7 +57,7 @@ pub fn transmit_compressed_rgba(
         if index == 0 {
             write!(
                 output,
-                "\x1b_Ga=T,f=32,s={width},v={height},i={},p=1,o=z,c={},r={},C=1,q=2,m={more};",
+                "\x1b_Ga=T,f=32,s={width},v={height},i={},p=1,o=z,c={},r={}{crop},C=1,q=2,m={more};",
                 placement.image_id, placement.columns, placement.rows
             )?;
         } else {
@@ -79,11 +94,40 @@ mod tests {
                 image_id: 1,
                 columns: 1,
                 rows: 1,
+                crop: None,
             },
         )
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn crop_adds_source_rectangle_to_the_command() {
+        let mut output = Vec::new();
+        let compressed = compress_rgba(&[0; 64]).unwrap();
+
+        transmit_compressed_rgba(
+            &mut output,
+            &compressed,
+            8,
+            8,
+            Placement {
+                image_id: 3,
+                columns: 8,
+                rows: 4,
+                crop: Some(Crop {
+                    x: 0,
+                    y: 16,
+                    width: 8,
+                    height: 4,
+                }),
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(",c=8,r=4,x=0,y=16,w=8,h=4,C=1"));
     }
 
     #[test]
@@ -103,6 +147,7 @@ mod tests {
                 image_id: 7,
                 columns: 8,
                 rows: 4,
+                crop: None,
             },
         )
         .unwrap();
