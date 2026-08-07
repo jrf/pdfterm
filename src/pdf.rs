@@ -90,6 +90,11 @@ pub enum WorkerMessage {
         document_id: DocumentId,
         error: String,
     },
+    Text {
+        document_id: DocumentId,
+        page: u32,
+        content: String,
+    },
     Frame(Frame),
     Error(String),
 }
@@ -100,6 +105,10 @@ enum WorkerCommand {
         path: PathBuf,
     },
     Close(DocumentId),
+    ExtractText {
+        document_id: DocumentId,
+        page: u32,
+    },
 }
 
 enum WorkerTask {
@@ -108,6 +117,10 @@ enum WorkerTask {
         path: PathBuf,
     },
     Close(DocumentId),
+    ExtractText {
+        document_id: DocumentId,
+        page: u32,
+    },
     Render(RenderRequest),
 }
 
@@ -166,6 +179,7 @@ impl RenderWorker {
             Ok(
                 WorkerMessage::Opened { .. }
                 | WorkerMessage::OpenError { .. }
+                | WorkerMessage::Text { .. }
                 | WorkerMessage::Frame(_),
             ) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
@@ -194,6 +208,12 @@ impl RenderWorker {
 
     pub fn close(&self, document_id: DocumentId) {
         let _ = self.command_tx.send(WorkerCommand::Close(document_id));
+    }
+
+    pub fn extract_text(&self, document_id: DocumentId, page: u32) {
+        let _ = self
+            .command_tx
+            .send(WorkerCommand::ExtractText { document_id, page });
     }
 
     pub fn try_recv(&self) -> Result<WorkerMessage, TryRecvError> {
@@ -304,6 +324,19 @@ fn run_worker(
                 }
                 WorkerTask::Close(document_id) => {
                     documents.remove(&document_id);
+                    continue;
+                }
+                WorkerTask::ExtractText { document_id, page } => {
+                    if let Some(document) = documents.get(&document_id) {
+                        let content = extract_page_text(document, page);
+                        message_tx
+                            .send(WorkerMessage::Text {
+                                document_id,
+                                page,
+                                content,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?;
+                    }
                     continue;
                 }
                 WorkerTask::Render(request) => request,
@@ -432,7 +465,25 @@ impl From<WorkerCommand> for WorkerTask {
         match command {
             WorkerCommand::Open { document_id, path } => Self::Open { document_id, path },
             WorkerCommand::Close(document_id) => Self::Close(document_id),
+            WorkerCommand::ExtractText { document_id, page } => {
+                Self::ExtractText { document_id, page }
+            }
         }
+    }
+}
+
+/// Extracts all selectable text from a page, returning an empty string when the
+/// page has no text layer or cannot be loaded.
+fn extract_page_text(document: &PdfDocument, page: u32) -> String {
+    let Ok(index) = i32::try_from(page) else {
+        return String::new();
+    };
+    let Ok(page) = document.pages().get(index) else {
+        return String::new();
+    };
+    match page.text() {
+        Ok(text) => text.all(),
+        Err(_) => String::new(),
     }
 }
 

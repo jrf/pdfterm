@@ -90,6 +90,7 @@ pub fn run(
                 WorkerMessage::OpenError { document_id, error } => {
                     app.fail_open(document_id, &error, &mut output)?
                 }
+                WorkerMessage::Text { content, .. } => app.copy_text(&content, &mut output)?,
             }
         }
         app.poll_file_change(&mut output)?;
@@ -491,6 +492,7 @@ impl App {
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
+            KeyCode::Char('y') => self.request_copy(output)?,
             _ => {}
         }
         Ok(false)
@@ -576,6 +578,32 @@ impl App {
         if let Some(frame) = self.tab().cache.get(&key).cloned() {
             self.draw_frame(&frame, viewport, output)?;
         }
+        Ok(())
+    }
+
+    fn request_copy(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        let (document_id, page) = {
+            let tab = self.tab();
+            (tab.document_id, tab.page)
+        };
+        self.worker.extract_text(document_id, page);
+        let viewport = self.viewport()?;
+        self.draw_status(output, viewport, "copying page text...")?;
+        Ok(())
+    }
+
+    fn copy_text(&mut self, content: &str, output: &mut impl Write) -> Result<(), AppError> {
+        let viewport = self.viewport()?;
+        if content.trim().is_empty() {
+            self.draw_status(output, viewport, "no selectable text on this page")?;
+            return Ok(());
+        }
+        write_clipboard_osc52(output, content)?;
+        let message = format!("copied {} characters to the clipboard", content.chars().count());
+        self.draw_status(output, viewport, &message)?;
         Ok(())
     }
 
@@ -883,6 +911,15 @@ impl App {
             .iter()
             .position(|tab| tab.document_id == document_id)
     }
+}
+
+/// Writes text to the system clipboard using the OSC 52 escape sequence, which
+/// works over SSH because the terminal emulator performs the copy locally.
+fn write_clipboard_osc52(output: &mut impl Write, text: &str) -> io::Result<()> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    write!(output, "\x1b]52;c;{encoded}\x07")?;
+    output.flush()
 }
 
 fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
@@ -1457,7 +1494,7 @@ mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
         clear_picker, cycled_tab_index, draw_picker, filter_outline, outline_start_index,
-        picker_rect, stale_status_row,
+        picker_rect, stale_status_row, write_clipboard_osc52,
     };
     use crate::pdf::OutlineItem;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1533,6 +1570,15 @@ mod tests {
                 depth: 0,
             },
         ]
+    }
+
+    #[test]
+    fn clipboard_write_uses_base64_osc52_sequence() {
+        let mut output = Vec::new();
+
+        write_clipboard_osc52(&mut output, "hi").expect("clipboard write");
+
+        assert_eq!(output, b"\x1b]52;c;aGk=\x07");
     }
 
     #[test]
