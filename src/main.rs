@@ -20,7 +20,8 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match pdfterm::app::run(cli.path, cli.pdfium_library, cli.page - 1) {
+    let config = pdfterm::config::Config::load();
+    match pdfterm::app::run(cli.path, cli.pdfium_library, cli.page - 1, &config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("pdfterm: {error}");

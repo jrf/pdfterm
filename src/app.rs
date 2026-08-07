@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph};
 use thiserror::Error;
 
 use crate::browser::BrowserState;
+use crate::config::Config;
 use crate::kitty::{self, Placement};
 use crate::pdf::{
     DocumentId, FitMode, Frame, RenderKey, RenderRequest, RenderWorker, WorkerMessage,
@@ -46,6 +47,7 @@ pub fn run(
     path: Option<PathBuf>,
     pdfium_library: Option<PathBuf>,
     start_page: u32,
+    config: &Config,
 ) -> Result<(), AppError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::NotInteractive);
@@ -69,8 +71,8 @@ pub fn run(
         start_page.min(page_count - 1),
         path,
         watcher,
-        FitMode::default(),
-        false,
+        config.fit_mode(),
+        config.invert(),
     );
     app.request_current(&mut output)?;
 
