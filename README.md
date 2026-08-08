@@ -2,6 +2,8 @@
 
 `pdfterm` is a low-latency PDF viewer for Kitty terminals. It renders on the machine where the command runs, compresses each page once, and sends the bitmap through Kitty's graphics protocol. Direct SSH sessions need no local helper.
 
+![pdfterm rendering a PDF in dark mode inside Kitty](assets/pdfterm-dark-mode.png)
+
 The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top of the picker.
 
 You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode preserves document hues and leaves embedded images unchanged.
