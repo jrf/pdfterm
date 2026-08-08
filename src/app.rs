@@ -1355,21 +1355,29 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
     );
 
     let visible_height = usize::from(rows[1].height);
-    let mut lines: Vec<Line> = entries
-        .iter()
-        .enumerate()
-        .skip(browser.scroll_offset)
-        .take(visible_height)
-        .map(|(index, entry)| {
-            picker_entry_line(
-                entry,
-                browser,
-                index == browser.selected,
+    let recent_heading_index = browser.recent_heading_index();
+    let mut lines = Vec::with_capacity(visible_height);
+    for (index, entry) in entries.iter().enumerate().skip(browser.scroll_offset) {
+        if Some(index) == recent_heading_index && lines.len() + 1 < visible_height {
+            lines.push(picker_recent_heading_line(
                 usize::from(rows[1].width),
                 colors,
-            )
-        })
-        .collect();
+            ));
+        }
+        if lines.len() >= visible_height {
+            break;
+        }
+        lines.push(picker_entry_line(
+            entry,
+            browser,
+            index == browser.selected,
+            usize::from(rows[1].width),
+            colors,
+        ));
+        if lines.len() >= visible_height {
+            break;
+        }
+    }
     if lines.is_empty() {
         let message = if browser.filter.is_empty() {
             "   No PDF files found"
@@ -1408,6 +1416,28 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
         .style(Style::default().bg(colors.chrome)),
         rows[2],
     );
+}
+
+fn picker_recent_heading_line(width: usize, colors: PickerTheme) -> Line<'static> {
+    let label = " Most Recent ";
+    let mut spans = vec![
+        Span::styled("  ", Style::default().bg(colors.surface)),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(colors.recent)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let used = 2 + label.chars().count();
+    if used < width {
+        spans.push(Span::styled(
+            "─".repeat(width - used),
+            Style::default().fg(colors.border).bg(colors.surface),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn picker_entry_line(
@@ -1857,6 +1887,32 @@ mod tests {
             buffer[(popup.x + 1, popup.y + 2)].bg,
             picker_color(theme.bg_highlight)
         );
+    }
+
+    #[test]
+    fn picker_labels_the_recent_files_section() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let recent = directory.path().join("recent.pdf");
+        fs::write(&recent, b"synthetic").expect("PDF");
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.set_recents(vec![recent]);
+        let area = Rect::new(0, 0, 80, 30);
+        let popup = picker_rect(area);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_picker(frame, &browser, crate::theme::TOKYO_NIGHT_MOON))
+            .expect("draw picker");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (popup.y + 1..popup.y + popup.height - 1)
+            .flat_map(|y| {
+                (popup.x + 1..popup.x + popup.width - 1)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+
+        assert!(rendered.contains("Most Recent"));
     }
 
     #[test]

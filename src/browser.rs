@@ -235,6 +235,15 @@ impl BrowserState {
             .filter_map(|index| self.active_source().get(*index))
     }
 
+    /// Returns the displayed index where the recent-files section begins.
+    /// Fuzzy results are ranked by match quality, so they are not sectioned.
+    pub fn recent_heading_index(&self) -> Option<usize> {
+        if !self.filter.is_empty() {
+            return None;
+        }
+        self.filtered_entries().position(|entry| entry.is_recent)
+    }
+
     pub fn match_indices(&self, name: &str) -> Vec<usize> {
         if self.filter.is_empty() {
             return Vec::new();
@@ -285,8 +294,18 @@ impl BrowserState {
         let visible_height = visible_height.max(1);
         if self.selected < self.scroll_offset {
             self.scroll_offset = self.selected;
-        } else if self.selected >= self.scroll_offset + visible_height {
-            self.scroll_offset = self.selected - visible_height + 1;
+            return;
+        }
+
+        let heading_index = self.recent_heading_index();
+        while self.scroll_offset < self.selected {
+            let entries = self.selected - self.scroll_offset + 1;
+            let includes_heading = heading_index
+                .is_some_and(|index| index >= self.scroll_offset && index <= self.selected);
+            if entries + usize::from(includes_heading) <= visible_height {
+                break;
+            }
+            self.scroll_offset += 1;
         }
     }
 
@@ -445,6 +464,29 @@ mod tests {
             .find(|entry| entry.name == "here.pdf")
             .expect("recent entry");
         assert!(entry.is_recent);
+    }
+
+    #[test]
+    fn recent_heading_starts_at_the_first_recent_entry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let recent = directory.path().join("recent.pdf");
+        fs::write(&recent, b"synthetic").expect("recent pdf");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.set_recents(vec![recent]);
+
+        let heading_index = browser.recent_heading_index().expect("recent heading");
+        assert!(
+            browser
+                .filtered_entries()
+                .nth(heading_index)
+                .unwrap()
+                .is_recent
+        );
+
+        browser.filter = "recent".into();
+        browser.rebuild_filter();
+        assert_eq!(browser.recent_heading_index(), None);
     }
 
     #[test]
