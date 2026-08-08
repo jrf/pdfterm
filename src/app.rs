@@ -1654,7 +1654,8 @@ fn help_lines(
     key_width: usize,
     colors: PickerTheme,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(bindings.len() + 1);
+    let mut lines = Vec::with_capacity(bindings.len() + 2);
+    lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         format!(" {title}"),
         Style::default()
