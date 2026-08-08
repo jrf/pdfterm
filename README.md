@@ -54,6 +54,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `y` | copy the current page's text to the clipboard |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
+| `?` | open the keybinding help menu |
 | `q` | close the current tab, exiting after the last tab |
 | `Esc` | exit immediately |
 

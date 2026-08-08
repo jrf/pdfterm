@@ -448,6 +448,17 @@ impl App {
         self.request_current(output)
     }
 
+    fn open_help(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.clear_viewer(output)?;
+        show_help(output, self.theme)?;
+        self.clear_viewer(output)?;
+        self.reset_render_state();
+        self.request_current(output)
+    }
+
     fn apply_theme(&mut self, index: usize) {
         let Some((_, theme)) = self.themes.get(index) else {
             return;
@@ -541,6 +552,7 @@ impl App {
             return Ok(false);
         }
         match key.code {
+            KeyCode::Char('?') => self.open_help(output)?,
             KeyCode::Char('q') => return self.close_current(output),
             KeyCode::Char(':') => self.begin_goto(output)?,
             KeyCode::Esc => return Ok(true),
@@ -844,7 +856,7 @@ impl App {
             SetForegroundColor(theme.green),
             Print(state),
             SetForegroundColor(theme.comment),
-            Print("  t: toc  T: theme  :: goto  m: fit  i: dark  y: copy  f: tab  q: close"),
+            Print("  ?: help"),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;
@@ -1109,6 +1121,38 @@ fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
         MoveTo(0, 0)
     )?;
     output.flush()
+}
+
+fn show_help(output: &mut impl Write, theme: Palette) -> Result<(), AppError> {
+    let backend = CrosstermBackend::new(&mut *output);
+    let mut terminal = Terminal::new(backend)?;
+    let mut redraw = true;
+
+    loop {
+        if redraw {
+            terminal.autoresize()?;
+            terminal.draw(|frame| draw_help_menu(frame, theme))?;
+            redraw = false;
+        }
+
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Resize(_, _) => redraw = true,
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press
+                    && matches!(
+                        key.code,
+                        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc
+                    ) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn pick_theme(
@@ -1539,6 +1583,103 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
     );
 }
 
+fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
+    const NAVIGATION: &[(&str, &str)] = &[
+        ("j/k · ↑/↓", "move vertically"),
+        ("h/l · ←/→", "move horizontally"),
+        ("Space · PgDn", "page viewport forward"),
+        ("Backspace · PgUp", "page viewport backward"),
+        ("g / G", "first / last page"),
+        (":", "go to page"),
+        ("Tab / Shift-Tab", "switch tabs"),
+    ];
+    const VIEWER: &[(&str, &str)] = &[
+        ("m", "cycle fit mode"),
+        ("i", "toggle dark mode"),
+        ("t", "table of contents"),
+        ("T", "choose theme"),
+        ("y", "copy page text"),
+        ("f", "open PDF in new tab"),
+        ("q", "close tab / exit"),
+        ("Esc", "exit immediately"),
+        ("?", "open help"),
+    ];
+
+    let colors = PickerTheme::from(theme);
+    let area = frame.area();
+    let popup = picker_rect(area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(colors.backdrop)),
+        area,
+    );
+    frame.render_widget(RatatuiClear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(colors.surface).fg(colors.text))
+        .border_style(Style::default().fg(colors.border))
+        .title(" Help ")
+        .title_style(
+            Style::default()
+                .fg(colors.accent)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
+
+    frame.render_widget(
+        Paragraph::new(help_lines("Navigation", NAVIGATION, 18, colors))
+            .style(Style::default().bg(colors.surface)),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(help_lines("Viewer", VIEWER, 5, colors))
+            .style(Style::default().bg(colors.surface)),
+        columns[1],
+    );
+    frame.render_widget(
+        Paragraph::new(picker_hint_line(&[("? / esc / q", "close")], None, colors))
+            .style(Style::default().bg(colors.chrome)),
+        rows[1],
+    );
+}
+
+fn help_lines(
+    title: &'static str,
+    bindings: &[(&str, &str)],
+    key_width: usize,
+    colors: PickerTheme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(bindings.len() + 1);
+    lines.push(Line::from(Span::styled(
+        format!(" {title}"),
+        Style::default()
+            .fg(colors.directory)
+            .bg(colors.surface)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(bindings.iter().map(|(key, action)| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {key:<key_width$}"),
+                Style::default()
+                    .fg(colors.accent)
+                    .bg(colors.selection)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {action}"),
+                Style::default().fg(colors.text).bg(colors.surface),
+            ),
+        ])
+    }));
+    lines
+}
+
 fn draw_theme_picker(frame: &mut RatatuiFrame, themes: &[(String, Palette)], selected: usize) {
     let theme = themes
         .get(selected)
@@ -1948,9 +2089,9 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        clear_picker, cycled_tab_index, draw_picker, draw_theme_picker, filter_outline,
-        outline_start_index, picker_color, picker_rect, shorten_path, stale_status_row,
-        write_clipboard_osc52,
+        clear_picker, cycled_tab_index, draw_help_menu, draw_picker, draw_theme_picker,
+        filter_outline, outline_start_index, picker_color, picker_rect, shorten_path,
+        stale_status_row, write_clipboard_osc52,
     };
     use crate::pdf::OutlineItem;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2170,6 +2311,32 @@ mod tests {
         assert!(rendered.contains("tokyo-night-moon"));
         assert!(rendered.contains("synthetic-theme"));
         assert!(rendered.contains("Themes"));
+    }
+
+    #[test]
+    fn help_menu_lists_viewer_keybindings() {
+        let area = Rect::new(0, 0, 100, 40);
+        let popup = picker_rect(area);
+        let theme = crate::theme::TOKYO_NIGHT_MOON;
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_help_menu(frame, theme))
+            .expect("draw help menu");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (popup.y..popup.y + popup.height)
+            .flat_map(|y| {
+                (popup.x..popup.x + popup.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+
+        assert_eq!(buffer[(0, 0)].bg, picker_color(theme.bg_dark1));
+        assert!(rendered.contains("Navigation"));
+        assert!(rendered.contains("Viewer"));
+        assert!(rendered.contains("choose theme"));
+        assert!(rendered.contains("open PDF in new tab"));
+        assert!(rendered.contains("? / esc / q"));
     }
 
     #[test]
