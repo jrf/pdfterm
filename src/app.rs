@@ -1561,7 +1561,7 @@ fn draw_theme_picker(frame: &mut RatatuiFrame, themes: &[(String, Palette)], sel
         .borders(Borders::ALL)
         .style(Style::default().bg(colors.surface).fg(colors.text))
         .border_style(Style::default().fg(colors.border))
-        .title(" Themes · session only ")
+        .title(" Themes ")
         .title_style(
             Style::default()
                 .fg(colors.accent)
@@ -2174,7 +2174,7 @@ mod tests {
         assert_eq!(buffer[(0, 0)].bg, picker_color(alternate.bg_dark1));
         assert!(rendered.contains("tokyo-night-moon"));
         assert!(rendered.contains("synthetic-theme"));
-        assert!(rendered.contains("session only"));
+        assert!(rendered.contains("Themes"));
     }
 
     #[test]
