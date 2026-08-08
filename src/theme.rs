@@ -16,6 +16,12 @@ pub struct GitPalette {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentPalette {
+    pub background: [u8; 3],
+    pub foreground: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Palette {
     pub bg: Color,
     pub bg_dark: Color,
@@ -47,6 +53,7 @@ pub struct Palette {
     pub teal: Color,
     pub terminal_black: Color,
     pub yellow: Color,
+    pub document: DocumentPalette,
     pub git: GitPalette,
 }
 
@@ -85,6 +92,10 @@ pub const TOKYO_NIGHT_MOON: Palette = Palette {
     teal: rgb(0x4f, 0xd6, 0xbe),
     terminal_black: rgb(0x44, 0x4a, 0x73),
     yellow: rgb(0xff, 0xc7, 0x77),
+    document: DocumentPalette {
+        background: [0x1e, 0x20, 0x30],
+        foreground: [0xc8, 0xd3, 0xf5],
+    },
     git: GitPalette {
         add: rgb(0xb8, 0xdb, 0x87),
         change: rgb(0x7c, 0xa1, 0xf2),
@@ -125,7 +136,15 @@ struct PaletteFile {
     teal: String,
     terminal_black: String,
     yellow: String,
+    document: Option<DocumentPaletteFile>,
     git: GitPaletteFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentPaletteFile {
+    background: String,
+    foreground: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +217,17 @@ fn parse_theme(text: &str) -> Result<Palette, ThemeError> {
         path: PathBuf::from("<theme>"),
         source,
     })?;
+    let document = if let Some(document) = &file.document {
+        DocumentPalette {
+            background: parse_rgb("document.background", &document.background)?,
+            foreground: parse_rgb("document.foreground", &document.foreground)?,
+        }
+    } else {
+        DocumentPalette {
+            background: parse_rgb("bg_dark", &file.bg_dark)?,
+            foreground: parse_rgb("fg", &file.fg)?,
+        }
+    };
     macro_rules! color {
         ($field:ident) => {
             parse_color(stringify!($field), &file.$field)?
@@ -234,6 +264,7 @@ fn parse_theme(text: &str) -> Result<Palette, ThemeError> {
         teal: color!(teal),
         terminal_black: color!(terminal_black),
         yellow: color!(yellow),
+        document,
         git: GitPalette {
             add: parse_color("git.add", &file.git.add)?,
             change: parse_color("git.change", &file.git.change)?,
@@ -243,6 +274,11 @@ fn parse_theme(text: &str) -> Result<Palette, ThemeError> {
 }
 
 fn parse_color(field: &str, value: &str) -> Result<Color, ThemeError> {
+    let [red, green, blue] = parse_rgb(field, value)?;
+    Ok(rgb(red, green, blue))
+}
+
+fn parse_rgb(field: &str, value: &str) -> Result<[u8; 3], ThemeError> {
     let Some(hex) = value.strip_prefix('#').filter(|hex| hex.len() == 6) else {
         return Err(ThemeError::InvalidColor {
             field: field.to_string(),
@@ -258,7 +294,7 @@ fn parse_color(field: &str, value: &str) -> Result<Color, ThemeError> {
             value: value.to_string(),
         });
     };
-    Ok(rgb(red, green, blue))
+    Ok([red, green, blue])
 }
 
 #[cfg(test)]
@@ -312,6 +348,13 @@ delete = "#e26a75"
         assert_eq!(TOKYO_NIGHT_MOON.magenta, rgb(0xc0, 0x99, 0xff));
         assert_eq!(TOKYO_NIGHT_MOON.green, rgb(0xc3, 0xe8, 0x8d));
         assert_eq!(TOKYO_NIGHT_MOON.comment, rgb(0x63, 0x6d, 0xa6));
+        assert_eq!(
+            TOKYO_NIGHT_MOON.document,
+            DocumentPalette {
+                background: [0x1e, 0x20, 0x30],
+                foreground: [0xc8, 0xd3, 0xf5],
+            }
+        );
     }
 
     #[test]
@@ -319,6 +362,21 @@ delete = "#e26a75"
         assert_eq!(
             parse_theme(TOKYO_NIGHT_MOON_TOML).expect("theme"),
             TOKYO_NIGHT_MOON
+        );
+    }
+
+    #[test]
+    fn parses_document_palette_override() {
+        let text = TOKYO_NIGHT_MOON_TOML.replace(
+            "[git]",
+            "[document]\nbackground = \"#101820\"\nforeground = \"#d8e0e8\"\n\n[git]",
+        );
+        assert_eq!(
+            parse_theme(&text).expect("theme").document,
+            DocumentPalette {
+                background: [0x10, 0x18, 0x20],
+                foreground: [0xd8, 0xe0, 0xe8],
+            }
         );
     }
 

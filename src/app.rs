@@ -23,7 +23,8 @@ use crate::browser::BrowserState;
 use crate::config::Config;
 use crate::kitty::{self, Placement};
 use crate::pdf::{
-    DocumentId, FitMode, Frame, OutlineItem, RenderKey, RenderRequest, RenderWorker, WorkerMessage,
+    DarkModeStyle, DocumentId, FitMode, Frame, OutlineItem, RenderKey, RenderRequest, RenderWorker,
+    WorkerMessage,
 };
 use crate::terminal::{TerminalGuard, Viewport};
 use crate::theme::Palette;
@@ -137,14 +138,20 @@ struct AppDefaults {
     fit: FitMode,
     invert: bool,
     theme: Palette,
+    dark_mode_style: DarkModeStyle,
 }
 
 impl From<&Config> for AppDefaults {
     fn from(config: &Config) -> Self {
+        let theme = crate::theme::load_or_default(config.theme());
         Self {
             fit: config.fit_mode(),
             invert: config.dark_mode(),
-            theme: crate::theme::load_or_default(config.theme()),
+            dark_mode_style: DarkModeStyle::new(
+                theme.document.background,
+                theme.document.foreground,
+            ),
+            theme,
         }
     }
 }
@@ -157,6 +164,7 @@ struct Tab {
     page: u32,
     fit: FitMode,
     invert: bool,
+    dark_mode_style: DarkModeStyle,
     scroll_x: u32,
     scroll_y: u32,
     outline: Arc<Vec<OutlineItem>>,
@@ -178,6 +186,7 @@ impl Tab {
             height: viewport.pixel_height,
             fit: self.fit,
             invert: self.invert,
+            dark_mode_style: self.dark_mode_style,
         }
     }
 }
@@ -216,6 +225,7 @@ impl App {
                 page,
                 fit: default_fit,
                 invert: default_invert,
+                dark_mode_style: defaults.dark_mode_style,
                 scroll_x: 0,
                 scroll_y: 0,
                 outline: Arc::new(outline),
@@ -308,6 +318,10 @@ impl App {
                     page: 0,
                     fit: self.default_fit,
                     invert: self.default_invert,
+                    dark_mode_style: DarkModeStyle::new(
+                        self.theme.document.background,
+                        self.theme.document.foreground,
+                    ),
                     scroll_x: 0,
                     scroll_y: 0,
                     outline: Arc::new(outline),
@@ -687,6 +701,7 @@ impl App {
                 && cached.height == key.height
                 && cached.fit == key.fit
                 && cached.invert == key.invert
+                && cached.dark_mode_style == key.dark_mode_style
                 && cached.page.abs_diff(current_page) <= 1
         });
 
@@ -732,8 +747,11 @@ impl App {
         if let Some(previous) = self.visible_image_id.replace(image_id) {
             kitty::delete_image(output, previous)?;
         }
+        let dark_mode = frame.dark_mode_elapsed.map_or_else(String::new, |elapsed| {
+            format!("  dark {}ms", elapsed.as_millis())
+        });
         let state = format!(
-            "render {}ms  compress {}ms  transfer {}ms",
+            "render {}ms{dark_mode}  compress {}ms  transfer {}ms",
             frame.render_elapsed.as_millis(),
             frame.compression_elapsed.as_millis(),
             transfer_elapsed.as_millis()
@@ -1443,6 +1461,29 @@ fn picker_recent_heading_line(width: usize, colors: PickerTheme) -> Line<'static
     Line::from(spans)
 }
 
+fn truncate_left(value: &str, max_width: usize) -> String {
+    if Line::raw(value).width() <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let suffix_width = max_width.saturating_sub(1);
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for character in value.chars().rev() {
+        let width = Line::raw(character.to_string()).width();
+        if used + width > suffix_width {
+            break;
+        }
+        suffix.push(character);
+        used += width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
 fn picker_entry_line(
     entry: &crate::browser::BrowserEntry,
     browser: &BrowserState,
@@ -1508,7 +1549,28 @@ fn picker_entry_line(
     }
 
     let mut line = Line::from(spans);
-    let used = line.width();
+    let mut used = line.width();
+    if entry.is_recent
+        && browser.filter.is_empty()
+        && let Some(parent) = entry.path.parent()
+    {
+        let parent = shorten_path(&parent.to_string_lossy());
+        let available = width.saturating_sub(used + 2);
+        if available >= 3 {
+            let parent = truncate_left(&parent, available);
+            let parent_width = Line::raw(parent.as_str()).width();
+            let gap = width.saturating_sub(used + parent_width);
+            line.spans.push(Span::styled(
+                " ".repeat(gap),
+                Style::default().bg(background),
+            ));
+            line.spans.push(Span::styled(
+                parent,
+                Style::default().fg(colors.text_dim).bg(background),
+            ));
+            used = width;
+        }
+    }
     if used < width {
         line.spans.push(Span::styled(
             " ".repeat(width - used),
@@ -1706,7 +1768,7 @@ mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
         clear_picker, cycled_tab_index, draw_picker, filter_outline, outline_start_index,
-        picker_color, picker_rect, stale_status_row, write_clipboard_osc52,
+        picker_color, picker_rect, shorten_path, stale_status_row, write_clipboard_osc52,
     };
     use crate::pdf::OutlineItem;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1893,9 +1955,10 @@ mod tests {
     }
 
     #[test]
-    fn picker_labels_the_recent_files_section() {
+    fn picker_labels_recent_files_with_parent_directory() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let recent = directory.path().join("recent.pdf");
+        let parent = shorten_path(&directory.path().display().to_string());
         fs::write(&recent, b"synthetic").expect("PDF");
         let mut browser = BrowserState::new(directory.path().to_path_buf());
         browser.set_recents(vec![recent]);
@@ -1916,6 +1979,7 @@ mod tests {
             .collect();
 
         assert!(rendered.contains("Most Recent"));
+        assert!(rendered.contains(&parent));
     }
 
     #[test]
