@@ -9,7 +9,7 @@ use crossterm::terminal::{
 };
 
 use crate::kitty;
-use crate::theme::TOKYO_NIGHT_MOON;
+use crate::theme::Palette;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Viewport {
@@ -129,10 +129,9 @@ pub struct ImagePlacement {
 pub struct TerminalGuard;
 
 impl TerminalGuard {
-    pub fn enter(output: &mut impl Write) -> io::Result<Self> {
+    pub fn enter(output: &mut impl Write, theme: Palette) -> io::Result<Self> {
         force_color_output(true);
         terminal::enable_raw_mode()?;
-        let theme = TOKYO_NIGHT_MOON;
         if let Err(error) = execute!(
             output,
             EnterAlternateScreen,

@@ -14,7 +14,9 @@ use crate::pdf::FitMode;
 #[serde(default)]
 pub struct Config {
     fit_mode: FitModeSetting,
-    invert: bool,
+    #[serde(alias = "invert")]
+    dark_mode: bool,
+    theme: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -53,17 +55,27 @@ impl Config {
         }
     }
 
-    pub fn invert(&self) -> bool {
-        self.invert
+    pub fn dark_mode(&self) -> bool {
+        self.dark_mode
+    }
+
+    pub fn theme(&self) -> &str {
+        self.theme
+            .as_deref()
+            .unwrap_or(crate::theme::DEFAULT_THEME_NAME)
     }
 }
 
 fn config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("config.toml"))
+}
+
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("pdfterm").join("config.toml"))
+    Some(base.join("pdfterm"))
 }
 
 #[cfg(test)]
@@ -75,20 +87,34 @@ mod tests {
     fn empty_config_uses_defaults() {
         let config: Config = toml::from_str("").expect("empty config");
         assert_eq!(config.fit_mode(), FitMode::Page);
-        assert!(!config.invert());
+        assert!(!config.dark_mode());
+        assert_eq!(config.theme(), "tokyo-night-moon");
     }
 
     #[test]
-    fn parses_fit_mode_and_invert() {
+    fn parses_fit_mode_and_dark_mode() {
         let config: Config =
-            toml::from_str("fit_mode = \"width\"\ninvert = true\n").expect("config");
+            toml::from_str("fit_mode = \"width\"\ndark_mode = true\n").expect("config");
         assert_eq!(config.fit_mode(), FitMode::Width);
-        assert!(config.invert());
+        assert!(config.dark_mode());
+    }
+
+    #[test]
+    fn accepts_legacy_invert_name() {
+        let config: Config = toml::from_str("invert = true\n").expect("config");
+        assert!(config.dark_mode());
+    }
+
+    #[test]
+    fn parses_theme_name() {
+        let config: Config = toml::from_str("theme = \"moon\"\n").expect("config");
+        assert_eq!(config.theme(), "moon");
     }
 
     #[test]
     fn unknown_keys_are_ignored() {
-        let config: Config = toml::from_str("future_option = 42\ninvert = true\n").expect("config");
-        assert!(config.invert());
+        let config: Config =
+            toml::from_str("future_option = 42\ndark_mode = true\n").expect("config");
+        assert!(config.dark_mode());
     }
 }

@@ -12,6 +12,7 @@ pub struct BrowserEntry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_recent: bool,
 }
 
 pub struct BrowserState {
@@ -65,6 +66,7 @@ impl BrowserState {
                 name: "../".into(),
                 path: parent.to_path_buf(),
                 is_dir: true,
+                is_recent: false,
             });
         }
 
@@ -87,12 +89,14 @@ impl BrowserState {
                     name: format!("{name}/"),
                     path: entry.path(),
                     is_dir: true,
+                    is_recent: false,
                 });
             } else if is_pdf(&entry.path()) {
                 files.push(BrowserEntry {
                     name,
                     path: entry.path(),
                     is_dir: false,
+                    is_recent: false,
                 });
             }
         }
@@ -123,7 +127,10 @@ impl BrowserState {
             if !path.is_file() || !is_pdf(path) {
                 continue;
             }
-            if self.entries.iter().any(|entry| &entry.path == path) {
+            if let Some(position) = self.entries.iter().position(|entry| &entry.path == path) {
+                let mut entry = self.entries.remove(position);
+                entry.is_recent = true;
+                recent_entries.push(entry);
                 continue;
             }
             let file_name = path
@@ -131,9 +138,10 @@ impl BrowserState {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned());
             recent_entries.push(BrowserEntry {
-                name: format!("★ {file_name}"),
+                name: file_name,
                 path: path.clone(),
                 is_dir: false,
+                is_recent: true,
             });
         }
         for (offset, entry) in recent_entries.into_iter().enumerate() {
@@ -146,6 +154,7 @@ impl BrowserState {
             return;
         }
         let directory = self.current_dir.clone();
+        let recents = self.recents.clone();
         let (sender, receiver) = mpsc::channel();
         self.recursive_rx = Some(receiver);
         thread::spawn(move || {
@@ -154,6 +163,7 @@ impl BrowserState {
                 .into_iter()
                 .map(|(name, path)| BrowserEntry {
                     name,
+                    is_recent: recents.contains(&path),
                     path,
                     is_dir: false,
                 })
@@ -165,6 +175,7 @@ impl BrowserState {
                             name: entry.file_name().to_string_lossy().into_owned(),
                             path: entry.path(),
                             is_dir: false,
+                            is_recent: false,
                         });
                     }
                 }
@@ -222,6 +233,24 @@ impl BrowserState {
         self.filtered_indices
             .iter()
             .filter_map(|index| self.active_source().get(*index))
+    }
+
+    pub fn match_indices(&self, name: &str) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return Vec::new();
+        }
+        let pattern = Pattern::parse(&self.filter, CaseMatching::Ignore, Normalization::Smart);
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let mut buffer = Vec::new();
+        let haystack = Utf32Str::new(name, &mut buffer);
+        let mut indices = Vec::new();
+        let _ = pattern.indices(haystack, &mut matcher, &mut indices);
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .filter_map(|index| usize::try_from(index).ok())
+            .collect()
     }
 
     pub fn select_down(&mut self) {
@@ -382,17 +411,17 @@ mod tests {
         let mut browser = BrowserState::new(directory.path().to_path_buf());
         browser.set_recents(vec![recent.clone()]);
 
-        let starred = browser
+        let recent_position = browser
             .entries
             .iter()
-            .position(|entry| entry.name == "★ z-recent.pdf")
+            .position(|entry| entry.name == "z-recent.pdf" && entry.is_recent)
             .expect("recent entry present");
         let listed = browser
             .entries
             .iter()
             .position(|entry| entry.name == "b.pdf")
             .expect("directory entry present");
-        assert!(starred < listed);
+        assert!(recent_position < listed);
     }
 
     #[test]
@@ -410,5 +439,20 @@ mod tests {
             .filter(|entry| entry.name.contains("here.pdf"))
             .count();
         assert_eq!(count, 1);
+        let entry = browser
+            .entries
+            .iter()
+            .find(|entry| entry.name == "here.pdf")
+            .expect("recent entry");
+        assert!(entry.is_recent);
+    }
+
+    #[test]
+    fn fuzzy_match_indices_identify_highlighted_characters() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.filter = "gss".to_string();
+
+        assert_eq!(browser.match_indices("genesis.pdf"), vec![0, 4, 6]);
     }
 }

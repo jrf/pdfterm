@@ -26,7 +26,7 @@ use crate::pdf::{
     DocumentId, FitMode, Frame, OutlineItem, RenderKey, RenderRequest, RenderWorker, WorkerMessage,
 };
 use crate::terminal::{TerminalGuard, Viewport};
-use crate::theme::TOKYO_NIGHT_MOON;
+use crate::theme::Palette;
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
@@ -54,10 +54,12 @@ pub fn run(
     }
 
     let mut output = io::stdout();
-    let _terminal = TerminalGuard::enter(&mut output)?;
+    let defaults = AppDefaults::from(config);
+    let theme = defaults.theme;
+    let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
         Some(path) => path.canonicalize()?,
-        None => match pick_pdf(std::env::current_dir()?, &mut output)? {
+        None => match pick_pdf(std::env::current_dir()?, &mut output, theme)? {
             Some(path) => path,
             None => return Ok(()),
         },
@@ -73,7 +75,7 @@ pub fn run(
         path,
         watcher,
         outline,
-        config,
+        defaults,
     );
     app.request_current(&mut output)?;
 
@@ -127,6 +129,24 @@ struct App {
     default_fit: FitMode,
     default_invert: bool,
     goto_input: Option<String>,
+    theme: Palette,
+}
+
+#[derive(Clone, Copy)]
+struct AppDefaults {
+    fit: FitMode,
+    invert: bool,
+    theme: Palette,
+}
+
+impl From<&Config> for AppDefaults {
+    fn from(config: &Config) -> Self {
+        Self {
+            fit: config.fit_mode(),
+            invert: config.dark_mode(),
+            theme: crate::theme::load_or_default(config.theme()),
+        }
+    }
 }
 
 struct Tab {
@@ -181,10 +201,10 @@ impl App {
         path: PathBuf,
         watcher: FileWatcher,
         outline: Vec<OutlineItem>,
-        config: &Config,
+        defaults: AppDefaults,
     ) -> Self {
-        let default_fit = config.fit_mode();
-        let default_invert = config.invert();
+        let default_fit = defaults.fit;
+        let default_invert = defaults.invert;
         Self {
             worker,
             pending_open: None,
@@ -212,6 +232,7 @@ impl App {
             default_fit,
             default_invert,
             goto_input: None,
+            theme: defaults.theme,
         }
     }
 
@@ -339,7 +360,7 @@ impl App {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        match pick_pdf(directory, output)? {
+        match pick_pdf(directory, output, self.theme)? {
             Some(path) => {
                 let path = path.canonicalize()?;
                 if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
@@ -373,7 +394,7 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        let selection = pick_outline(&outline, self.tab().page, output)?;
+        let selection = pick_outline(&outline, self.tab().page, output, self.theme)?;
         if let Some(page) = selection {
             let page = page.min(self.tab().page_count - 1);
             self.tab_mut().page = page;
@@ -433,7 +454,7 @@ impl App {
     }
 
     fn draw_goto(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
-        let theme = TOKYO_NIGHT_MOON;
+        let theme = self.theme;
         let input = self.goto_input.as_deref().unwrap_or_default();
         let hint = format!(
             "  (1-{}, enter to jump, esc to cancel)",
@@ -727,7 +748,7 @@ impl App {
         viewport: Viewport,
         state: &str,
     ) -> io::Result<()> {
-        let theme = TOKYO_NIGHT_MOON;
+        let theme = self.theme;
         let tab = self.tab();
         let mut mode = String::new();
         if tab.fit != FitMode::Page {
@@ -815,7 +836,7 @@ impl App {
     }
 
     fn clear_viewer(&mut self, output: &mut impl Write) -> io::Result<()> {
-        let theme = TOKYO_NIGHT_MOON;
+        let theme = self.theme;
         kitty::delete_all(output)?;
         self.visible_image_id = None;
         self.last_status_row = None;
@@ -832,7 +853,7 @@ impl App {
     fn prepare_viewport(&mut self, output: &mut impl Write) -> io::Result<Viewport> {
         let viewport = self.viewport()?;
         if let Some(row) = stale_status_row(self.last_status_row, viewport.status_row) {
-            let theme = TOKYO_NIGHT_MOON;
+            let theme = self.theme;
             execute!(
                 output,
                 MoveTo(0, row),
@@ -849,7 +870,7 @@ impl App {
         if self.tabs.len() < 2 {
             return Ok(());
         }
-        let theme = TOKYO_NIGHT_MOON;
+        let theme = self.theme;
         let columns = usize::from(crossterm::terminal::size()?.0);
         execute!(
             output,
@@ -941,7 +962,11 @@ fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
     }
 }
 
-fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBuf>, AppError> {
+fn pick_pdf(
+    directory: PathBuf,
+    output: &mut impl Write,
+    theme: Palette,
+) -> Result<Option<PathBuf>, AppError> {
     let mut browser = BrowserState::new(directory);
     browser.set_recents(crate::recent::load());
     browser.preload_recursive();
@@ -959,7 +984,7 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
             let area = terminal.size()?;
             visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
             browser.adjust_scroll(visible_height);
-            terminal.draw(|frame| draw_picker(frame, &browser))?;
+            terminal.draw(|frame| draw_picker(frame, &browser, theme))?;
             redraw = false;
         }
 
@@ -1006,12 +1031,11 @@ fn pick_pdf(directory: PathBuf, output: &mut impl Write) -> Result<Option<PathBu
         redraw = true;
     };
     drop(terminal);
-    clear_picker(output)?;
+    clear_picker(output, theme)?;
     Ok(selection)
 }
 
-fn clear_picker(output: &mut impl Write) -> io::Result<()> {
-    let theme = TOKYO_NIGHT_MOON;
+fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
     execute!(
         output,
         SetBackgroundColor(theme.bg),
@@ -1026,6 +1050,7 @@ fn pick_outline(
     items: &[OutlineItem],
     current_page: u32,
     output: &mut impl Write,
+    theme: Palette,
 ) -> Result<Option<u32>, AppError> {
     let mut filter = String::new();
     let mut filtered: Vec<usize> = (0..items.len()).collect();
@@ -1047,7 +1072,15 @@ fn pick_outline(
                 scroll_offset = selected - visible_height + 1;
             }
             terminal.draw(|frame| {
-                draw_outline(frame, items, &filtered, selected, scroll_offset, &filter)
+                draw_outline(
+                    frame,
+                    items,
+                    &filtered,
+                    selected,
+                    scroll_offset,
+                    &filter,
+                    theme,
+                )
             })?;
             redraw = false;
         }
@@ -1100,7 +1133,7 @@ fn pick_outline(
         redraw = true;
     };
     drop(terminal);
-    clear_picker(output)?;
+    clear_picker(output, theme)?;
     Ok(selection)
 }
 
@@ -1144,23 +1177,26 @@ fn draw_outline(
     selected: usize,
     scroll_offset: usize,
     filter: &str,
+    theme: Palette,
 ) {
-    let theme = TOKYO_NIGHT_MOON;
+    let colors = PickerTheme::from(theme);
     let area = frame.area();
     let popup = picker_rect(area);
     frame.render_widget(
-        Block::default().style(Style::default().bg(picker_color(theme.bg))),
+        Block::default().style(Style::default().bg(colors.backdrop)),
         area,
     );
     frame.render_widget(RatatuiClear, popup);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(picker_color(theme.blue)))
+        .style(Style::default().bg(colors.surface).fg(colors.text))
+        .border_style(Style::default().fg(colors.border))
         .title(" Outline ")
         .title_style(
             Style::default()
-                .fg(picker_color(theme.blue))
+                .fg(colors.accent)
+                .bg(colors.surface)
                 .add_modifier(Modifier::BOLD),
         );
     let inner = block.inner(popup);
@@ -1175,15 +1211,18 @@ fn draw_outline(
     let filter_line = if filter.is_empty() {
         Line::from(Span::styled(
             " type to filter...",
-            Style::default().fg(picker_color(theme.comment)),
+            Style::default().fg(colors.muted).bg(colors.chrome),
         ))
     } else {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(picker_color(theme.blue))),
-            Span::styled(filter, Style::default().fg(picker_color(theme.fg))),
+            Span::styled(" > ", Style::default().fg(colors.accent).bg(colors.chrome)),
+            Span::styled(filter, Style::default().fg(colors.text).bg(colors.chrome)),
         ])
     };
-    frame.render_widget(Paragraph::new(filter_line), rows[0]);
+    frame.render_widget(
+        Paragraph::new(filter_line).style(Style::default().bg(colors.chrome)),
+        rows[0],
+    );
 
     let visible_height = usize::from(rows[1].height);
     let width = usize::from(rows[1].width);
@@ -1196,18 +1235,16 @@ fn draw_outline(
             let item = &items[*item_index];
             let is_selected = position == selected;
             let style = if is_selected {
-                Style::default()
-                    .fg(picker_color(theme.fg))
-                    .bg(picker_color(theme.bg_highlight))
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(colors.text).bg(colors.selection)
             } else {
-                Style::default().fg(picker_color(theme.fg))
+                Style::default().fg(colors.text).bg(colors.surface)
             };
             let indent = "  ".repeat(usize::from(item.depth).min(6) + 1);
             let page_label = format!(" {} ", item.page + 1);
             let mut line = Line::from(vec![
+                Span::styled(if is_selected { "▌" } else { " " }, style.fg(colors.accent)),
                 Span::styled(indent, style),
-                Span::styled(item.title.clone(), style),
+                Span::styled(item.title.clone(), style.add_modifier(Modifier::BOLD)),
             ]);
             let used = line.width();
             let page_width = page_label.chars().count();
@@ -1215,7 +1252,7 @@ fn draw_outline(
                 let page_style = if is_selected {
                     style
                 } else {
-                    Style::default().fg(picker_color(theme.comment))
+                    Style::default().fg(colors.muted).bg(colors.surface)
                 };
                 line.spans
                     .push(Span::styled(" ".repeat(width - used - page_width), style));
@@ -1227,16 +1264,21 @@ fn draw_outline(
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "   No matches",
-            Style::default().fg(picker_color(theme.comment)),
+            Style::default().fg(colors.muted).bg(colors.surface),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), rows[1]);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
+        rows[1],
+    );
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " enter:jump  esc:close",
-            Style::default().fg(picker_color(theme.comment)),
-        ))),
+        Paragraph::new(picker_hint_line(
+            &[("enter", "jump"), ("esc", "close")],
+            None,
+            colors,
+        ))
+        .style(Style::default().bg(colors.chrome)),
         rows[2],
     );
 }
@@ -1261,13 +1303,13 @@ fn apply_picker_navigation(
     true
 }
 
-fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
-    let theme = TOKYO_NIGHT_MOON;
+fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette) {
+    let colors = PickerTheme::from(theme);
     let entries: Vec<_> = browser.filtered_entries().collect();
     let area = frame.area();
     let popup = picker_rect(area);
     frame.render_widget(
-        Block::default().style(Style::default().bg(picker_color(theme.bg))),
+        Block::default().style(Style::default().bg(colors.backdrop)),
         area,
     );
     frame.render_widget(RatatuiClear, popup);
@@ -1275,11 +1317,13 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
     let directory = shorten_path(&browser.current_dir.display().to_string());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(picker_color(theme.blue)))
+        .style(Style::default().bg(colors.surface).fg(colors.text))
+        .border_style(Style::default().fg(colors.border))
         .title(format!(" {directory} "))
         .title_style(
             Style::default()
-                .fg(picker_color(theme.blue))
+                .fg(colors.accent)
+                .bg(colors.surface)
                 .add_modifier(Modifier::BOLD),
         );
     let inner = block.inner(popup);
@@ -1294,18 +1338,21 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
     let filter = if browser.filter.is_empty() {
         Line::from(Span::styled(
             " type to filter...",
-            Style::default().fg(picker_color(theme.comment)),
+            Style::default().fg(colors.muted).bg(colors.chrome),
         ))
     } else {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(picker_color(theme.blue))),
+            Span::styled(" > ", Style::default().fg(colors.accent).bg(colors.chrome)),
             Span::styled(
                 browser.filter.as_str(),
-                Style::default().fg(picker_color(theme.fg)),
+                Style::default().fg(colors.text).bg(colors.chrome),
             ),
         ])
     };
-    frame.render_widget(Paragraph::new(filter), rows[0]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(colors.chrome)),
+        rows[0],
+    );
 
     let visible_height = usize::from(rows[1].height);
     let mut lines: Vec<Line> = entries
@@ -1314,40 +1361,13 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
         .skip(browser.scroll_offset)
         .take(visible_height)
         .map(|(index, entry)| {
-            let selected = index == browser.selected;
-            let style = if selected {
-                Style::default()
-                    .fg(picker_color(theme.fg))
-                    .bg(picker_color(theme.bg_highlight))
-                    .add_modifier(Modifier::BOLD)
-            } else if entry.name == "../" {
-                Style::default().fg(picker_color(theme.fg_dark))
-            } else if entry.is_dir {
-                Style::default().fg(picker_color(theme.blue))
-            } else {
-                Style::default().fg(picker_color(theme.fg))
-            };
-            let icon = if entry.name == "../" {
-                "^ "
-            } else if entry.is_dir {
-                "/ "
-            } else {
-                "  "
-            };
-            let mut line = Line::from(vec![
-                Span::styled("   ", style),
-                Span::styled(icon, style),
-                Span::styled(entry.name.as_str(), style),
-            ]);
-            if selected {
-                let used = line.width();
-                let width = usize::from(rows[1].width);
-                if used < width {
-                    line.spans
-                        .push(Span::styled(" ".repeat(width - used), style));
-                }
-            }
-            line
+            picker_entry_line(
+                entry,
+                browser,
+                index == browser.selected,
+                usize::from(rows[1].width),
+                colors,
+            )
         })
         .collect();
     if lines.is_empty() {
@@ -1358,23 +1378,139 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState) {
         };
         lines.push(Line::from(Span::styled(
             message,
-            Style::default().fg(picker_color(theme.comment)),
+            Style::default().fg(colors.muted).bg(colors.surface),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), rows[1]);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
+        rows[1],
+    );
 
-    let hint = if browser.recursive_loading() {
-        " enter:open  esc:close  (loading...)"
+    let status = if browser.recursive_loading() {
+        Some((
+            format!("scanning • {} shown", entries.len()),
+            colors.loading,
+        ))
     } else {
-        " enter:open  esc:close"
+        let position = if entries.is_empty() {
+            0
+        } else {
+            browser.selected + 1
+        };
+        Some((format!("{position}/{}", entries.len()), colors.muted))
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(picker_color(theme.comment)),
-        ))),
+        Paragraph::new(picker_hint_line(
+            &[("enter", "open"), ("esc", "close")],
+            status,
+            colors,
+        ))
+        .style(Style::default().bg(colors.chrome)),
         rows[2],
     );
+}
+
+fn picker_entry_line(
+    entry: &crate::browser::BrowserEntry,
+    browser: &BrowserState,
+    selected: bool,
+    width: usize,
+    colors: PickerTheme,
+) -> Line<'static> {
+    let background = if selected {
+        colors.selection
+    } else {
+        colors.surface
+    };
+    let marker_style = Style::default().fg(colors.accent).bg(background);
+    let icon = if entry.name == "../" {
+        "↑ "
+    } else if entry.is_dir {
+        "› "
+    } else {
+        "  "
+    };
+    let icon_color = if entry.name == "../" {
+        colors.text_dim
+    } else if entry.is_dir {
+        colors.directory
+    } else if entry.is_recent {
+        colors.recent
+    } else {
+        colors.text
+    };
+    let mut spans = vec![
+        Span::styled(if selected { "▌ " } else { "  " }, marker_style),
+        Span::styled(icon, Style::default().fg(icon_color).bg(background)),
+    ];
+
+    let matches = browser.match_indices(&entry.name);
+    let basename_start = if entry.is_dir {
+        0
+    } else {
+        entry
+            .name
+            .char_indices()
+            .rev()
+            .find(|(_, character)| *character == '/')
+            .map_or(0, |(index, _)| entry.name[..=index].chars().count())
+    };
+    for (index, character) in entry.name.chars().enumerate() {
+        let foreground = if matches.binary_search(&index).is_ok() {
+            colors.matched
+        } else if index < basename_start || entry.name == "../" {
+            colors.text_dim
+        } else if entry.is_recent {
+            colors.recent
+        } else if entry.is_dir {
+            colors.directory
+        } else {
+            colors.text
+        };
+        let mut style = Style::default().fg(foreground).bg(background);
+        if matches.binary_search(&index).is_ok() || (selected && index >= basename_start) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(character.to_string(), style));
+    }
+
+    let mut line = Line::from(spans);
+    let used = line.width();
+    if used < width {
+        line.spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(background),
+        ));
+    }
+    line
+}
+
+fn picker_hint_line(
+    bindings: &[(&str, &str)],
+    status: Option<(String, RatatuiColor)>,
+    colors: PickerTheme,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(" ", Style::default().bg(colors.chrome))];
+    for (key, action) in bindings {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(colors.accent)
+                .bg(colors.selection)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {action}  "),
+            Style::default().fg(colors.muted).bg(colors.chrome),
+        ));
+    }
+    if let Some((status, color)) = status {
+        spans.push(Span::styled(
+            status,
+            Style::default().fg(color).bg(colors.chrome),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn picker_rect(area: Rect) -> Rect {
@@ -1409,6 +1545,43 @@ fn picker_color(color: crossterm::style::Color) -> RatatuiColor {
     match color {
         crossterm::style::Color::Rgb { r, g, b } => RatatuiColor::Rgb(r, g, b),
         _ => RatatuiColor::Reset,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PickerTheme {
+    backdrop: RatatuiColor,
+    surface: RatatuiColor,
+    chrome: RatatuiColor,
+    selection: RatatuiColor,
+    border: RatatuiColor,
+    accent: RatatuiColor,
+    directory: RatatuiColor,
+    recent: RatatuiColor,
+    matched: RatatuiColor,
+    loading: RatatuiColor,
+    text: RatatuiColor,
+    text_dim: RatatuiColor,
+    muted: RatatuiColor,
+}
+
+impl From<Palette> for PickerTheme {
+    fn from(theme: Palette) -> Self {
+        Self {
+            backdrop: picker_color(theme.bg_dark1),
+            surface: picker_color(theme.bg),
+            chrome: picker_color(theme.bg_dark),
+            selection: picker_color(theme.bg_highlight),
+            border: picker_color(theme.blue7),
+            accent: picker_color(theme.blue),
+            directory: picker_color(theme.blue1),
+            recent: picker_color(theme.yellow),
+            matched: picker_color(theme.magenta),
+            loading: picker_color(theme.cyan),
+            text: picker_color(theme.fg),
+            text_dim: picker_color(theme.fg_dark),
+            muted: picker_color(theme.comment),
+        }
     }
 }
 
@@ -1500,7 +1673,7 @@ mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
         clear_picker, cycled_tab_index, draw_picker, filter_outline, outline_start_index,
-        picker_rect, stale_status_row, write_clipboard_osc52,
+        picker_color, picker_rect, stale_status_row, write_clipboard_osc52,
     };
     use crate::pdf::OutlineItem;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1645,7 +1818,7 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_picker(frame, &browser))
+            .draw(|frame| draw_picker(frame, &browser, crate::theme::TOKYO_NIGHT_MOON))
             .expect("draw picker");
         let buffer = terminal.backend().buffer();
         let right = popup.x + popup.width - 1;
@@ -1658,10 +1831,39 @@ mod tests {
     }
 
     #[test]
+    fn picker_uses_layered_theme_and_selection_marker() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("one.pdf"), b"synthetic").expect("PDF");
+        let browser = BrowserState::new(directory.path().to_path_buf());
+        let area = Rect::new(0, 0, 80, 30);
+        let popup = picker_rect(area);
+        let theme = crate::theme::TOKYO_NIGHT_MOON;
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_picker(frame, &browser, theme))
+            .expect("draw picker");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(0, 0)].bg, picker_color(theme.bg_dark1));
+        assert_eq!(buffer[(popup.x, popup.y)].fg, picker_color(theme.blue7));
+        assert_eq!(
+            buffer[(popup.x + 1, popup.y + 1)].bg,
+            picker_color(theme.bg_dark)
+        );
+        assert_eq!(buffer[(popup.x + 1, popup.y + 2)].symbol(), "▌");
+        assert_eq!(
+            buffer[(popup.x + 1, popup.y + 2)].bg,
+            picker_color(theme.bg_highlight)
+        );
+    }
+
+    #[test]
     fn closing_picker_clears_its_terminal_buffer() {
         let mut output = Vec::new();
 
-        clear_picker(&mut output).expect("clear picker");
+        clear_picker(&mut output, crate::theme::TOKYO_NIGHT_MOON).expect("clear picker");
 
         assert!(output.windows(4).any(|window| window == b"\x1b[2J"));
     }
