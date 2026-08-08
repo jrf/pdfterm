@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::style::{Print, SetBackgroundColor, SetForegroundColor};
+use crossterm::style::{Attribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
 use ratatui::Frame as RatatuiFrame;
 use ratatui::Terminal;
@@ -875,7 +875,8 @@ impl App {
         execute!(
             output,
             MoveTo(0, 0),
-            SetBackgroundColor(theme.bg_dark),
+            SetBackgroundColor(theme.bg_dark1),
+            SetForegroundColor(theme.dark3),
             Clear(ClearType::CurrentLine)
         )?;
         let mut used = 0;
@@ -893,15 +894,17 @@ impl App {
             if index == self.active_tab {
                 execute!(
                     output,
-                    SetBackgroundColor(theme.bg_highlight),
-                    SetForegroundColor(theme.fg),
-                    Print(&label)
+                    SetBackgroundColor(theme.blue),
+                    SetForegroundColor(theme.bg_dark),
+                    SetAttribute(Attribute::Bold),
+                    Print(&label),
+                    SetAttribute(Attribute::NormalIntensity)
                 )?;
             } else {
                 execute!(
                     output,
-                    SetBackgroundColor(theme.bg_dark),
-                    SetForegroundColor(theme.fg_dark),
+                    SetBackgroundColor(theme.bg),
+                    SetForegroundColor(theme.dark3),
                     Print(&label)
                 )?;
             }
