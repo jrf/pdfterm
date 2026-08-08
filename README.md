@@ -73,13 +73,16 @@ fit_mode = "page"
 # enable Polaris-style dark mode by default
 dark_mode = true
 
-# load ~/.config/pdfterm/themes/tokyo-night-moon.toml
+# load ~/.config/themes/tokyo-night-moon.toml
 theme = "tokyo-night-moon"
 ```
 
 The legacy `invert` key remains accepted as an alias for `dark_mode`. Theme names
-may contain letters, numbers, dashes, and underscores. Theme files contain the
-complete color palette using `#RRGGBB` values:
+may contain letters, numbers, dashes, and underscores. Shared themes are loaded
+from `~/.config/themes/`; a file with the same name in
+`~/.config/pdfterm/themes/` overrides it. Both the shared `[colors]`/`[ui]`
+schema and pdfterm's legacy complete-palette schema are accepted. Legacy theme
+files contain the complete color palette using `#RRGGBB` values:
 
 ```toml
 bg = "#222436"

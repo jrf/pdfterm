@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::style::Color;
 use serde::Deserialize;
@@ -155,6 +156,15 @@ struct GitPaletteFile {
     delete: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SharedPaletteFile {
+    colors: BTreeMap<String, String>,
+    #[serde(default)]
+    ui: BTreeMap<String, String>,
+    document: Option<DocumentPaletteFile>,
+    git: Option<GitPaletteFile>,
+}
+
 #[derive(Debug, Error)]
 pub enum ThemeError {
     #[error("invalid theme name {0:?}; use letters, numbers, dashes, or underscores")]
@@ -200,8 +210,8 @@ pub fn load(name: &str) -> Result<Palette, ThemeError> {
     {
         return Err(ThemeError::InvalidName(name.to_string()));
     }
-    let directory = crate::config::config_dir().ok_or(ThemeError::MissingConfigDirectory)?;
-    let path = directory.join("themes").join(format!("{name}.toml"));
+    let config_root = crate::config::config_root().ok_or(ThemeError::MissingConfigDirectory)?;
+    let path = theme_path(&config_root, name);
     let text = fs::read_to_string(&path).map_err(|source| ThemeError::Read {
         path: path.clone(),
         source,
@@ -212,11 +222,39 @@ pub fn load(name: &str) -> Result<Palette, ThemeError> {
     })
 }
 
+fn theme_path(config_root: &Path, name: &str) -> PathBuf {
+    let app_path = config_root
+        .join("pdfterm")
+        .join("themes")
+        .join(format!("{name}.toml"));
+    let shared_path = config_root.join("themes").join(format!("{name}.toml"));
+    if app_path.is_file() || !shared_path.is_file() {
+        app_path
+    } else {
+        shared_path
+    }
+}
+
 fn parse_theme(text: &str) -> Result<Palette, ThemeError> {
-    let file: PaletteFile = toml::from_str(text).map_err(|source| ThemeError::Parse {
+    let value: toml::Value = toml::from_str(text).map_err(|source| ThemeError::Parse {
         path: PathBuf::from("<theme>"),
         source,
     })?;
+    if value.get("colors").is_some() {
+        let file: SharedPaletteFile = value.try_into().map_err(|source| ThemeError::Parse {
+            path: PathBuf::from("<theme>"),
+            source,
+        })?;
+        return parse_shared_theme(&file);
+    }
+    let file: PaletteFile = value.try_into().map_err(|source| ThemeError::Parse {
+        path: PathBuf::from("<theme>"),
+        source,
+    })?;
+    parse_legacy_theme(&file)
+}
+
+fn parse_legacy_theme(file: &PaletteFile) -> Result<Palette, ThemeError> {
     let document = if let Some(document) = &file.document {
         DocumentPalette {
             background: parse_rgb("document.background", &document.background)?,
@@ -271,6 +309,257 @@ fn parse_theme(text: &str) -> Result<Palette, ThemeError> {
             delete: parse_color("git.delete", &file.git.delete)?,
         },
     })
+}
+
+fn parse_shared_theme(file: &SharedPaletteFile) -> Result<Palette, ThemeError> {
+    let bg = shared_color(
+        file,
+        "bg",
+        &["background"],
+        &["bg", "base"],
+        TOKYO_NIGHT_MOON.bg,
+    )?;
+    let bg_dark = shared_color(
+        file,
+        "bg_dark",
+        &["background_dark", "background"],
+        &["bg_dark", "mantle", "bg"],
+        bg,
+    )?;
+    let bg_dark1 = shared_color(
+        file,
+        "bg_dark1",
+        &["background_deep", "background_dark"],
+        &["bg_dark1", "crust", "bg_dark", "mantle"],
+        bg_dark,
+    )?;
+    let bg_highlight = shared_color(
+        file,
+        "bg_highlight",
+        &["cursor_bg", "selection"],
+        &["bg_highlight", "surface0", "bg"],
+        bg,
+    )?;
+    let fg = shared_color(file, "fg", &["text"], &["fg", "text"], TOKYO_NIGHT_MOON.fg)?;
+    let fg_dark = shared_color(
+        file,
+        "fg_dark",
+        &["text_dim"],
+        &["fg_dark", "fg_dim", "subtext0", "comment"],
+        fg,
+    )?;
+    let fg_gutter = shared_color(
+        file,
+        "fg_gutter",
+        &["border", "text_muted"],
+        &["fg_gutter", "fg_muted", "surface1", "overlay0"],
+        fg_dark,
+    )?;
+    let blue = shared_color(
+        file,
+        "blue",
+        &["selection", "heading"],
+        &["blue", "lavender", "fg_bright", "fg"],
+        fg,
+    )?;
+    let blue0 = shared_color(file, "blue0", &[], &["blue0", "sapphire", "blue"], blue)?;
+    let blue1 = shared_color(
+        file,
+        "blue1",
+        &["key"],
+        &["blue1", "sky", "cyan", "blue"],
+        blue,
+    )?;
+    let blue2 = shared_color(
+        file,
+        "blue2",
+        &[],
+        &["blue2", "teal", "cyan", "blue"],
+        blue1,
+    )?;
+    let blue5 = shared_color(file, "blue5", &[], &["blue5", "sky", "cyan", "blue"], blue1)?;
+    let blue6 = shared_color(
+        file,
+        "blue6",
+        &[],
+        &["blue6", "lavender", "cyan", "blue"],
+        blue5,
+    )?;
+    let blue7 = shared_color(
+        file,
+        "blue7",
+        &["border"],
+        &["blue7", "overlay0", "fg_muted"],
+        fg_gutter,
+    )?;
+    let comment = shared_color(
+        file,
+        "comment",
+        &["text_dim", "text_muted"],
+        &["comment", "overlay0", "fg_dim"],
+        fg_dark,
+    )?;
+    let cyan = shared_color(
+        file,
+        "cyan",
+        &["key"],
+        &["cyan", "sky", "aqua", "blue1"],
+        blue1,
+    )?;
+    let dark3 = shared_color(
+        file,
+        "dark3",
+        &[],
+        &["dark3", "overlay1", "fg_muted"],
+        fg_gutter,
+    )?;
+    let dark5 = shared_color(
+        file,
+        "dark5",
+        &[],
+        &["dark5", "overlay2", "fg_dim"],
+        fg_dark,
+    )?;
+    let green = shared_color(
+        file,
+        "green",
+        &[],
+        &["green", "teal", "lime", "fg_bright"],
+        fg,
+    )?;
+    let green1 = shared_color(file, "green1", &[], &["green1", "teal", "green"], green)?;
+    let green2 = shared_color(file, "green2", &[], &["green2", "teal", "green"], green1)?;
+    let magenta = shared_color(
+        file,
+        "magenta",
+        &["accent"],
+        &["magenta", "mauve", "pink", "fg_bright"],
+        fg,
+    )?;
+    let magenta2 = shared_color(
+        file,
+        "magenta2",
+        &[],
+        &["magenta2", "pink", "mauve"],
+        magenta,
+    )?;
+    let orange = shared_color(file, "orange", &[], &["orange", "peach", "yellow"], magenta)?;
+    let purple = shared_color(
+        file,
+        "purple",
+        &[],
+        &["purple", "mauve", "pink", "magenta"],
+        magenta,
+    )?;
+    let red = shared_color(file, "red", &["error"], &["red", "maroon"], magenta)?;
+    let red1 = shared_color(file, "red1", &[], &["red1", "maroon", "red"], red)?;
+    let teal = shared_color(file, "teal", &[], &["teal", "cyan", "green"], cyan)?;
+    let terminal_black = shared_color(
+        file,
+        "terminal_black",
+        &["background_deep"],
+        &["terminal_black", "crust", "bg_dark1"],
+        bg_dark1,
+    )?;
+    let yellow = shared_color(
+        file,
+        "yellow",
+        &["heading"],
+        &["yellow", "peach", "fg_bright"],
+        fg,
+    )?;
+
+    let document = if let Some(document) = &file.document {
+        DocumentPalette {
+            background: parse_rgb("document.background", &document.background)?,
+            foreground: parse_rgb("document.foreground", &document.foreground)?,
+        }
+    } else {
+        DocumentPalette {
+            background: rgb_channels(bg_dark),
+            foreground: rgb_channels(fg),
+        }
+    };
+    let git = if let Some(git) = &file.git {
+        GitPalette {
+            add: parse_color("git.add", &git.add)?,
+            change: parse_color("git.change", &git.change)?,
+            delete: parse_color("git.delete", &git.delete)?,
+        }
+    } else {
+        GitPalette {
+            add: green,
+            change: blue,
+            delete: red,
+        }
+    };
+
+    Ok(Palette {
+        bg,
+        bg_dark,
+        bg_dark1,
+        bg_highlight,
+        blue,
+        blue0,
+        blue1,
+        blue2,
+        blue5,
+        blue6,
+        blue7,
+        comment,
+        cyan,
+        dark3,
+        dark5,
+        fg,
+        fg_dark,
+        fg_gutter,
+        green,
+        green1,
+        green2,
+        magenta,
+        magenta2,
+        orange,
+        purple,
+        red,
+        red1,
+        teal,
+        terminal_black,
+        yellow,
+        document,
+        git,
+    })
+}
+
+fn shared_color(
+    file: &SharedPaletteFile,
+    field: &str,
+    ui_roles: &[&str],
+    color_names: &[&str],
+    fallback: Color,
+) -> Result<Color, ThemeError> {
+    for role in ui_roles {
+        if let Some(reference) = file.ui.get(*role) {
+            if reference.starts_with('#') {
+                return parse_color(field, reference);
+            }
+            if let Some(value) = file.colors.get(reference) {
+                return parse_color(field, value);
+            }
+        }
+    }
+    for name in color_names {
+        if let Some(value) = file.colors.get(*name) {
+            return parse_color(field, value);
+        }
+    }
+    Ok(fallback)
+}
+
+fn rgb_channels(color: Color) -> [u8; 3] {
+    match color {
+        Color::Rgb { r, g, b } => [r, g, b],
+        _ => [0, 0, 0],
+    }
 }
 
 fn parse_color(field: &str, value: &str) -> Result<Color, ThemeError> {
@@ -378,6 +667,71 @@ delete = "#e26a75"
                 foreground: [0xd8, 0xe0, 0xe8],
             }
         );
+    }
+
+    #[test]
+    fn parses_shared_catppuccin_palette() {
+        let theme = parse_theme(
+            r##"
+[colors]
+base = "#1e1e2e"
+mantle = "#181825"
+crust = "#11111b"
+surface0 = "#313244"
+surface1 = "#45475a"
+overlay0 = "#6c7086"
+overlay1 = "#7f849c"
+overlay2 = "#9399b2"
+text = "#cdd6f4"
+subtext0 = "#a6adc8"
+red = "#f38ba8"
+maroon = "#eba0ac"
+peach = "#fab387"
+yellow = "#f9e2af"
+green = "#a6e3a1"
+teal = "#94e2d5"
+sky = "#89dceb"
+blue = "#89b4fa"
+mauve = "#cba6f7"
+pink = "#f5c2e7"
+
+[ui]
+background = "base"
+background_dark = "mantle"
+background_deep = "crust"
+border = "surface1"
+accent = "mauve"
+selection = "blue"
+key = "sky"
+text = "text"
+text_dim = "subtext0"
+error = "red"
+cursor_bg = "surface0"
+"##,
+        )
+        .expect("shared theme");
+
+        assert_eq!(theme.bg, rgb(0x1e, 0x1e, 0x2e));
+        assert_eq!(theme.bg_dark, rgb(0x18, 0x18, 0x25));
+        assert_eq!(theme.fg, rgb(0xcd, 0xd6, 0xf4));
+        assert_eq!(theme.blue, rgb(0x89, 0xb4, 0xfa));
+        assert_eq!(theme.magenta, rgb(0xcb, 0xa6, 0xf7));
+        assert_eq!(theme.git.add, rgb(0xa6, 0xe3, 0xa1));
+    }
+
+    #[test]
+    fn app_theme_overrides_shared_theme_path() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("themes/moon.toml");
+        let app = root.path().join("pdfterm/themes/moon.toml");
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&shared, "shared").unwrap();
+
+        assert_eq!(theme_path(root.path(), "moon"), shared);
+
+        std::fs::write(&app, "app").unwrap();
+        assert_eq!(theme_path(root.path(), "moon"), app);
     }
 
     #[test]

@@ -70,12 +70,16 @@ fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
-pub(crate) fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_root() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("pdfterm"))
+    Some(base)
+}
+
+pub(crate) fn config_dir() -> Option<PathBuf> {
+    Some(config_root()?.join("pdfterm"))
 }
 
 #[cfg(test)]
