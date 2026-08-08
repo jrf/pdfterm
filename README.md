@@ -4,7 +4,7 @@
 
 The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top of the picker.
 
-You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, invert colors for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52).
+You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode preserves document hues and leaves embedded images unchanged.
 
 ## Requirements
 
@@ -46,7 +46,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `g` / `G` | first / last page |
 | `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
 | `m` | cycle fit mode: fit-page → fit-width → fit-height |
-| `i` | invert (dark-mode) rendering |
+| `i` | toggle Polaris-style dark mode |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
 | `y` | copy the current page's text to the clipboard |
 | `f` | open a PDF in a new tab |
@@ -68,7 +68,7 @@ a malformed file is reported once and ignored. Supported keys:
 # fit-page (default), fit-width, or fit-height
 fit_mode = "page"
 
-# invert page colors by default (dark mode)
+# enable Polaris-style dark mode by default
 invert = false
 ```
 

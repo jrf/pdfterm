@@ -737,7 +737,7 @@ impl App {
             if !mode.is_empty() {
                 mode.push(' ');
             }
-            mode.push_str("invert");
+            mode.push_str("dark");
         }
         if !mode.is_empty() {
             mode.push_str("  ");
@@ -761,7 +761,7 @@ impl App {
             SetForegroundColor(theme.green),
             Print(state),
             SetForegroundColor(theme.comment),
-            Print("  t: toc  :: goto  m: fit  i: invert  y: copy  f: tab  q: close"),
+            Print("  t: toc  :: goto  m: fit  i: dark  y: copy  f: tab  q: close"),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;

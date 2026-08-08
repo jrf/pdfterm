@@ -1,12 +1,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
-use pdfium_render::prelude::{PdfBookmark, PdfDocument, PdfRenderConfig, Pdfium};
+use pdfium_render::prelude::{
+    PdfBookmark, PdfDocument, PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon,
+    PdfPageObjectsCommon, PdfRenderConfig, Pdfium,
+};
+
+const DARK_MIN_LIGHTNESS: f32 = 0.118;
+const DARK_MAX_LIGHTNESS: f32 = 0.82;
+const DARK_LIGHTNESS_RANGE: f32 = DARK_MAX_LIGHTNESS - DARK_MIN_LIGHTNESS;
+const LOW_CHROMA_THRESHOLD: u8 = 10;
+const MAX_DARK_MODE_WORKERS: usize = 8;
+const MAX_FORM_DEPTH: u8 = 32;
+const PARALLEL_DARK_MODE_PIXELS: usize = 250_000;
 
 pub type DocumentId = u64;
 
@@ -373,14 +385,14 @@ fn run_worker(
             let bitmap = page.render_with_config(&config).map_err(|error| {
                 format!("could not render page {}: {error}", request.key.page + 1)
             })?;
-            let render_elapsed = render_started.elapsed();
 
             let width = bitmap.width() as u32;
             let height = bitmap.height() as u32;
             let mut raw_rgba = bitmap.as_raw_bytes();
             if request.key.invert {
-                invert_rgb(&mut raw_rgba);
+                apply_dark_mode(&page, &config, width, height, &mut raw_rgba);
             }
+            let render_elapsed = render_started.elapsed();
             let compression_started = Instant::now();
             let compressed_rgba = crate::kitty::compress_rgba(&raw_rgba).map_err(|error| {
                 format!("could not compress page {}: {error}", request.key.page + 1)
@@ -448,16 +460,258 @@ fn collect_bookmarks(mut bookmark: PdfBookmark, depth: u16, items: &mut Vec<Outl
     }
 }
 
-/// Inverts the red, green, and blue channels of an RGBA buffer, leaving alpha
-/// untouched, so light documents render comfortably on a dark terminal.
-fn invert_rgb(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_mut(4) {
-        if let [r, g, b, _alpha] = pixel {
-            *r = 255 - *r;
-            *g = 255 - *g;
-            *b = 255 - *b;
+/// Applies Polaris's dark-mode lightness transform while leaving embedded
+/// images unchanged.
+fn apply_dark_mode(
+    page: &PdfPage<'_>,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+    rgba: &mut [u8],
+) {
+    let mask = image_mask(page, config, width, height);
+    darken_rgba(rgba, mask.as_deref());
+}
+
+/// Builds a pixel mask for image page objects so photos and figures retain
+/// their original colors. Polaris uses the same axis-aligned bounds behavior.
+fn image_mask(
+    page: &PdfPage<'_>,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let width_i32 = i32::try_from(width).ok()?;
+    let height_i32 = i32::try_from(height).ok()?;
+    let width = width as usize;
+    let height = height as usize;
+    let mut mask = None;
+
+    for object in page.objects().iter() {
+        mask_images_in_object(
+            &object,
+            PdfMatrix::IDENTITY,
+            0,
+            page,
+            config,
+            width,
+            height,
+            width_i32,
+            height_i32,
+            &mut mask,
+        );
+    }
+
+    mask
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mask_images_in_object(
+    object: &PdfPageObject<'_>,
+    parent_transform: PdfMatrix,
+    depth: u8,
+    page: &PdfPage<'_>,
+    config: &PdfRenderConfig,
+    width: usize,
+    height: usize,
+    width_i32: i32,
+    height_i32: i32,
+    mask: &mut Option<Vec<u8>>,
+) {
+    if object.as_image_object().is_some() {
+        let Ok(bounds) = object.bounds() else {
+            return;
+        };
+        let corners = [
+            (bounds.x1(), bounds.y1()),
+            (bounds.x2(), bounds.y2()),
+            (bounds.x3(), bounds.y3()),
+            (bounds.x4(), bounds.y4()),
+        ]
+        .map(|(x, y)| parent_transform.apply_to_points(x, y));
+        let pixels = corners.map(|(x, y)| page.points_to_pixels(x, y, config));
+        let [Ok(p1), Ok(p2), Ok(p3), Ok(p4)] = pixels else {
+            return;
+        };
+        let xs = [p1.0, p2.0, p3.0, p4.0];
+        let ys = [p1.1, p2.1, p3.1, p4.1];
+        let left = (*xs.iter().min().unwrap()).clamp(0, width_i32) as usize;
+        let right = (*xs.iter().max().unwrap()).clamp(0, width_i32) as usize;
+        let top = (*ys.iter().min().unwrap()).clamp(0, height_i32) as usize;
+        let bottom = (*ys.iter().max().unwrap()).clamp(0, height_i32) as usize;
+        if left >= right || top >= bottom {
+            return;
+        }
+
+        let mask = mask.get_or_insert_with(|| vec![0; width * height]);
+        for row in top..bottom {
+            mask[row * width + left..row * width + right].fill(255);
+        }
+        return;
+    }
+
+    if depth >= MAX_FORM_DEPTH {
+        return;
+    }
+    let Some(form) = object.as_x_object_form_object() else {
+        return;
+    };
+    let Ok(form_transform) = form.matrix() else {
+        return;
+    };
+    let child_transform = form_transform.multiply(parent_transform);
+    for child in form.iter() {
+        mask_images_in_object(
+            &child,
+            child_transform,
+            depth + 1,
+            page,
+            config,
+            width,
+            height,
+            width_i32,
+            height_i32,
+            mask,
+        );
+    }
+}
+
+fn darken_rgba(rgba: &mut [u8], mask: Option<&[u8]>) {
+    let pixel_count = rgba.len() / 4;
+    debug_assert_eq!(rgba.len(), pixel_count * 4);
+    debug_assert!(mask.is_none_or(|mask| mask.len() == pixel_count));
+
+    let worker_count = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_DARK_MODE_WORKERS)
+        .min(pixel_count);
+    if pixel_count < PARALLEL_DARK_MODE_PIXELS || worker_count == 1 {
+        darken_rgba_chunk(rgba, mask);
+        return;
+    }
+
+    let pixels_per_chunk = pixel_count.div_ceil(worker_count);
+    let bytes_per_chunk = pixels_per_chunk * 4;
+    thread::scope(|scope| match mask {
+        Some(mask) => {
+            for (rgba, mask) in rgba
+                .chunks_mut(bytes_per_chunk)
+                .zip(mask.chunks(pixels_per_chunk))
+            {
+                scope.spawn(move || darken_rgba_chunk(rgba, Some(mask)));
+            }
+        }
+        None => {
+            for rgba in rgba.chunks_mut(bytes_per_chunk) {
+                scope.spawn(move || darken_rgba_chunk(rgba, None));
+            }
+        }
+    });
+}
+
+fn darken_rgba_chunk(rgba: &mut [u8], mask: Option<&[u8]>) {
+    for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+        let mask_value = mask.map_or(0, |mask| mask[index]);
+        if mask_value == 255 {
+            continue;
+        }
+
+        let [red, green, blue, _alpha] = pixel else {
+            unreachable!();
+        };
+        let original = [*red, *green, *blue];
+        let transformed = dark_mode_pixel(original);
+        if mask_value == 0 {
+            [*red, *green, *blue] = transformed;
+        } else {
+            let mask_ratio = f32::from(mask_value) / 255.0;
+            *red = blend_channel(transformed[0], original[0], mask_ratio);
+            *green = blend_channel(transformed[1], original[1], mask_ratio);
+            *blue = blend_channel(transformed[2], original[2], mask_ratio);
         }
     }
+}
+
+fn dark_mode_pixel([red, green, blue]: [u8; 3]) -> [u8; 3] {
+    let max_channel = red.max(green).max(blue);
+    let min_channel = red.min(green).min(blue);
+    if max_channel - min_channel < LOW_CHROMA_THRESHOLD {
+        let sum = usize::from(red) + usize::from(green) + usize::from(blue);
+        let value = grayscale_dark_mode_lut()[sum];
+        return [value, value, value];
+    }
+
+    let red_f = f32::from(red) / 255.0;
+    let green_f = f32::from(green) / 255.0;
+    let blue_f = f32::from(blue) / 255.0;
+    let max_f = f32::from(max_channel) / 255.0;
+    let min_f = f32::from(min_channel) / 255.0;
+    let lightness = (max_f + min_f) * 0.5;
+    let new_lightness = DARK_MIN_LIGHTNESS + (1.0 - lightness.powf(1.2)) * DARK_LIGHTNESS_RANGE;
+    let chroma = max_f - min_f;
+
+    let hue = if max_channel == red {
+        (green_f - blue_f) / chroma + if green_f < blue_f { 6.0 } else { 0.0 }
+    } else if max_channel == green {
+        (blue_f - red_f) / chroma + 2.0
+    } else {
+        (red_f - green_f) / chroma + 4.0
+    } / 6.0;
+    let saturation = if lightness > 0.5 {
+        chroma / (2.0 - max_f - min_f)
+    } else {
+        chroma / (max_f + min_f)
+    };
+    let q = if new_lightness < 0.5 {
+        new_lightness * (1.0 + saturation)
+    } else {
+        new_lightness + saturation - new_lightness * saturation
+    };
+    let p = 2.0 * new_lightness - q;
+
+    [
+        unit_to_u8(hue_to_rgb(p, q, hue + 1.0 / 3.0)),
+        unit_to_u8(hue_to_rgb(p, q, hue)),
+        unit_to_u8(hue_to_rgb(p, q, hue - 1.0 / 3.0)),
+    ]
+}
+
+fn grayscale_dark_mode_lut() -> &'static [u8; 766] {
+    static LUT: OnceLock<[u8; 766]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|sum| {
+            let average = sum as f32 / (255.0 * 3.0);
+            unit_to_u8(DARK_MIN_LIGHTNESS + (1.0 - average.powf(1.2)) * DARK_LIGHTNESS_RANGE)
+        })
+    })
+}
+
+fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+    if t < 1.0 / 6.0 {
+        p + (q - p) * 6.0 * t
+    } else if t < 0.5 {
+        q
+    } else if t < 2.0 / 3.0 {
+        p + (q - p) * (2.0 / 3.0 - t) * 6.0
+    } else {
+        p
+    }
+}
+
+fn unit_to_u8(value: f32) -> u8 {
+    (value * 255.0).clamp(0.0, 255.0) as u8
+}
+
+fn blend_channel(transformed: u8, original: u8, mask_ratio: f32) -> u8 {
+    (f32::from(transformed) * (1.0 - mask_ratio) + f32::from(original) * mask_ratio)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 impl From<WorkerCommand> for WorkerTask {
@@ -520,13 +774,112 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FitMode, invert_rgb};
+    use super::{FitMode, dark_mode_pixel, darken_rgba};
 
     #[test]
-    fn invert_flips_color_channels_but_keeps_alpha() {
-        let mut pixels = [0, 10, 245, 128, 255, 255, 255, 64];
-        invert_rgb(&mut pixels);
-        assert_eq!(pixels, [255, 245, 10, 128, 0, 0, 0, 64]);
+    fn image_mask_finds_images_nested_in_transformed_forms() {
+        use super::{image_mask, load_pdfium};
+        use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfRenderConfig};
+
+        let pdfium = load_pdfium(None).unwrap();
+        let source = pdfium
+            .load_pdf_from_byte_vec(synthetic_image_pdf(), None)
+            .unwrap();
+        let source_page = source.pages().get(0).unwrap();
+        let mut document = pdfium.create_new_pdf().unwrap();
+        let mut form = source_page
+            .objects()
+            .copy_into_x_object_form_object(&mut document)
+            .unwrap();
+        form.as_x_object_form_object_mut()
+            .unwrap()
+            .scale(0.5, 0.5)
+            .unwrap();
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::from_points(
+                source_page.width(),
+                source_page.height(),
+            ))
+            .unwrap()
+            .objects_mut()
+            .add_object(form)
+            .unwrap();
+        let page = document.pages().get(0).unwrap();
+        let config = PdfRenderConfig::new().set_target_width(400);
+        let bitmap = page.render_with_config(&config).unwrap();
+        let mask = image_mask(
+            &page,
+            &config,
+            bitmap.width() as u32,
+            bitmap.height() as u32,
+        )
+        .unwrap();
+        assert_eq!(mask.iter().filter(|&&value| value == 255).count(), 10_000);
+    }
+
+    fn synthetic_image_pdf() -> Vec<u8> {
+        let page_stream = "q 200 0 0 200 100 100 cm /Im0 Do Q";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{page_stream}\nendstream",
+                page_stream.len()
+            ),
+            "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\nRGB\nendstream".to_string(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn dark_mode_bounds_grayscale_and_keeps_alpha() {
+        let mut pixels = [0, 0, 0, 128, 255, 255, 255, 64];
+        darken_rgba(&mut pixels, None);
+        assert_eq!(pixels, [209, 209, 209, 128, 30, 30, 30, 64]);
+    }
+
+    #[test]
+    fn dark_mode_preserves_hue() {
+        let [red, green, blue] = dark_mode_pixel([20, 100, 200]);
+        assert!(blue > green);
+        assert!(green > red);
+    }
+
+    #[test]
+    fn dark_mode_mask_preserves_images() {
+        let mut pixels = [255, 255, 255, 255, 20, 100, 200, 128];
+        darken_rgba(&mut pixels, Some(&[0, 255]));
+        assert_eq!(&pixels[..4], &[30, 30, 30, 255]);
+        assert_eq!(&pixels[4..], &[20, 100, 200, 128]);
+    }
+
+    #[test]
+    fn dark_mode_handles_full_hd_page() {
+        let mut pixels = vec![255; 1920 * 1080 * 4];
+        darken_rgba(&mut pixels, None);
+        assert_eq!(&pixels[..4], &[30, 30, 30, 255]);
+        assert_eq!(&pixels[pixels.len() - 4..], &[30, 30, 30, 255]);
     }
 
     #[test]
