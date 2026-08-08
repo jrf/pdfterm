@@ -146,16 +146,11 @@ struct AppDefaults {
 
 impl From<&Config> for AppDefaults {
     fn from(config: &Config) -> Self {
-        let themes = crate::theme::available_themes();
+        let themes = crate::theme::available_themes(config.theme_catalog(), config.theme());
         let configured_theme = crate::theme::load_or_default(config.theme());
         let theme_index = themes
             .iter()
-            .position(|(name, _)| name == config.theme())
-            .or_else(|| {
-                themes
-                    .iter()
-                    .position(|(name, _)| name == crate::theme::DEFAULT_THEME_NAME)
-            })
+            .position(|(_, theme)| *theme == configured_theme)
             .unwrap_or(0);
         let theme = themes
             .get(theme_index)

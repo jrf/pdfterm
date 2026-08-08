@@ -74,15 +74,15 @@ fit_mode = "page"
 # enable Polaris-style dark mode by default
 dark_mode = true
 
-# load ~/.config/themes/tokyo-night-moon.toml
-theme = "tokyo-night-moon"
+# load one theme directly and list picker entries explicitly
+theme = "~/.config/themes/tokyo-night-moon.toml"
+theme_catalog = "~/.config/themes/catalog.toml"
 ```
 
-The legacy `invert` key remains accepted as an alias for `dark_mode`. Theme names
-may contain letters, numbers, dashes, and underscores. Shared themes are loaded
-from `~/.config/themes/`; a file with the same name in
-`~/.config/pdfterm/themes/` overrides it. Both the shared `[colors]`/`[ui]`
-schema and pdfterm's legacy complete-palette schema are accepted. Legacy theme
+The legacy `invert` key remains accepted as an alias for `dark_mode`. `theme` is
+loaded directly, while `theme_catalog` supplies an explicit `themes = [...]`
+array for the picker. pdfterm never scans a theme directory. Both the shared
+`[colors]`/`[ui]` schema and pdfterm's legacy complete-palette schema are accepted. Legacy theme
 files contain the complete color palette using `#RRGGBB` values:
 
 ```toml
@@ -124,7 +124,7 @@ delete = "#e26a75"
 ```
 
 If the selected theme is missing or malformed, pdfterm reports it once and uses
-its built-in Tokyo Night Moon palette. Press `T` to preview and apply any
+its internal fallback palette. Press `T` to preview and apply any
 installed theme for the current session; picker changes do not rewrite
 `config.toml`.
 

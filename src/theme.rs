@@ -7,8 +7,6 @@ use crossterm::style::Color;
 use serde::Deserialize;
 use thiserror::Error;
 
-pub const DEFAULT_THEME_NAME: &str = "tokyo-night-moon";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GitPalette {
     pub add: Color,
@@ -167,10 +165,6 @@ struct SharedPaletteFile {
 
 #[derive(Debug, Error)]
 pub enum ThemeError {
-    #[error("invalid theme name {0:?}; use letters, numbers, dashes, or underscores")]
-    InvalidName(String),
-    #[error("could not locate the pdfterm configuration directory")]
-    MissingConfigDirectory,
     #[error("could not read theme {path}: {source}")]
     Read {
         path: PathBuf,
@@ -187,42 +181,29 @@ pub enum ThemeError {
     InvalidColor { field: String, value: String },
 }
 
-pub fn load_or_default(name: &str) -> Palette {
-    match load(name) {
-        Ok(theme) => theme,
-        Err(ThemeError::Read { source, .. })
-            if name == DEFAULT_THEME_NAME && source.kind() == io::ErrorKind::NotFound =>
-        {
-            TOKYO_NIGHT_MOON
-        }
-        Err(error) => {
-            eprintln!("pdfterm: {error}; using the built-in {DEFAULT_THEME_NAME} theme");
-            TOKYO_NIGHT_MOON
-        }
-    }
-}
-
-pub fn available_themes() -> Vec<(String, Palette)> {
-    let Some(config_root) = crate::config::config_root() else {
-        return vec![(DEFAULT_THEME_NAME.to_string(), TOKYO_NIGHT_MOON)];
+pub fn load_or_default(configured_path: Option<&str>) -> Palette {
+    let Some(configured_path) = configured_path else {
+        return TOKYO_NIGHT_MOON;
     };
-    discover_themes(&config_root)
-}
-
-pub fn load(name: &str) -> Result<Palette, ThemeError> {
-    if !valid_theme_name(name) {
-        return Err(ThemeError::InvalidName(name.to_string()));
+    match load(configured_path) {
+        Ok(theme) => theme,
+        Err(error) => {
+            eprintln!("pdfterm: {error}; using the internal fallback palette");
+            TOKYO_NIGHT_MOON
+        }
     }
-    let config_root = crate::config::config_root().ok_or(ThemeError::MissingConfigDirectory)?;
-    let path = theme_path(&config_root, name);
-    load_theme_file(&path)
 }
 
-fn valid_theme_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+pub fn available_themes(
+    catalog_path: Option<&str>,
+    selected_path: Option<&str>,
+) -> Vec<(String, Palette)> {
+    discover_themes(catalog_path, selected_path, &home_dir())
+}
+
+pub fn load(configured_path: &str) -> Result<Palette, ThemeError> {
+    let path = expand_home(&home_dir(), configured_path);
+    load_theme_file(&path)
 }
 
 fn load_theme_file(path: &Path) -> Result<Palette, ThemeError> {
@@ -239,45 +220,69 @@ fn load_theme_file(path: &Path) -> Result<Palette, ThemeError> {
     })
 }
 
-fn discover_themes(config_root: &Path) -> Vec<(String, Palette)> {
-    let mut themes = BTreeMap::from([(DEFAULT_THEME_NAME.to_string(), TOKYO_NIGHT_MOON)]);
-    overlay_theme_directory(&mut themes, &config_root.join("themes"));
-    overlay_theme_directory(&mut themes, &config_root.join("pdfterm/themes"));
-    themes.into_iter().collect()
+fn discover_themes(
+    catalog_path: Option<&str>,
+    selected_path: Option<&str>,
+    home: &Path,
+) -> Vec<(String, Palette)> {
+    let mut themes = Vec::new();
+    if let Some(catalog_path) = catalog_path {
+        for path in load_catalog_paths(&expand_home(home, catalog_path)) {
+            load_theme_entry(&mut themes, &path, home);
+        }
+    }
+    if let Some(selected_path) = selected_path {
+        load_theme_entry(&mut themes, selected_path, home);
+    }
+    themes.sort_by(|left, right| left.0.cmp(&right.0));
+    themes
 }
 
-fn overlay_theme_directory(themes: &mut BTreeMap<String, Palette>, directory: &Path) {
-    let Ok(entries) = fs::read_dir(directory) else {
+fn load_catalog_paths(catalog_path: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(catalog_path) else {
+        return Vec::new();
+    };
+    let Ok(catalog) = contents.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    catalog
+        .get("themes")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn load_theme_entry(themes: &mut Vec<(String, Palette)>, configured_path: &str, home: &Path) {
+    let path = expand_home(home, configured_path);
+    let Ok(theme) = load_theme_file(&path) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !valid_theme_name(name) {
-            continue;
-        }
-        if let Ok(theme) = load_theme_file(&path) {
-            themes.insert(name.to_string(), theme);
-        }
-    }
+    let name = theme_name(&path);
+    themes.retain(|(existing, _)| existing != &name);
+    themes.push((name, theme));
 }
 
-fn theme_path(config_root: &Path, name: &str) -> PathBuf {
-    let app_path = config_root
-        .join("pdfterm")
-        .join("themes")
-        .join(format!("{name}.toml"));
-    let shared_path = config_root.join("themes").join(format!("{name}.toml"));
-    if app_path.is_file() || !shared_path.is_file() {
-        app_path
-    } else {
-        shared_path
-    }
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+fn expand_home(home: &Path, configured_path: &str) -> PathBuf {
+    configured_path
+        .strip_prefix("~/")
+        .map(|rest| home.join(rest))
+        .unwrap_or_else(|| PathBuf::from(configured_path))
+}
+
+fn theme_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("theme")
+        .replace('-', " ")
 }
 
 fn parse_theme(text: &str) -> Result<Palette, ThemeError> {
@@ -765,40 +770,44 @@ cursor_bg = "surface0"
     }
 
     #[test]
-    fn app_theme_overrides_shared_theme_path() {
+    fn expands_home_in_explicit_theme_path() {
         let root = tempfile::tempdir().unwrap();
-        let shared = root.path().join("themes/moon.toml");
-        let app = root.path().join("pdfterm/themes/moon.toml");
-        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
-        std::fs::write(&shared, "shared").unwrap();
-
-        assert_eq!(theme_path(root.path(), "moon"), shared);
-
-        std::fs::write(&app, "app").unwrap();
-        assert_eq!(theme_path(root.path(), "moon"), app);
+        assert_eq!(
+            expand_home(root.path(), "~/.config/themes/synthetic.toml"),
+            root.path().join(".config/themes/synthetic.toml")
+        );
     }
 
     #[test]
-    fn discovers_shared_themes_with_app_specific_overrides() {
+    fn catalog_loads_only_explicit_theme_paths() {
         let root = tempfile::tempdir().unwrap();
-        let shared = root.path().join("themes/custom.toml");
-        let app = root.path().join("pdfterm/themes/custom.toml");
-        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
-        std::fs::write(&shared, TOKYO_NIGHT_MOON_TOML.replace("#222436", "#101010")).unwrap();
-        std::fs::write(&app, TOKYO_NIGHT_MOON_TOML.replace("#222436", "#202020")).unwrap();
-        std::fs::write(root.path().join("themes/invalid.toml"), "not toml").unwrap();
+        let themes_dir = root.path().join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        std::fs::write(
+            themes_dir.join("synthetic-theme.toml"),
+            TOKYO_NIGHT_MOON_TOML.replace("#222436", "#101010"),
+        )
+        .unwrap();
+        std::fs::write(themes_dir.join("unlisted.toml"), TOKYO_NIGHT_MOON_TOML).unwrap();
+        let catalog = root.path().join("catalog.toml");
+        std::fs::write(
+            &catalog,
+            format!(
+                "themes = [\"{}\"]\n",
+                themes_dir.join("synthetic-theme.toml").display()
+            ),
+        )
+        .unwrap();
 
-        let themes = discover_themes(root.path());
-        let custom = themes
-            .iter()
-            .find(|(name, _)| name == "custom")
-            .expect("custom theme");
+        let themes = discover_themes(
+            Some(catalog.to_str().unwrap()),
+            Some(themes_dir.join("synthetic-theme.toml").to_str().unwrap()),
+            root.path(),
+        );
 
-        assert_eq!(custom.1.bg, rgb(0x20, 0x20, 0x20));
-        assert!(themes.iter().any(|(name, _)| name == DEFAULT_THEME_NAME));
-        assert!(!themes.iter().any(|(name, _)| name == "invalid"));
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].0, "synthetic theme");
+        assert_eq!(themes[0].1.bg, rgb(0x10, 0x10, 0x10));
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub struct Config {
     #[serde(alias = "invert")]
     dark_mode: bool,
     theme: Option<String>,
+    theme_catalog: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -59,10 +60,12 @@ impl Config {
         self.dark_mode
     }
 
-    pub fn theme(&self) -> &str {
-        self.theme
-            .as_deref()
-            .unwrap_or(crate::theme::DEFAULT_THEME_NAME)
+    pub fn theme(&self) -> Option<&str> {
+        self.theme.as_deref()
+    }
+
+    pub fn theme_catalog(&self) -> Option<&str> {
+        self.theme_catalog.as_deref()
     }
 }
 
@@ -92,7 +95,8 @@ mod tests {
         let config: Config = toml::from_str("").expect("empty config");
         assert_eq!(config.fit_mode(), FitMode::Page);
         assert!(!config.dark_mode());
-        assert_eq!(config.theme(), "tokyo-night-moon");
+        assert_eq!(config.theme(), None);
+        assert_eq!(config.theme_catalog(), None);
     }
 
     #[test]
@@ -110,9 +114,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_theme_name() {
-        let config: Config = toml::from_str("theme = \"moon\"\n").expect("config");
-        assert_eq!(config.theme(), "moon");
+    fn parses_explicit_theme_paths() {
+        let config: Config = toml::from_str(
+            "theme = \"~/.config/themes/synthetic.toml\"\ntheme_catalog = \"~/.config/themes/catalog.toml\"\n",
+        )
+        .expect("config");
+        assert_eq!(config.theme(), Some("~/.config/themes/synthetic.toml"));
+        assert_eq!(
+            config.theme_catalog(),
+            Some("~/.config/themes/catalog.toml")
+        );
     }
 
     #[test]
