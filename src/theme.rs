@@ -202,24 +202,69 @@ pub fn load_or_default(name: &str) -> Palette {
     }
 }
 
+pub fn available_themes() -> Vec<(String, Palette)> {
+    let Some(config_root) = crate::config::config_root() else {
+        return vec![(DEFAULT_THEME_NAME.to_string(), TOKYO_NIGHT_MOON)];
+    };
+    discover_themes(&config_root)
+}
+
 pub fn load(name: &str) -> Result<Palette, ThemeError> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
+    if !valid_theme_name(name) {
         return Err(ThemeError::InvalidName(name.to_string()));
     }
     let config_root = crate::config::config_root().ok_or(ThemeError::MissingConfigDirectory)?;
     let path = theme_path(&config_root, name);
-    let text = fs::read_to_string(&path).map_err(|source| ThemeError::Read {
-        path: path.clone(),
+    load_theme_file(&path)
+}
+
+fn valid_theme_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn load_theme_file(path: &Path) -> Result<Palette, ThemeError> {
+    let text = fs::read_to_string(path).map_err(|source| ThemeError::Read {
+        path: path.to_path_buf(),
         source,
     })?;
     parse_theme(&text).map_err(|error| match error {
-        ThemeError::Parse { source, .. } => ThemeError::Parse { path, source },
+        ThemeError::Parse { source, .. } => ThemeError::Parse {
+            path: path.to_path_buf(),
+            source,
+        },
         other => other,
     })
+}
+
+fn discover_themes(config_root: &Path) -> Vec<(String, Palette)> {
+    let mut themes = BTreeMap::from([(DEFAULT_THEME_NAME.to_string(), TOKYO_NIGHT_MOON)]);
+    overlay_theme_directory(&mut themes, &config_root.join("themes"));
+    overlay_theme_directory(&mut themes, &config_root.join("pdfterm/themes"));
+    themes.into_iter().collect()
+}
+
+fn overlay_theme_directory(themes: &mut BTreeMap<String, Palette>, directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !valid_theme_name(name) {
+            continue;
+        }
+        if let Ok(theme) = load_theme_file(&path) {
+            themes.insert(name.to_string(), theme);
+        }
+    }
 }
 
 fn theme_path(config_root: &Path, name: &str) -> PathBuf {
@@ -732,6 +777,28 @@ cursor_bg = "surface0"
 
         std::fs::write(&app, "app").unwrap();
         assert_eq!(theme_path(root.path(), "moon"), app);
+    }
+
+    #[test]
+    fn discovers_shared_themes_with_app_specific_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("themes/custom.toml");
+        let app = root.path().join("pdfterm/themes/custom.toml");
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&shared, TOKYO_NIGHT_MOON_TOML.replace("#222436", "#101010")).unwrap();
+        std::fs::write(&app, TOKYO_NIGHT_MOON_TOML.replace("#222436", "#202020")).unwrap();
+        std::fs::write(root.path().join("themes/invalid.toml"), "not toml").unwrap();
+
+        let themes = discover_themes(root.path());
+        let custom = themes
+            .iter()
+            .find(|(name, _)| name == "custom")
+            .expect("custom theme");
+
+        assert_eq!(custom.1.bg, rgb(0x20, 0x20, 0x20));
+        assert!(themes.iter().any(|(name, _)| name == DEFAULT_THEME_NAME));
+        assert!(!themes.iter().any(|(name, _)| name == "invalid"));
     }
 
     #[test]

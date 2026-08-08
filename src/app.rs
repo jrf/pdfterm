@@ -131,19 +131,35 @@ struct App {
     default_invert: bool,
     goto_input: Option<String>,
     theme: Palette,
+    themes: Vec<(String, Palette)>,
+    theme_index: usize,
 }
 
-#[derive(Clone, Copy)]
 struct AppDefaults {
     fit: FitMode,
     invert: bool,
     theme: Palette,
     dark_mode_style: DarkModeStyle,
+    themes: Vec<(String, Palette)>,
+    theme_index: usize,
 }
 
 impl From<&Config> for AppDefaults {
     fn from(config: &Config) -> Self {
-        let theme = crate::theme::load_or_default(config.theme());
+        let themes = crate::theme::available_themes();
+        let configured_theme = crate::theme::load_or_default(config.theme());
+        let theme_index = themes
+            .iter()
+            .position(|(name, _)| name == config.theme())
+            .or_else(|| {
+                themes
+                    .iter()
+                    .position(|(name, _)| name == crate::theme::DEFAULT_THEME_NAME)
+            })
+            .unwrap_or(0);
+        let theme = themes
+            .get(theme_index)
+            .map_or(configured_theme, |(_, theme)| *theme);
         Self {
             fit: config.fit_mode(),
             invert: config.dark_mode(),
@@ -152,6 +168,8 @@ impl From<&Config> for AppDefaults {
                 theme.document.foreground,
             ),
             theme,
+            themes,
+            theme_index,
         }
     }
 }
@@ -243,6 +261,8 @@ impl App {
             default_invert,
             goto_input: None,
             theme: defaults.theme,
+            themes: defaults.themes,
+            theme_index: defaults.theme_index,
         }
     }
 
@@ -419,6 +439,34 @@ impl App {
         self.request_current(output)
     }
 
+    fn open_theme_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.clear_viewer(output)?;
+        let selection = pick_theme(&self.themes, self.theme_index, output)?;
+        if let Some(index) = selection {
+            self.apply_theme(index);
+        }
+        self.clear_viewer(output)?;
+        self.reset_render_state();
+        self.request_current(output)
+    }
+
+    fn apply_theme(&mut self, index: usize) {
+        let Some((_, theme)) = self.themes.get(index) else {
+            return;
+        };
+        let theme = *theme;
+        self.theme_index = index;
+        self.theme = theme;
+        let style = DarkModeStyle::new(theme.document.background, theme.document.foreground);
+        for tab in &mut self.tabs {
+            tab.dark_mode_style = style;
+            tab.cache.clear();
+        }
+    }
+
     fn begin_goto(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         if self.pending_open.is_some() {
             return Ok(());
@@ -529,6 +577,7 @@ impl App {
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
+            KeyCode::Char('T') => self.open_theme_picker(output)?,
             KeyCode::Char('y') => self.request_copy(output)?,
             _ => {}
         }
@@ -800,7 +849,7 @@ impl App {
             SetForegroundColor(theme.green),
             Print(state),
             SetForegroundColor(theme.comment),
-            Print("  t: toc  :: goto  m: fit  i: dark  y: copy  f: tab  q: close"),
+            Print("  t: toc  T: theme  :: goto  m: fit  i: dark  y: copy  f: tab  q: close"),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg)
         )?;
@@ -1065,6 +1114,62 @@ fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
         MoveTo(0, 0)
     )?;
     output.flush()
+}
+
+fn pick_theme(
+    themes: &[(String, Palette)],
+    current: usize,
+    output: &mut impl Write,
+) -> Result<Option<usize>, AppError> {
+    let mut selected = current.min(themes.len().saturating_sub(1));
+    let backend = CrosstermBackend::new(&mut *output);
+    let mut terminal = Terminal::new(backend)?;
+    let mut redraw = true;
+    let mut visible_height = 1;
+
+    let selection = loop {
+        if redraw {
+            terminal.autoresize()?;
+            let area = terminal.size()?;
+            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(3).max(1));
+            terminal.draw(|frame| draw_theme_picker(frame, themes, selected))?;
+            redraw = false;
+        }
+
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                redraw = true;
+                continue;
+            }
+            _ => continue,
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let last = themes.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => break None,
+            KeyCode::Enter => break Some(selected),
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = if selected == last { 0 } else { selected + 1 };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = if selected == 0 { last } else { selected - 1 };
+            }
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = last,
+            KeyCode::PageDown => selected = (selected + visible_height).min(last),
+            KeyCode::PageUp => selected = selected.saturating_sub(visible_height),
+            _ => continue,
+        }
+        redraw = true;
+    };
+    drop(terminal);
+    Ok(selection)
 }
 
 fn pick_outline(
@@ -1439,6 +1544,87 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
     );
 }
 
+fn draw_theme_picker(frame: &mut RatatuiFrame, themes: &[(String, Palette)], selected: usize) {
+    let theme = themes
+        .get(selected)
+        .map_or(crate::theme::TOKYO_NIGHT_MOON, |(_, theme)| *theme);
+    let colors = PickerTheme::from(theme);
+    let area = frame.area();
+    let popup = picker_rect(area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(colors.backdrop)),
+        area,
+    );
+    frame.render_widget(RatatuiClear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(colors.surface).fg(colors.text))
+        .border_style(Style::default().fg(colors.border))
+        .title(" Themes · session only ")
+        .title_style(
+            Style::default()
+                .fg(colors.accent)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+    let visible_height = usize::from(rows[0].height).max(1);
+    let first_visible = selected.saturating_add(1).saturating_sub(visible_height);
+    let width = usize::from(rows[0].width);
+    let lines: Vec<_> = themes
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_height)
+        .map(|(index, (name, _))| {
+            let is_selected = index == selected;
+            let background = if is_selected {
+                colors.selection
+            } else {
+                colors.surface
+            };
+            let mut style = Style::default().fg(colors.text).bg(background);
+            if is_selected {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let mut line = Line::from(vec![
+                Span::styled(
+                    if is_selected { "▌ " } else { "  " },
+                    Style::default().fg(colors.accent).bg(background),
+                ),
+                Span::styled(name.clone(), style),
+            ]);
+            let used = line.width();
+            if used < width {
+                line.spans.push(Span::styled(
+                    " ".repeat(width - used),
+                    Style::default().bg(background),
+                ));
+            }
+            line
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
+        rows[0],
+    );
+
+    let status = Some((format!("{}/{}", selected + 1, themes.len()), colors.muted));
+    frame.render_widget(
+        Paragraph::new(picker_hint_line(
+            &[("j/k", "select"), ("enter", "apply"), ("esc", "cancel")],
+            status,
+            colors,
+        ))
+        .style(Style::default().bg(colors.chrome)),
+        rows[1],
+    );
+}
+
 fn picker_recent_heading_line(width: usize, colors: PickerTheme) -> Line<'static> {
     let label = " Most Recent ";
     let mut spans = vec![
@@ -1767,8 +1953,9 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        clear_picker, cycled_tab_index, draw_picker, filter_outline, outline_start_index,
-        picker_color, picker_rect, shorten_path, stale_status_row, write_clipboard_osc52,
+        clear_picker, cycled_tab_index, draw_picker, draw_theme_picker, filter_outline,
+        outline_start_index, picker_color, picker_rect, shorten_path, stale_status_row,
+        write_clipboard_osc52,
     };
     use crate::pdf::OutlineItem;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1952,6 +2139,42 @@ mod tests {
             buffer[(popup.x + 1, popup.y + 2)].bg,
             picker_color(theme.bg_highlight)
         );
+    }
+
+    #[test]
+    fn theme_picker_previews_the_selected_palette() {
+        let mut alternate = crate::theme::TOKYO_NIGHT_MOON;
+        alternate.bg_dark1 = crossterm::style::Color::Rgb {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+        };
+        let themes = vec![
+            (
+                "tokyo-night-moon".to_string(),
+                crate::theme::TOKYO_NIGHT_MOON,
+            ),
+            ("synthetic-theme".to_string(), alternate),
+        ];
+        let area = Rect::new(0, 0, 80, 30);
+        let popup = picker_rect(area);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_theme_picker(frame, &themes, 1))
+            .expect("draw theme picker");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (popup.y..popup.y + popup.height)
+            .flat_map(|y| {
+                (popup.x..popup.x + popup.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+
+        assert_eq!(buffer[(0, 0)].bg, picker_color(alternate.bg_dark1));
+        assert!(rendered.contains("tokyo-night-moon"));
+        assert!(rendered.contains("synthetic-theme"));
+        assert!(rendered.contains("session only"));
     }
 
     #[test]

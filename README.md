@@ -50,6 +50,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `m` | cycle fit mode: fit-page → fit-width → fit-height |
 | `i` | toggle Polaris-style dark mode |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
+| `T` | choose and preview a theme for the current session |
 | `y` | copy the current page's text to the clipboard |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
@@ -123,8 +124,9 @@ delete = "#e26a75"
 ```
 
 If the selected theme is missing or malformed, pdfterm reports it once and uses
-its built-in Tokyo Night Moon palette. Themes are selected when pdfterm starts;
-there is currently no in-app theme menu.
+its built-in Tokyo Night Moon palette. Press `T` to preview and apply any
+installed theme for the current session; picker changes do not rewrite
+`config.toml`.
 
 Dark mode uses `bg_dark` and `fg` for the document background and foreground by
 default. A theme can override those choices independently:
