@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
 use pdfium_render::prelude::{
-    PdfBookmark, PdfDocument, PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon,
-    PdfPageObjectsCommon, PdfPoints, PdfRenderConfig, Pdfium,
+    PdfAction, PdfBookmark, PdfDestination, PdfDestinationViewSettings, PdfDocument, PdfLink,
+    PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPoints,
+    PdfRect, PdfRenderConfig, Pdfium,
 };
 
 const LOW_CHROMA_THRESHOLD: u8 = 10;
@@ -19,6 +20,8 @@ const IMAGE_MASK_SAMPLES: usize = 4;
 const PARALLEL_DARK_MODE_PIXELS: usize = 250_000;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
+const LINK_HIGHLIGHT_ALPHA: u16 = 40;
+const LINK_BORDER_ALPHA: u16 = 210;
 
 pub type DocumentId = u64;
 
@@ -92,6 +95,8 @@ pub struct RenderKey {
     pub dark_mode_style: DarkModeStyle,
     pub search_request_id: u64,
     pub search_highlight: [u8; 3],
+    pub link_mode: bool,
+    pub link_highlight: [u8; 3],
 }
 
 #[derive(Debug)]
@@ -111,6 +116,27 @@ pub struct Frame {
     pub highlight_elapsed: Option<Duration>,
     pub compression_elapsed: Duration,
     pub generation: u64,
+    pub links: Vec<PageLink>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkTarget {
+    Internal { page: u32, top_ratio: Option<f32> },
+    Uri(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageLinkRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageLink {
+    pub rect: PageLinkRect,
+    pub target: LinkTarget,
 }
 
 #[derive(Debug)]
@@ -637,16 +663,22 @@ fn run_worker(
                 );
                 started.elapsed()
             });
-            let highlight_elapsed = (request.key.search_request_id != 0)
+            let search_rectangles = (request.key.search_request_id != 0)
                 .then(|| {
                     search_highlights
                         .get(&request.key.document_id)
                         .filter(|highlights| highlights.request_id == request.key.search_request_id)
                         .and_then(|highlights| highlights.pages.get(&request.key.page))
                 })
-                .flatten()
-                .map(|rectangles| {
-                    let started = Instant::now();
+                .flatten();
+            let links = if request.key.link_mode {
+                extract_page_links(document, &page, &config, width, height)
+            } else {
+                Vec::new()
+            };
+            let highlight_elapsed = (search_rectangles.is_some() || !links.is_empty()).then(|| {
+                let started = Instant::now();
+                if let Some(rectangles) = search_rectangles {
                     apply_search_highlights(
                         &page,
                         &config,
@@ -656,8 +688,18 @@ fn run_worker(
                         rectangles,
                         request.key.search_highlight,
                     );
-                    started.elapsed()
-                });
+                }
+                if !links.is_empty() {
+                    apply_link_highlights(
+                        &mut raw_rgba,
+                        width,
+                        height,
+                        &links,
+                        request.key.link_highlight,
+                    );
+                }
+                started.elapsed()
+            });
             let compression_started = Instant::now();
             let compressed_rgba = crate::kitty::compress_rgba(&raw_rgba).map_err(|error| {
                 format!("could not compress page {}: {error}", request.key.page + 1)
@@ -679,6 +721,7 @@ fn run_worker(
                     highlight_elapsed,
                     compression_elapsed,
                     generation: request.generation,
+                    links,
                 }))
                 .map_err(|_| "viewer stopped".to_string())?;
         }
@@ -1341,12 +1384,164 @@ fn apply_search_highlights(
     }
 }
 
+fn extract_page_links(
+    document: &PdfDocument,
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+) -> Vec<PageLink> {
+    page.links()
+        .iter()
+        .filter_map(|link| {
+            let target = resolve_link_target(document, &link)?;
+            let bounds = link.rect().ok()?;
+            let rect = page_rect_to_pixels(page, config, width, height, bounds)?;
+            Some(PageLink {
+                rect: PageLinkRect {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                target,
+            })
+        })
+        .collect()
+}
+
+fn resolve_link_target(document: &PdfDocument, link: &PdfLink<'_>) -> Option<LinkTarget> {
+    if let Some(destination) = link.destination() {
+        return resolve_internal_destination(document, destination);
+    }
+    match link.action()? {
+        PdfAction::LocalDestination(action) => {
+            resolve_internal_destination(document, action.destination().ok()?)
+        }
+        PdfAction::Uri(action) => action.uri().ok().map(LinkTarget::Uri),
+        _ => None,
+    }
+}
+
+fn resolve_internal_destination(
+    document: &PdfDocument,
+    destination: PdfDestination<'_>,
+) -> Option<LinkTarget> {
+    let page_index = destination.page_index().ok()?;
+    let page = u32::try_from(page_index).ok()?;
+    let target_y = match destination.view_settings().ok() {
+        Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, y, _)) => y,
+        Some(PdfDestinationViewSettings::FitPageHorizontallyToWindow(y))
+        | Some(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(y)) => y,
+        Some(PdfDestinationViewSettings::FitPageToRectangle(rect)) => Some(rect.top()),
+        _ => None,
+    };
+    let top_ratio = target_y.and_then(|y| {
+        let target_page = document.pages().get(page_index).ok()?;
+        let page_height = target_page.height().value;
+        (page_height > 0.0).then(|| ((page_height - y.value) / page_height).clamp(0.0, 1.0))
+    });
+    Some(LinkTarget::Internal { page, top_ratio })
+}
+
+fn page_rect_to_pixels(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+    bounds: PdfRect,
+) -> Option<PixelRect> {
+    let corners = [
+        (bounds.left().value, bounds.top().value),
+        (bounds.right().value, bounds.top().value),
+        (bounds.left().value, bounds.bottom().value),
+        (bounds.right().value, bounds.bottom().value),
+    ];
+    let pixels: Vec<_> = corners
+        .into_iter()
+        .filter_map(|(x, y)| {
+            page.points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
+                .ok()
+        })
+        .collect();
+    if pixels.len() != corners.len() {
+        return None;
+    }
+    let min_x = pixels.iter().map(|(x, _)| *x).min()?;
+    let max_x = pixels.iter().map(|(x, _)| *x).max()?;
+    let min_y = pixels.iter().map(|(_, y)| *y).min()?;
+    let max_y = pixels.iter().map(|(_, y)| *y).max()?;
+    Some(PixelRect {
+        left: min_x.saturating_sub(1).clamp(0, width as i32) as u32,
+        right: max_x.saturating_add(2).clamp(0, width as i32) as u32,
+        top: min_y.saturating_sub(1).clamp(0, height as i32) as u32,
+        bottom: max_y.saturating_add(2).clamp(0, height as i32) as u32,
+    })
+}
+
+fn apply_link_highlights(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    links: &[PageLink],
+    color: [u8; 3],
+) {
+    for link in links {
+        let rect = PixelRect {
+            left: link.rect.left,
+            top: link.rect.top,
+            right: link.rect.right,
+            bottom: link.rect.bottom,
+        };
+        blend_rectangle(rgba, width, height, rect, color, LINK_HIGHLIGHT_ALPHA);
+        let border = 2;
+        for edge in [
+            PixelRect {
+                bottom: rect.top.saturating_add(border),
+                ..rect
+            },
+            PixelRect {
+                top: rect.bottom.saturating_sub(border),
+                ..rect
+            },
+            PixelRect {
+                right: rect.left.saturating_add(border),
+                ..rect
+            },
+            PixelRect {
+                left: rect.right.saturating_sub(border),
+                ..rect
+            },
+        ] {
+            blend_rectangle(rgba, width, height, edge, color, LINK_BORDER_ALPHA);
+        }
+    }
+}
+
 fn blend_highlight_rectangle(
     rgba: &mut [u8],
     width: u32,
     height: u32,
     rectangle: PixelRect,
     color: [u8; 3],
+) {
+    blend_rectangle(
+        rgba,
+        width,
+        height,
+        rectangle,
+        color,
+        SEARCH_HIGHLIGHT_ALPHA,
+    );
+}
+
+fn blend_rectangle(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    rectangle: PixelRect,
+    color: [u8; 3],
+    alpha: u16,
 ) {
     let left = rectangle.left.min(width);
     let right = rectangle.right.min(width);
@@ -1373,9 +1568,7 @@ fn blend_highlight_rectangle(
             };
             for (channel, highlight) in pixel[..3].iter_mut().zip(color) {
                 let original = u16::from(*channel);
-                *channel = ((original * (255 - SEARCH_HIGHLIGHT_ALPHA)
-                    + u16::from(highlight) * SEARCH_HIGHLIGHT_ALPHA)
-                    / 255) as u8;
+                *channel = ((original * (255 - alpha) + u16::from(highlight) * alpha) / 255) as u8;
             }
         }
     }
@@ -1425,8 +1618,8 @@ mod tests {
     #[test]
     fn pdfium_image_mask_and_text_cache_work() {
         use super::{
-            apply_search_highlights, cached_page_text, empty_text_cache, image_mask, load_pdfium,
-            search_page,
+            LinkTarget, apply_link_highlights, apply_search_highlights, cached_page_text,
+            empty_text_cache, extract_page_links, image_mask, load_pdfium, search_page,
         };
         use pdfium_render::prelude::{
             PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints, PdfRenderConfig,
@@ -1514,6 +1707,49 @@ mod tests {
             [0xff, 0xc7, 0x77],
         );
         assert_ne!(highlighted, original);
+
+        let link_document = pdfium
+            .load_pdf_from_byte_vec(synthetic_link_pdf(), None)
+            .expect("load synthetic linked PDF");
+        let link_page = link_document.pages().get(0).expect("first page");
+        let link_config = PdfRenderConfig::new()
+            .set_reverse_byte_order(true)
+            .set_target_width(400);
+        let link_bitmap = link_page
+            .render_with_config(&link_config)
+            .expect("render linked page");
+        let link_width = link_bitmap.width() as u32;
+        let link_height = link_bitmap.height() as u32;
+        let links = extract_page_links(
+            &link_document,
+            &link_page,
+            &link_config,
+            link_width,
+            link_height,
+        );
+
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| matches!(
+            link.target,
+            LinkTarget::Internal {
+                page: 1,
+                top_ratio: Some(ratio)
+            } if (ratio - 0.25).abs() < f32::EPSILON
+        )));
+        assert!(links.iter().any(|link| {
+            matches!(&link.target, LinkTarget::Uri(uri) if uri == "https://example.invalid/paper")
+        }));
+
+        let mut link_highlighted = link_bitmap.as_raw_bytes();
+        let link_original = link_highlighted.clone();
+        apply_link_highlights(
+            &mut link_highlighted,
+            link_width,
+            link_height,
+            &links,
+            [0x86, 0xe1, 0xfc],
+        );
+        assert_ne!(link_highlighted, link_original);
     }
 
     fn synthetic_image_pdf() -> Vec<u8> {
@@ -1527,6 +1763,39 @@ mod tests {
                 page_stream.len()
             ),
             "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\nRGB\nendstream".to_string(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn synthetic_link_pdf() -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [7 0 R 8 0 R] /Contents 5 0 R >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Contents 6 0 R >>".to_string(),
+            "<< /Length 0 >>\nstream\n\nendstream".to_string(),
+            "<< /Length 0 >>\nstream\n\nendstream".to_string(),
+            "<< /Type /Annot /Subtype /Link /Rect [10 10 80 30] /Border [0 0 0] /Dest [4 0 R /XYZ null 300 null] >>".to_string(),
+            "<< /Type /Annot /Subtype /Link /Rect [100 10 180 30] /Border [0 0 0] /A << /S /URI /URI (https://example.invalid/paper) >> >>".to_string(),
         ];
         let mut pdf = b"%PDF-1.7\n".to_vec();
         let mut offsets = Vec::with_capacity(objects.len());

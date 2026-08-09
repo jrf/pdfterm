@@ -5,6 +5,9 @@
 
 Page 1 contains generated text and shapes for pdfterm smoke testing.
 
+Follow the #link(<synthetic-reference>)[synthetic reference] or copy the
+#link("https://example.invalid/paper")[synthetic external link].
+
 #rect(width: 100%, height: 3in, fill: gradient.linear(blue, purple))
 
 #pagebreak()
@@ -17,7 +20,6 @@ Page 1 contains generated text and shapes for pdfterm smoke testing.
 
 #pagebreak()
 
-= Synthetic third page
+= Synthetic third page <synthetic-reference>
 
 #circle(radius: 2in, fill: orange, stroke: 4pt + black)
-

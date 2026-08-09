@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::DisableMouseCapture;
 use crossterm::execute;
 use crossterm::style::{ResetColor, SetBackgroundColor, SetForegroundColor, force_color_output};
 use crossterm::terminal::{
@@ -155,6 +156,7 @@ impl Drop for TerminalGuard {
         let _ = kitty::delete_all(&mut output);
         let _ = execute!(
             output,
+            DisableMouseCapture,
             ResetColor,
             Show,
             EnableLineWrap,

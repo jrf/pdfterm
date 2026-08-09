@@ -6,7 +6,7 @@
 
 The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top of the picker.
 
-You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line reports PDF rendering, dark-mode conversion, compression, and transfer latency separately.
+You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line reports PDF rendering, dark-mode conversion, compression, and transfer latency separately.
 
 ## Requirements
 
@@ -54,6 +54,8 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
 | `T` | choose and preview a theme for the current session |
 | `y` | copy the current page's text to the clipboard |
+| `L` | toggle link mode and highlight clickable PDF annotations |
+| `b` | return to the view before the last followed internal link |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
 | `?` | open the keybinding help menu |
@@ -68,6 +70,13 @@ Search scans and caches selectable text incrementally without blocking foregroun
 page rendering. It is case-insensitive, treats runs of whitespace as a single
 space, and highlights matches using the active theme. Image-only PDFs require OCR
 and are reported as having no matches.
+
+Link mode temporarily enables mouse capture so normal terminal text selection is
+unchanged outside the mode. Click an internal citation or other annotated link to
+jump to its PDF destination; link history is kept independently for each tab.
+External URLs are copied to the local clipboard with OSC 52 instead of being
+opened on the remote machine. Press `Esc` or `L` to leave link mode. Plain citation
+text without a PDF link annotation is not inferred.
 
 ## Configuration
 

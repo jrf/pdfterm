@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::cursor::{Hide, MoveTo};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::style::{Attribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
@@ -23,10 +26,10 @@ use crate::browser::BrowserState;
 use crate::config::Config;
 use crate::kitty::{self, Placement};
 use crate::pdf::{
-    DarkModeStyle, DocumentId, FitMode, Frame, OutlineItem, RenderKey, RenderRequest, RenderWorker,
-    SearchPageMatch, WorkerMessage,
+    DarkModeStyle, DocumentId, FitMode, Frame, LinkTarget, OutlineItem, PageLink, RenderKey,
+    RenderRequest, RenderWorker, SearchPageMatch, WorkerMessage,
 };
-use crate::terminal::{TerminalGuard, Viewport};
+use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -131,6 +134,7 @@ pub fn run(
                     break;
                 }
                 Event::Resize(_, _) => app.request_current(&mut output)?,
+                Event::Mouse(mouse) => app.handle_mouse(mouse, &mut output)?,
                 _ => {}
             }
         }
@@ -156,6 +160,7 @@ struct App {
     goto_input: Option<String>,
     search_input: Option<String>,
     next_search_request_id: u64,
+    link_mode: bool,
     theme: Palette,
     themes: Vec<(String, Palette)>,
     theme_index: usize,
@@ -167,6 +172,7 @@ struct AppDefaults {
     theme: Palette,
     dark_mode_style: DarkModeStyle,
     search_highlight: [u8; 3],
+    link_highlight: [u8; 3],
     themes: Vec<(String, Palette)>,
     theme_index: usize,
 }
@@ -190,6 +196,7 @@ impl From<&Config> for AppDefaults {
                 theme.document.foreground,
             ),
             search_highlight: terminal_color_rgb(theme.yellow),
+            link_highlight: terminal_color_rgb(theme.cyan),
             theme,
             themes,
             theme_index,
@@ -207,11 +214,27 @@ struct Tab {
     invert: bool,
     dark_mode_style: DarkModeStyle,
     search_highlight: [u8; 3],
+    link_highlight: [u8; 3],
     scroll_x: u32,
     scroll_y: u32,
     outline: Arc<Vec<OutlineItem>>,
     cache: HashMap<RenderKey, Arc<Frame>>,
     search: SearchState,
+    link_history: Vec<ViewPosition>,
+    pending_destination: Option<LinkDestination>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewPosition {
+    page: u32,
+    scroll_x: u32,
+    scroll_y: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LinkDestination {
+    page: u32,
+    top_ratio: Option<f32>,
 }
 
 #[derive(Default)]
@@ -297,7 +320,7 @@ enum Axis {
 }
 
 impl Tab {
-    fn render_key(&self, viewport: Viewport) -> RenderKey {
+    fn render_key(&self, viewport: Viewport, link_mode: bool) -> RenderKey {
         RenderKey {
             document_id: self.document_id,
             page: self.page,
@@ -308,6 +331,8 @@ impl Tab {
             dark_mode_style: self.dark_mode_style,
             search_request_id: self.search.highlight_request_id(self.page),
             search_highlight: self.search_highlight,
+            link_mode,
+            link_highlight: self.link_highlight,
         }
     }
 }
@@ -355,11 +380,14 @@ impl App {
                 invert: default_invert,
                 dark_mode_style: defaults.dark_mode_style,
                 search_highlight: defaults.search_highlight,
+                link_highlight: defaults.link_highlight,
                 scroll_x: 0,
                 scroll_y: 0,
                 outline: Arc::new(outline),
                 cache: HashMap::new(),
                 search: SearchState::default(),
+                link_history: Vec::new(),
+                pending_destination: None,
             }],
             active_tab: 0,
             next_document_id: INITIAL_DOCUMENT_ID + 1,
@@ -374,6 +402,7 @@ impl App {
             goto_input: None,
             search_input: None,
             next_search_request_id: 1,
+            link_mode: false,
             theme: defaults.theme,
             themes: defaults.themes,
             theme_index: defaults.theme_index,
@@ -434,6 +463,8 @@ impl App {
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 tab.search = SearchState::default();
+                tab.link_history.clear();
+                tab.pending_destination = None;
                 if index == self.active_tab {
                     self.reset_render_state();
                     self.request_current(output)?;
@@ -458,11 +489,14 @@ impl App {
                         self.theme.document.foreground,
                     ),
                     search_highlight: terminal_color_rgb(self.theme.yellow),
+                    link_highlight: terminal_color_rgb(self.theme.cyan),
                     scroll_x: 0,
                     scroll_y: 0,
                     outline: Arc::new(outline),
                     cache: HashMap::new(),
                     search: SearchState::default(),
+                    link_history: Vec::new(),
+                    pending_destination: None,
                 });
                 self.active_tab = self.tabs.len() - 1;
                 self.reset_render_state();
@@ -590,9 +624,11 @@ impl App {
         self.theme = theme;
         let style = DarkModeStyle::new(theme.document.background, theme.document.foreground);
         let search_highlight = terminal_color_rgb(theme.yellow);
+        let link_highlight = terminal_color_rgb(theme.cyan);
         for tab in &mut self.tabs {
             tab.dark_mode_style = style;
             tab.search_highlight = search_highlight;
+            tab.link_highlight = link_highlight;
             tab.cache.clear();
         }
     }
@@ -861,6 +897,105 @@ impl App {
         Ok(true)
     }
 
+    fn toggle_link_mode(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.set_link_mode(!self.link_mode, output)
+    }
+
+    fn set_link_mode(&mut self, enabled: bool, output: &mut impl Write) -> Result<(), AppError> {
+        if enabled == self.link_mode {
+            return Ok(());
+        }
+        if enabled {
+            execute!(output, EnableMouseCapture)?;
+        } else {
+            execute!(output, DisableMouseCapture)?;
+        }
+        self.link_mode = enabled;
+        self.request_current(output)
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, output: &mut impl Write) -> Result<(), AppError> {
+        if !self.link_mode
+            || mouse.kind != MouseEventKind::Down(MouseButton::Left)
+            || self.pending_open.is_some()
+        {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let key = self.tab().render_key(viewport, self.link_mode);
+        let Some(frame) = self.tab().cache.get(&key).cloned() else {
+            self.draw_status(output, viewport, "links are still rendering")?;
+            return Ok(());
+        };
+        let placement = viewport.place(
+            frame.width,
+            frame.height,
+            self.tab().scroll_x,
+            self.tab().scroll_y,
+        );
+        let Some(target) = link_at_cell(
+            &frame.links,
+            placement,
+            frame.width,
+            frame.height,
+            viewport.top,
+            mouse.column,
+            mouse.row,
+        ) else {
+            self.draw_status(output, viewport, "no link here")?;
+            return Ok(());
+        };
+        self.follow_link(target, output)
+    }
+
+    fn follow_link(&mut self, target: LinkTarget, output: &mut impl Write) -> Result<(), AppError> {
+        match target {
+            LinkTarget::Internal { page, top_ratio } => {
+                let current = ViewPosition {
+                    page: self.tab().page,
+                    scroll_x: self.tab().scroll_x,
+                    scroll_y: self.tab().scroll_y,
+                };
+                let page = page.min(self.tab().page_count - 1);
+                let tab = self.tab_mut();
+                if tab.link_history.len() == 100 {
+                    tab.link_history.remove(0);
+                }
+                tab.link_history.push(current);
+                tab.page = page;
+                tab.scroll_x = 0;
+                tab.scroll_y = 0;
+                tab.pending_destination = Some(LinkDestination { page, top_ratio });
+                self.request_current(output)?;
+            }
+            LinkTarget::Uri(uri) => {
+                if uri.trim().is_empty() {
+                    self.draw_status(output, self.viewport()?, "empty link")?;
+                } else {
+                    write_clipboard_osc52(output, &uri)?;
+                    self.draw_status(output, self.viewport()?, "copied link to clipboard")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn follow_link_back(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let Some(previous) = self.tab_mut().link_history.pop() else {
+            self.draw_status(output, self.viewport()?, "no link history")?;
+            return Ok(());
+        };
+        let tab = self.tab_mut();
+        tab.page = previous.page.min(tab.page_count - 1);
+        tab.scroll_x = previous.scroll_x;
+        tab.scroll_y = previous.scroll_y;
+        tab.pending_destination = None;
+        self.request_current(output)
+    }
+
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
         if self.search_input.is_some() {
             self.handle_search_key(key, output)?;
@@ -877,6 +1012,9 @@ impl App {
             KeyCode::Char('/') => self.begin_search(output)?,
             KeyCode::Char('n') => self.navigate_search(true, output)?,
             KeyCode::Char('N') => self.navigate_search(false, output)?,
+            KeyCode::Char('L') => self.toggle_link_mode(output)?,
+            KeyCode::Char('b') => self.follow_link_back(output)?,
+            KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
@@ -936,7 +1074,7 @@ impl App {
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport);
+        let key = self.tab().render_key(viewport, self.link_mode);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
             return self.page_step(forward, output);
         };
@@ -990,7 +1128,7 @@ impl App {
     /// without asking the worker to render again.
     fn redraw_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport);
+        let key = self.tab().render_key(viewport, self.link_mode);
         if let Some(frame) = self.tab().cache.get(&key).cloned() {
             self.draw_frame(&frame, viewport, output)?;
         }
@@ -1043,7 +1181,7 @@ impl App {
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
-        let key = self.tab().render_key(viewport);
+        let key = self.tab().render_key(viewport, self.link_mode);
         self.desired_key = Some(key);
         self.generation = self.generation.wrapping_add(1);
         self.worker.begin_generation(self.generation);
@@ -1086,7 +1224,7 @@ impl App {
 
         if self.desired_key == Some(key) {
             let viewport = self.viewport()?;
-            let current_key = self.tab().render_key(viewport);
+            let current_key = self.tab().render_key(viewport, self.link_mode);
             if current_key == key {
                 self.draw_frame(&frame, viewport, output)?;
                 self.prefetch_neighbors(key);
@@ -1101,6 +1239,16 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        if let Some(destination) = self.tab_mut().pending_destination.take()
+            && destination.page == frame.key.page
+        {
+            let target_y = destination
+                .top_ratio
+                .map(|ratio| (ratio * frame.height as f32).round() as u32)
+                .unwrap_or(0);
+            self.tab_mut().scroll_x = 0;
+            self.tab_mut().scroll_y = target_y;
+        }
         let tab = self.tab();
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         self.tab_mut().scroll_x = placement.scroll_x;
@@ -1133,10 +1281,15 @@ impl App {
             format!("  highlight {}ms", elapsed.as_millis())
         });
         let state = format!(
-            "render {}ms{dark_mode}{highlight}  compress {}ms  transfer {}ms",
+            "render {}ms{dark_mode}{highlight}  compress {}ms  transfer {}ms{}",
             frame.render_elapsed.as_millis(),
             frame.compression_elapsed.as_millis(),
-            transfer_elapsed.as_millis()
+            transfer_elapsed.as_millis(),
+            if self.link_mode {
+                format!("  {} links", frame.links.len())
+            } else {
+                String::new()
+            }
         );
         self.draw_status(output, viewport, &state)?;
         Ok(())
@@ -1164,6 +1317,9 @@ impl App {
             mode.push_str("  ");
         }
         let search_status = tab.search.status_label(tab.page);
+        let link_status = self
+            .link_mode
+            .then_some("  link mode · click · b back · esc close");
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -1184,6 +1340,8 @@ impl App {
             Print(state),
             SetForegroundColor(theme.magenta),
             Print(search_status.as_deref().unwrap_or_default()),
+            SetForegroundColor(theme.cyan),
+            Print(link_status.unwrap_or_default()),
             SetForegroundColor(theme.comment),
             Print("  ?: help"),
             SetBackgroundColor(theme.bg),
@@ -1251,6 +1409,7 @@ impl App {
             output,
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg),
+            Hide,
             Clear(ClearType::All),
             MoveTo(0, 0)
         )?;
@@ -1358,6 +1517,61 @@ fn write_clipboard_osc52(output: &mut impl Write, text: &str) -> io::Result<()> 
     output.flush()
 }
 
+fn link_at_cell(
+    links: &[PageLink],
+    placement: ImagePlacement,
+    image_width: u32,
+    image_height: u32,
+    viewport_top: u16,
+    column: u16,
+    row: u16,
+) -> Option<LinkTarget> {
+    let local_column = column.checked_sub(placement.left)?;
+    let local_row = row.checked_sub(viewport_top)?;
+    if local_column >= placement.columns || local_row >= placement.rows {
+        return None;
+    }
+    let (source_x, source_y, visible_width, visible_height) = placement
+        .crop
+        .map_or((0, 0, image_width, image_height), |crop| {
+            (crop.x, crop.y, crop.width, crop.height)
+        });
+    let x0 = source_x + scaled_cell_boundary(local_column, placement.columns, visible_width);
+    let x1 = source_x
+        + scaled_cell_boundary(
+            local_column.saturating_add(1),
+            placement.columns,
+            visible_width,
+        );
+    let y0 = source_y + scaled_cell_boundary(local_row, placement.rows, visible_height);
+    let y1 = source_y
+        + scaled_cell_boundary(local_row.saturating_add(1), placement.rows, visible_height);
+    let cell_center_x = u64::from(x0) + u64::from(x1);
+    let cell_center_y = u64::from(y0) + u64::from(y1);
+
+    links
+        .iter()
+        .filter(|link| {
+            link.rect.left < x1
+                && link.rect.right > x0
+                && link.rect.top < y1
+                && link.rect.bottom > y0
+        })
+        .min_by_key(|link| {
+            let link_center_x = u64::from(link.rect.left) + u64::from(link.rect.right);
+            let link_center_y = u64::from(link.rect.top) + u64::from(link.rect.bottom);
+            cell_center_x
+                .abs_diff(link_center_x)
+                .saturating_pow(2)
+                .saturating_add(cell_center_y.abs_diff(link_center_y).saturating_pow(2))
+        })
+        .map(|link| link.target.clone())
+}
+
+fn scaled_cell_boundary(cell: u16, cells: u16, pixels: u32) -> u32 {
+    ((u64::from(cell) * u64::from(pixels)) / u64::from(cells.max(1))) as u32
+}
+
 fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
     previous.filter(|row| *row < current)
 }
@@ -1450,6 +1664,7 @@ fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
         output,
         SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.fg),
+        Hide,
         Clear(ClearType::All),
         MoveTo(0, 0)
     )?;
@@ -1934,6 +2149,8 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("t", "table of contents"),
         ("T", "choose theme"),
         ("y", "copy page text"),
+        ("L", "toggle clickable links"),
+        ("b", "return from followed link"),
         ("f", "open PDF in new tab"),
         ("q", "close tab / exit"),
         ("Esc", "clear search / exit"),
@@ -2426,10 +2643,11 @@ mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, SearchState,
         apply_picker_navigation, clear_picker, cycled_tab_index, draw_help_menu, draw_picker,
-        draw_theme_picker, filter_outline, outline_start_index, picker_color, picker_rect,
-        search_target_page, shorten_path, stale_status_row, write_clipboard_osc52,
+        draw_theme_picker, filter_outline, link_at_cell, outline_start_index, picker_color,
+        picker_rect, search_target_page, shorten_path, stale_status_row, write_clipboard_osc52,
     };
-    use crate::pdf::{OutlineItem, SearchPageMatch};
+    use crate::pdf::{LinkTarget, OutlineItem, PageLink, PageLinkRect, SearchPageMatch};
+    use crate::terminal::ImagePlacement;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2565,6 +2783,38 @@ mod tests {
         write_clipboard_osc52(&mut output, "hi").expect("clipboard write");
 
         assert_eq!(output, b"\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn mouse_cell_intersection_selects_tiny_link_targets() {
+        let target = LinkTarget::Internal {
+            page: 7,
+            top_ratio: Some(0.5),
+        };
+        let links = [PageLink {
+            rect: PageLinkRect {
+                left: 52,
+                top: 22,
+                right: 55,
+                bottom: 25,
+            },
+            target: target.clone(),
+        }];
+        let placement = ImagePlacement {
+            left: 10,
+            columns: 20,
+            rows: 10,
+            crop: None,
+            scroll_x: 0,
+            scroll_y: 0,
+        };
+
+        assert_eq!(
+            link_at_cell(&links, placement, 200, 100, 1, 15, 3),
+            Some(target)
+        );
+        assert_eq!(link_at_cell(&links, placement, 200, 100, 1, 14, 3), None);
+        assert_eq!(link_at_cell(&links, placement, 200, 100, 1, 15, 0), None);
     }
 
     #[test]
@@ -2766,5 +3016,6 @@ mod tests {
         clear_picker(&mut output, crate::theme::TOKYO_NIGHT_MOON).expect("clear picker");
 
         assert!(output.windows(4).any(|window| window == b"\x1b[2J"));
+        assert!(output.windows(6).any(|window| window == b"\x1b[?25l"));
     }
 }
