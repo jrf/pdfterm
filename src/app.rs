@@ -1012,7 +1012,7 @@ impl App {
         }
 
         self.clear_viewer(output)?;
-        let selection = pick_link(&frame.links, output, self.theme)?;
+        let selection = pick_link(&frame.links, self.tab().page, output, self.theme)?;
         self.clear_viewer(output)?;
         self.reset_render_state();
         match selection {
@@ -1791,6 +1791,7 @@ fn pick_theme(
 
 fn pick_link(
     links: &[PageLink],
+    page: u32,
     output: &mut impl Write,
     theme: Palette,
 ) -> Result<Option<LinkTarget>, AppError> {
@@ -1805,9 +1806,10 @@ fn pick_link(
         if redraw {
             terminal.autoresize()?;
             let area = terminal.size()?;
-            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(3).max(1));
-            terminal
-                .draw(|frame| draw_link_picker(frame, links, selected, &number_input, theme))?;
+            visible_height = link_picker_visible_height(area.into());
+            terminal.draw(|frame| {
+                draw_link_picker(frame, links, selected, &number_input, page, theme)
+            })?;
             redraw = false;
         }
 
@@ -2281,6 +2283,7 @@ fn draw_link_picker(
     links: &[PageLink],
     selected: usize,
     number_input: &str,
+    page: u32,
     theme: Palette,
 ) {
     let colors = PickerTheme::from(theme);
@@ -2296,7 +2299,7 @@ fn draw_link_picker(
         .borders(Borders::ALL)
         .style(Style::default().bg(colors.surface).fg(colors.text))
         .border_style(Style::default().fg(colors.border))
-        .title(" Links on this page ")
+        .title(format!(" Links on page {} · {} ", page + 1, links.len()))
         .title_style(
             Style::default()
                 .fg(colors.accent)
@@ -2305,12 +2308,33 @@ fn draw_link_picker(
         );
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let detail_height = link_picker_detail_height(popup);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(detail_height),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
     let visible_height = usize::from(rows[0].height).max(1);
     let first_visible = selected.saturating_add(1).saturating_sub(visible_height);
     let width = usize::from(rows[0].width);
     let number_width = links.len().to_string().len().max(1);
+    let prefix_width = 2 + number_width + 2;
+    let available_width = width.saturating_sub(prefix_width);
+    let label_column_width = if available_width >= 18 {
+        links
+            .iter()
+            .skip(first_visible)
+            .take(visible_height)
+            .map(|link| Line::raw(link_picker_label(&link.label)).width())
+            .max()
+            .unwrap_or(0)
+            .min(32)
+            .min(available_width.saturating_sub(10))
+    } else {
+        0
+    };
     let lines: Vec<_> = links
         .iter()
         .enumerate()
@@ -2327,24 +2351,34 @@ fn draw_link_picker(
             let number = format!("{:>number_width$}  ", index + 1);
             let label = link_picker_label(&link.label);
             let detail = format!("→ {}", link_target_description(&link.target));
-            let prefix_width = 2 + Line::raw(number.as_str()).width();
-            let available_width = width.saturating_sub(prefix_width);
-            let (label, separator, detail) = if available_width >= 8 {
+            let (label, separator, detail) = if label_column_width > 0 {
+                let label = truncate_right(&label, label_column_width);
+                let label_width = Line::raw(label.as_str()).width();
+                let separator = format!("{}  ", " ".repeat(label_column_width - label_width));
+                let detail_width = available_width
+                    .saturating_sub(label_column_width)
+                    .saturating_sub(2);
+                (label, separator, truncate_right(&detail, detail_width))
+            } else if available_width >= 8 {
                 let detail_width = Line::raw(detail.as_str()).width();
                 let detail_budget = detail_width.min((available_width / 2).max(8));
                 let detail = truncate_right(&detail, detail_budget);
                 let detail_width = Line::raw(detail.as_str()).width();
                 let separator = if available_width > detail_width + 2 {
-                    "  "
+                    "  ".to_string()
                 } else {
-                    ""
+                    String::new()
                 };
                 let label_width = available_width
                     .saturating_sub(detail_width)
-                    .saturating_sub(separator.len());
+                    .saturating_sub(Line::raw(separator.as_str()).width());
                 (truncate_right(&label, label_width), separator, detail)
             } else {
-                (truncate_right(&label, available_width), "", String::new())
+                (
+                    truncate_right(&label, available_width),
+                    String::new(),
+                    String::new(),
+                )
             };
             let mut line = Line::from(vec![
                 Span::styled(
@@ -2376,24 +2410,86 @@ fn draw_link_picker(
         rows[0],
     );
 
+    if detail_height > 0
+        && let Some(link) = links.get(selected)
+    {
+        draw_link_picker_detail(frame, rows[1], link, selected, colors);
+    }
+
     let status = if number_input.is_empty() {
         format!("{}/{}", selected + 1, links.len())
     } else {
-        format!("number {number_input} · {}/{}", selected + 1, links.len())
+        format!("typed {number_input} · {}/{}", selected + 1, links.len())
+    };
+    let action = match links.get(selected).map(|link| &link.target) {
+        Some(LinkTarget::Uri(_)) => "copy URL",
+        _ => "jump",
     };
     frame.render_widget(
         Paragraph::new(picker_hint_line(
             &[
                 ("j/k", "select"),
-                ("number", "jump"),
-                ("enter", "follow"),
+                ("number", "select"),
+                ("enter", action),
                 ("esc", "close"),
             ],
             Some((status, colors.muted)),
             colors,
         ))
         .style(Style::default().bg(colors.chrome)),
-        rows[1],
+        rows[2],
+    );
+}
+
+fn draw_link_picker_detail(
+    frame: &mut RatatuiFrame,
+    area: Rect,
+    link: &PageLink,
+    selected: usize,
+    colors: PickerTheme,
+) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(colors.border))
+        .title(format!(" Selected {} ", selected + 1))
+        .title_style(
+            Style::default()
+                .fg(colors.muted)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(colors.surface));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = usize::from(inner.width);
+    let label = truncate_right(&link_picker_label(&link.label), width);
+    let (kind, target) = match &link.target {
+        LinkTarget::Internal { page, .. } => ("internal PDF", format!("page {}", page + 1)),
+        LinkTarget::Uri(uri) => ("external URL", uri.clone()),
+    };
+    let kind_width = Line::raw(kind).width() + 3;
+    let target = truncate_right(&target, width.saturating_sub(kind_width));
+    let lines = vec![
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(colors.text)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(kind, Style::default().fg(colors.accent).bg(colors.surface)),
+            Span::styled(" · ", Style::default().fg(colors.muted).bg(colors.surface)),
+            Span::styled(
+                target,
+                Style::default().fg(colors.text_dim).bg(colors.surface),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
+        inner,
     );
 }
 
@@ -2820,6 +2916,20 @@ fn picker_rect(area: Rect) -> Rect {
     )
 }
 
+fn link_picker_detail_height(popup: Rect) -> u16 {
+    if popup.height >= 10 { 4 } else { 0 }
+}
+
+fn link_picker_visible_height(area: Rect) -> usize {
+    let popup = picker_rect(area);
+    usize::from(
+        popup
+            .height
+            .saturating_sub(3 + link_picker_detail_height(popup))
+            .max(1),
+    )
+}
+
 fn shorten_path(path: &str) -> String {
     std::env::var_os("HOME")
         .and_then(|home| {
@@ -2962,8 +3072,9 @@ mod tests {
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, SearchState,
         apply_picker_navigation, clear_picker, cycled_tab_index, draw_help_menu, draw_link_picker,
         draw_picker, draw_theme_picker, filter_outline, link_at_cell, link_picker_label,
-        outline_start_index, picker_color, picker_rect, search_target_page, shorten_path,
-        stale_status_row, update_link_number_selection, write_clipboard_osc52,
+        link_picker_visible_height, outline_start_index, picker_color, picker_rect,
+        search_target_page, shorten_path, stale_status_row, update_link_number_selection,
+        write_clipboard_osc52,
     };
     use crate::pdf::{LinkTarget, OutlineItem, PageLink, PageLinkRect, SearchPageMatch};
     use crate::terminal::ImagePlacement;
@@ -3181,7 +3292,9 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_link_picker(frame, &links, 1, "2", crate::theme::TOKYO_NIGHT_MOON))
+            .draw(|frame| {
+                draw_link_picker(frame, &links, 1, "2", 2, crate::theme::TOKYO_NIGHT_MOON)
+            })
             .expect("draw link picker");
         let buffer = terminal.backend().buffer();
         let rendered: String = (popup.y..popup.y + popup.height)
@@ -3190,12 +3303,21 @@ mod tests {
             })
             .collect();
 
-        assert!(rendered.contains("Links on this page"));
+        assert!(rendered.contains("Links on page 3 · 2"));
         assert!(rendered.contains("citation [12]  → page 8"));
         assert!(rendered.contains("page 8"));
         assert!(rendered.contains("project page"));
         assert!(rendered.contains("external · example.invalid"));
-        assert!(rendered.contains("number 2"));
+        assert!(rendered.contains("Selected 2"));
+        assert!(rendered.contains("external URL · https://example.invalid/paper"));
+        assert!(rendered.contains("copy URL"));
+        assert!(rendered.contains("typed 2"));
+    }
+
+    #[test]
+    fn link_picker_reserves_room_for_details_when_space_allows() {
+        assert_eq!(link_picker_visible_height(Rect::new(0, 0, 100, 30)), 15);
+        assert_eq!(link_picker_visible_height(Rect::new(0, 0, 20, 8)), 3);
     }
 
     #[test]

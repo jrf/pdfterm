@@ -1393,7 +1393,8 @@ fn extract_page_links(
     height: u32,
 ) -> Vec<PageLink> {
     let page_text = page.text().ok();
-    page.links()
+    let mut links: Vec<_> = page
+        .links()
         .iter()
         .filter_map(|link| {
             let target = resolve_link_target(document, &link)?;
@@ -1415,7 +1416,20 @@ fn extract_page_links(
                 target,
             })
         })
-        .collect()
+        .collect();
+    sort_page_links_reading_order(&mut links);
+    links
+}
+
+fn sort_page_links_reading_order(links: &mut [PageLink]) {
+    links.sort_by_key(|link| {
+        (
+            link.rect.top,
+            link.rect.left,
+            link.rect.bottom,
+            link.rect.right,
+        )
+    });
 }
 
 fn link_text_label(text: &str) -> String {
@@ -1922,6 +1936,38 @@ mod tests {
         let long = super::link_text_label(&"x".repeat(100));
         assert_eq!(long.chars().count(), 81);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn links_are_sorted_top_to_bottom_then_left_to_right() {
+        use super::{LinkTarget, PageLink, PageLinkRect, sort_page_links_reading_order};
+
+        let mut links = [(40, 20), (10, 80), (10, 5)]
+            .into_iter()
+            .map(|(top, left)| PageLink {
+                rect: PageLinkRect {
+                    left,
+                    top,
+                    right: left + 5,
+                    bottom: top + 5,
+                },
+                label: format!("{top}:{left}"),
+                target: LinkTarget::Internal {
+                    page: 0,
+                    top_ratio: None,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        sort_page_links_reading_order(&mut links);
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.label.as_str())
+                .collect::<Vec<_>>(),
+            ["10:5", "10:80", "40:20"]
+        );
     }
 
     #[test]

@@ -75,10 +75,12 @@ and are reported as having no matches.
 Link mode temporarily enables mouse capture so normal terminal text selection is
 unchanged outside the mode. Click an annotated link, or press `Enter` to open a
 numbered picker for the current page. In the picker, use `j`/`k`, arrows, or type
-an entry number, then press `Enter` to follow it. Link history is kept independently
-for each tab. External URLs are copied to the local clipboard with OSC 52 instead
-of being opened on the remote machine. Press `Esc` or `L` to leave link mode. Plain
-citation text without a PDF link annotation is not inferred.
+an entry number, then press `Enter` to follow it. Links are ordered top-to-bottom
+and left-to-right, and the selected-link panel shows destination details. Link
+history is kept independently for each tab. External URLs are copied to the local
+clipboard with OSC 52 instead of being opened on the remote machine. Press `Esc`
+or `L` to leave link mode. Plain citation text without a PDF link annotation is
+not inferred.
 
 ## Configuration
 
