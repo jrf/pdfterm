@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::kitty::{self, Placement};
 use crate::pdf::{
     DarkModeStyle, DocumentId, FitMode, Frame, OutlineItem, RenderKey, RenderRequest, RenderWorker,
-    WorkerMessage,
+    SearchPageMatch, WorkerMessage,
 };
 use crate::terminal::{TerminalGuard, Viewport};
 use crate::theme::Palette;
@@ -95,6 +95,30 @@ pub fn run(
                     app.fail_open(document_id, &error, &mut output)?
                 }
                 WorkerMessage::Text { content, .. } => app.copy_text(&content, &mut output)?,
+                WorkerMessage::SearchProgress {
+                    document_id,
+                    request_id,
+                    scanned,
+                    total,
+                } => app.receive_search_progress(
+                    document_id,
+                    request_id,
+                    scanned,
+                    total,
+                    &mut output,
+                )?,
+                WorkerMessage::SearchResults {
+                    document_id,
+                    request_id,
+                    matches,
+                    total_occurrences,
+                } => app.receive_search_results(
+                    document_id,
+                    request_id,
+                    matches,
+                    total_occurrences,
+                    &mut output,
+                )?,
             }
         }
         app.poll_file_change(&mut output)?;
@@ -130,6 +154,8 @@ struct App {
     default_fit: FitMode,
     default_invert: bool,
     goto_input: Option<String>,
+    search_input: Option<String>,
+    next_search_request_id: u64,
     theme: Palette,
     themes: Vec<(String, Palette)>,
     theme_index: usize,
@@ -140,6 +166,7 @@ struct AppDefaults {
     invert: bool,
     theme: Palette,
     dark_mode_style: DarkModeStyle,
+    search_highlight: [u8; 3],
     themes: Vec<(String, Palette)>,
     theme_index: usize,
 }
@@ -162,6 +189,7 @@ impl From<&Config> for AppDefaults {
                 theme.document.background,
                 theme.document.foreground,
             ),
+            search_highlight: terminal_color_rgb(theme.yellow),
             theme,
             themes,
             theme_index,
@@ -178,10 +206,88 @@ struct Tab {
     fit: FitMode,
     invert: bool,
     dark_mode_style: DarkModeStyle,
+    search_highlight: [u8; 3],
     scroll_x: u32,
     scroll_y: u32,
     outline: Arc<Vec<OutlineItem>>,
     cache: HashMap<RenderKey, Arc<Frame>>,
+    search: SearchState,
+}
+
+#[derive(Default)]
+struct SearchState {
+    query: String,
+    request_id: u64,
+    matches: Vec<SearchPageMatch>,
+    total_occurrences: u32,
+    scanned: u32,
+    total_pages: u32,
+    searching: bool,
+}
+
+impl SearchState {
+    fn highlight_request_id(&self, page: u32) -> u64 {
+        if !self.searching && self.matches.iter().any(|result| result.page == page) {
+            self.request_id
+        } else {
+            0
+        }
+    }
+
+    fn status_label(&self, current_page: u32) -> Option<String> {
+        if self.query.is_empty() {
+            return None;
+        }
+        let query = truncated_search_query(&self.query, 28);
+        if self.searching {
+            return Some(format!(
+                "  search {}/{}  /{}",
+                self.scanned, self.total_pages, query
+            ));
+        }
+        if self.matches.is_empty() {
+            return Some(format!("  no matches  /{query}"));
+        }
+        let position = self
+            .matches
+            .iter()
+            .position(|result| result.page == current_page)
+            .map(|index| format!("{}/{}", index + 1, self.matches.len()))
+            .unwrap_or_else(|| format!("{} pages", self.matches.len()));
+        Some(format!(
+            "  search {position} · {} hits  /{query}",
+            self.total_occurrences
+        ))
+    }
+}
+
+fn truncated_search_query(query: &str, max_chars: usize) -> String {
+    let mut characters = query.chars();
+    let mut truncated: String = characters.by_ref().take(max_chars).collect();
+    if characters.next().is_some() {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn search_target_page(
+    matches: &[SearchPageMatch],
+    current_page: u32,
+    forward: bool,
+) -> Option<u32> {
+    if forward {
+        matches
+            .iter()
+            .find(|result| result.page > current_page)
+            .or_else(|| matches.first())
+    } else {
+        matches
+            .iter()
+            .rev()
+            .find(|result| result.page < current_page)
+            .or_else(|| matches.last())
+    }
+    .map(|result| result.page)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,7 +306,16 @@ impl Tab {
             fit: self.fit,
             invert: self.invert,
             dark_mode_style: self.dark_mode_style,
+            search_request_id: self.search.highlight_request_id(self.page),
+            search_highlight: self.search_highlight,
         }
+    }
+}
+
+fn terminal_color_rgb(color: crossterm::style::Color) -> [u8; 3] {
+    match color {
+        crossterm::style::Color::Rgb { r, g, b } => [r, g, b],
+        _ => [0xff, 0xc7, 0x77],
     }
 }
 
@@ -239,10 +354,12 @@ impl App {
                 fit: default_fit,
                 invert: default_invert,
                 dark_mode_style: defaults.dark_mode_style,
+                search_highlight: defaults.search_highlight,
                 scroll_x: 0,
                 scroll_y: 0,
                 outline: Arc::new(outline),
                 cache: HashMap::new(),
+                search: SearchState::default(),
             }],
             active_tab: 0,
             next_document_id: INITIAL_DOCUMENT_ID + 1,
@@ -255,6 +372,8 @@ impl App {
             default_fit,
             default_invert,
             goto_input: None,
+            search_input: None,
+            next_search_request_id: 1,
             theme: defaults.theme,
             themes: defaults.themes,
             theme_index: defaults.theme_index,
@@ -314,6 +433,7 @@ impl App {
                 tab.scroll_y = 0;
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
+                tab.search = SearchState::default();
                 if index == self.active_tab {
                     self.reset_render_state();
                     self.request_current(output)?;
@@ -337,10 +457,12 @@ impl App {
                         self.theme.document.background,
                         self.theme.document.foreground,
                     ),
+                    search_highlight: terminal_color_rgb(self.theme.yellow),
                     scroll_x: 0,
                     scroll_y: 0,
                     outline: Arc::new(outline),
                     cache: HashMap::new(),
+                    search: SearchState::default(),
                 });
                 self.active_tab = self.tabs.len() - 1;
                 self.reset_render_state();
@@ -467,8 +589,10 @@ impl App {
         self.theme_index = index;
         self.theme = theme;
         let style = DarkModeStyle::new(theme.document.background, theme.document.foreground);
+        let search_highlight = terminal_color_rgb(theme.yellow);
         for tab in &mut self.tabs {
             tab.dark_mode_style = style;
+            tab.search_highlight = search_highlight;
             tab.cache.clear();
         }
     }
@@ -546,7 +670,202 @@ impl App {
         output.flush()
     }
 
+    fn begin_search(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.search_input = Some(String::new());
+        self.draw_search(output, self.viewport()?)?;
+        Ok(())
+    }
+
+    fn handle_search_key(
+        &mut self,
+        key: KeyEvent,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.search_input = None;
+                self.redraw_current(output)?;
+            }
+            KeyCode::Enter => {
+                let query = self.search_input.take().unwrap_or_default();
+                let query = query.trim();
+                if query.is_empty() {
+                    self.redraw_current(output)?;
+                } else {
+                    self.start_search(query.to_string(), output)?;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buffer) = self.search_input.as_mut() {
+                    buffer.pop();
+                }
+                self.draw_search(output, self.viewport()?)?;
+            }
+            KeyCode::Char('u') if control => {
+                if let Some(buffer) = self.search_input.as_mut() {
+                    buffer.clear();
+                }
+                self.draw_search(output, self.viewport()?)?;
+            }
+            KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                if let Some(buffer) = self
+                    .search_input
+                    .as_mut()
+                    .filter(|buffer| buffer.len() < 256)
+                {
+                    buffer.push(character);
+                }
+                self.draw_search(output, self.viewport()?)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn draw_search(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+        let theme = self.theme;
+        let input = self.search_input.as_deref().unwrap_or_default();
+        execute!(
+            output,
+            MoveTo(0, viewport.status_row),
+            SetBackgroundColor(theme.bg_dark),
+            Clear(ClearType::CurrentLine),
+            Print(" "),
+            SetForegroundColor(theme.yellow),
+            Print("search: "),
+            SetForegroundColor(theme.fg),
+            Print(input),
+            SetForegroundColor(theme.comment),
+            Print("  (enter to search, esc to cancel)"),
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.fg)
+        )?;
+        output.flush()
+    }
+
+    fn start_search(&mut self, query: String, output: &mut impl Write) -> Result<(), AppError> {
+        let request_id = self.next_search_request_id;
+        self.next_search_request_id = self.next_search_request_id.wrapping_add(1).max(1);
+        let (document_id, total_pages) = {
+            let tab = self.tab();
+            (tab.document_id, tab.page_count)
+        };
+        self.tab_mut().search = SearchState {
+            query: query.clone(),
+            request_id,
+            matches: Vec::new(),
+            total_occurrences: 0,
+            scanned: 0,
+            total_pages,
+            searching: true,
+        };
+        self.worker.search(document_id, request_id, query);
+        self.request_current(output)
+    }
+
+    fn receive_search_progress(
+        &mut self,
+        document_id: DocumentId,
+        request_id: u64,
+        scanned: u32,
+        total: u32,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some(index) = self.tab_index(document_id) else {
+            return Ok(());
+        };
+        if self.tabs[index].search.request_id != request_id {
+            return Ok(());
+        }
+        self.tabs[index].search.scanned = scanned;
+        self.tabs[index].search.total_pages = total;
+        if index == self.active_tab {
+            self.draw_status(output, self.viewport()?, "")?;
+        }
+        Ok(())
+    }
+
+    fn receive_search_results(
+        &mut self,
+        document_id: DocumentId,
+        request_id: u64,
+        matches: Vec<SearchPageMatch>,
+        total_occurrences: u32,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some(index) = self.tab_index(document_id) else {
+            return Ok(());
+        };
+        if self.tabs[index].search.request_id != request_id {
+            return Ok(());
+        }
+        let current_page = self.tabs[index].page;
+        let target_page = matches
+            .iter()
+            .find(|result| result.page >= current_page)
+            .or_else(|| matches.first())
+            .map(|result| result.page);
+        let search = &mut self.tabs[index].search;
+        search.matches = matches;
+        search.total_occurrences = total_occurrences;
+        search.scanned = search.total_pages;
+        search.searching = false;
+
+        if index != self.active_tab {
+            return Ok(());
+        }
+        if let Some(page) = target_page {
+            self.tabs[index].page = page;
+            self.tabs[index].scroll_x = 0;
+            self.tabs[index].scroll_y = 0;
+            self.request_current(output)?;
+        } else {
+            self.draw_status(output, self.viewport()?, "")?;
+        }
+        Ok(())
+    }
+
+    fn navigate_search(&mut self, forward: bool, output: &mut impl Write) -> Result<(), AppError> {
+        let tab = self.tab();
+        if tab.search.query.is_empty() {
+            self.draw_status(output, self.viewport()?, "no active search")?;
+            return Ok(());
+        }
+        if tab.search.searching {
+            self.draw_status(output, self.viewport()?, "searching")?;
+            return Ok(());
+        }
+        let Some(page) = search_target_page(&tab.search.matches, tab.page, forward) else {
+            self.draw_status(output, self.viewport()?, "")?;
+            return Ok(());
+        };
+        self.tab_mut().page = page;
+        self.tab_mut().scroll_x = 0;
+        self.tab_mut().scroll_y = 0;
+        self.request_current(output)
+    }
+
+    fn clear_search(&mut self, output: &mut impl Write) -> Result<bool, AppError> {
+        if self.tab().search.query.is_empty() {
+            return Ok(false);
+        }
+        let document_id = self.tab().document_id;
+        let request_id = self.tab().search.request_id;
+        self.worker.cancel_search(document_id, request_id);
+        self.tab_mut().search = SearchState::default();
+        self.request_current(output)?;
+        Ok(true)
+    }
+
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
+        if self.search_input.is_some() {
+            self.handle_search_key(key, output)?;
+            return Ok(false);
+        }
         if self.goto_input.is_some() {
             self.handle_goto_key(key, output)?;
             return Ok(false);
@@ -555,6 +874,10 @@ impl App {
             KeyCode::Char('?') => self.open_help(output)?,
             KeyCode::Char('q') => return self.close_current(output),
             KeyCode::Char(':') => self.begin_goto(output)?,
+            KeyCode::Char('/') => self.begin_search(output)?,
+            KeyCode::Char('n') => self.navigate_search(true, output)?,
+            KeyCode::Char('N') => self.navigate_search(false, output)?,
+            KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
             KeyCode::Tab => self.switch_tab(1, output)?,
@@ -806,8 +1129,11 @@ impl App {
         let dark_mode = frame.dark_mode_elapsed.map_or_else(String::new, |elapsed| {
             format!("  dark {}ms", elapsed.as_millis())
         });
+        let highlight = frame.highlight_elapsed.map_or_else(String::new, |elapsed| {
+            format!("  highlight {}ms", elapsed.as_millis())
+        });
         let state = format!(
-            "render {}ms{dark_mode}  compress {}ms  transfer {}ms",
+            "render {}ms{dark_mode}{highlight}  compress {}ms  transfer {}ms",
             frame.render_elapsed.as_millis(),
             frame.compression_elapsed.as_millis(),
             transfer_elapsed.as_millis()
@@ -837,6 +1163,7 @@ impl App {
         if !mode.is_empty() {
             mode.push_str("  ");
         }
+        let search_status = tab.search.status_label(tab.page);
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -855,6 +1182,8 @@ impl App {
             Print(&mode),
             SetForegroundColor(theme.green),
             Print(state),
+            SetForegroundColor(theme.magenta),
+            Print(search_status.as_deref().unwrap_or_default()),
             SetForegroundColor(theme.comment),
             Print("  ?: help"),
             SetBackgroundColor(theme.bg),
@@ -870,7 +1199,11 @@ impl App {
             .flatten()
             .filter(|page| *page < page_count)
         {
-            let neighbor = RenderKey { page, ..key };
+            let neighbor = RenderKey {
+                page,
+                search_request_id: self.tab().search.highlight_request_id(page),
+                ..key
+            };
             let cached = self.tab().cache.contains_key(&neighbor);
             if !cached && self.pending.insert(neighbor) {
                 self.worker.prefetch(RenderRequest {
@@ -1591,6 +1924,8 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("Backspace · PgUp", "page viewport backward"),
         ("g / G", "first / last page"),
         (":", "go to page"),
+        ("/", "search document"),
+        ("n / N", "next / prev match"),
         ("Tab / Shift-Tab", "switch tabs"),
     ];
     const VIEWER: &[(&str, &str)] = &[
@@ -1601,7 +1936,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("y", "copy page text"),
         ("f", "open PDF in new tab"),
         ("q", "close tab / exit"),
-        ("Esc", "exit immediately"),
+        ("Esc", "clear search / exit"),
         ("?", "open help"),
     ];
 
@@ -2089,12 +2424,12 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, apply_picker_navigation,
-        clear_picker, cycled_tab_index, draw_help_menu, draw_picker, draw_theme_picker,
-        filter_outline, outline_start_index, picker_color, picker_rect, shorten_path,
-        stale_status_row, write_clipboard_osc52,
+        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, SearchState,
+        apply_picker_navigation, clear_picker, cycled_tab_index, draw_help_menu, draw_picker,
+        draw_theme_picker, filter_outline, outline_start_index, picker_color, picker_rect,
+        search_target_page, shorten_path, stale_status_row, write_clipboard_osc52,
     };
-    use crate::pdf::OutlineItem;
+    use crate::pdf::{OutlineItem, SearchPageMatch};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2114,6 +2449,59 @@ mod tests {
         assert_eq!(cycled_tab_index(2, 3, 1), 0);
         assert_eq!(cycled_tab_index(2, 3, -1), 1);
         assert_eq!(cycled_tab_index(0, 3, -1), 2);
+    }
+
+    #[test]
+    fn search_navigation_wraps_between_matching_pages() {
+        let matches = [
+            SearchPageMatch {
+                page: 2,
+                occurrences: 1,
+            },
+            SearchPageMatch {
+                page: 5,
+                occurrences: 2,
+            },
+            SearchPageMatch {
+                page: 9,
+                occurrences: 1,
+            },
+        ];
+
+        assert_eq!(search_target_page(&matches, 2, true), Some(5));
+        assert_eq!(search_target_page(&matches, 9, true), Some(2));
+        assert_eq!(search_target_page(&matches, 5, false), Some(2));
+        assert_eq!(search_target_page(&matches, 2, false), Some(9));
+    }
+
+    #[test]
+    fn search_status_reports_progress_and_results() {
+        let mut search = SearchState {
+            query: "needle".into(),
+            request_id: 1,
+            matches: Vec::new(),
+            total_occurrences: 0,
+            scanned: 8,
+            total_pages: 20,
+            searching: true,
+        };
+        assert_eq!(
+            search.status_label(0).as_deref(),
+            Some("  search 8/20  /needle")
+        );
+
+        search.searching = false;
+        search.matches = vec![SearchPageMatch {
+            page: 4,
+            occurrences: 3,
+        }];
+        search.total_occurrences = 3;
+        assert_eq!(search.highlight_request_id(4), 1);
+        assert_eq!(search.highlight_request_id(5), 0);
+        assert_eq!(
+            search.status_label(4).as_deref(),
+            Some("  search 1/1 · 3 hits  /needle")
+        );
     }
 
     #[test]
@@ -2335,8 +2723,11 @@ mod tests {
         assert_eq!(buffer[(0, 0)].bg, picker_color(theme.bg_dark1));
         assert!(rendered.contains("Navigation"));
         assert!(rendered.contains("Viewer"));
+        assert!(rendered.contains("search document"));
+        assert!(rendered.contains("next / prev match"));
         assert!(rendered.contains("choose theme"));
         assert!(rendered.contains("open PDF in new tab"));
+        assert!(rendered.contains("clear search / exit"));
         assert!(rendered.contains("? / esc / q"));
     }
 

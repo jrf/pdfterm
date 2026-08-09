@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded};
 use pdfium_render::prelude::{
     PdfBookmark, PdfDocument, PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon,
-    PdfPageObjectsCommon, PdfRenderConfig, Pdfium,
+    PdfPageObjectsCommon, PdfPoints, PdfRenderConfig, Pdfium,
 };
 
 const LOW_CHROMA_THRESHOLD: u8 = 10;
@@ -17,6 +17,8 @@ const MAX_DARK_MODE_WORKERS: usize = 8;
 const MAX_FORM_DEPTH: u8 = 32;
 const IMAGE_MASK_SAMPLES: usize = 4;
 const PARALLEL_DARK_MODE_PIXELS: usize = 250_000;
+const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
 
 pub type DocumentId = u64;
 
@@ -26,6 +28,12 @@ pub struct OutlineItem {
     pub title: String,
     pub page: u32,
     pub depth: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchPageMatch {
+    pub page: u32,
+    pub occurrences: u32,
 }
 
 /// How a page is scaled to the terminal viewport.
@@ -82,6 +90,8 @@ pub struct RenderKey {
     pub fit: FitMode,
     pub invert: bool,
     pub dark_mode_style: DarkModeStyle,
+    pub search_request_id: u64,
+    pub search_highlight: [u8; 3],
 }
 
 #[derive(Debug)]
@@ -98,6 +108,7 @@ pub struct Frame {
     pub compressed_rgba: Vec<u8>,
     pub render_elapsed: Duration,
     pub dark_mode_elapsed: Option<Duration>,
+    pub highlight_elapsed: Option<Duration>,
     pub compression_elapsed: Duration,
     pub generation: u64,
 }
@@ -122,6 +133,18 @@ pub enum WorkerMessage {
         page: u32,
         content: String,
     },
+    SearchProgress {
+        document_id: DocumentId,
+        request_id: u64,
+        scanned: u32,
+        total: u32,
+    },
+    SearchResults {
+        document_id: DocumentId,
+        request_id: u64,
+        matches: Vec<SearchPageMatch>,
+        total_occurrences: u32,
+    },
     Frame(Frame),
     Error(String),
 }
@@ -136,6 +159,15 @@ enum WorkerCommand {
         document_id: DocumentId,
         page: u32,
     },
+    Search {
+        document_id: DocumentId,
+        request_id: u64,
+        query: String,
+    },
+    CancelSearch {
+        document_id: DocumentId,
+        request_id: u64,
+    },
 }
 
 enum WorkerTask {
@@ -148,7 +180,56 @@ enum WorkerTask {
         document_id: DocumentId,
         page: u32,
     },
+    StartSearch {
+        document_id: DocumentId,
+        request_id: u64,
+        query: String,
+    },
+    CancelSearch {
+        document_id: DocumentId,
+        request_id: u64,
+    },
+    SearchPage(SearchJob),
     Render(RenderRequest),
+}
+
+struct SearchJob {
+    document_id: DocumentId,
+    request_id: u64,
+    needle: String,
+    next_page: u32,
+    total_pages: u32,
+    matches: Vec<SearchPageMatch>,
+    total_occurrences: u32,
+    highlights: HashMap<u32, Vec<SearchRect>>,
+    last_progress: Instant,
+}
+
+struct SearchHighlights {
+    request_id: u64,
+    pages: HashMap<u32, Vec<SearchRect>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SearchRect {
+    bottom: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PixelRect {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+struct CachedPageText {
+    raw: String,
+    normalized: String,
+    source_index_by_byte: Vec<usize>,
 }
 
 struct WorkerChannels {
@@ -207,6 +288,8 @@ impl RenderWorker {
                 WorkerMessage::Opened { .. }
                 | WorkerMessage::OpenError { .. }
                 | WorkerMessage::Text { .. }
+                | WorkerMessage::SearchProgress { .. }
+                | WorkerMessage::SearchResults { .. }
                 | WorkerMessage::Frame(_),
             ) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
@@ -243,6 +326,21 @@ impl RenderWorker {
             .send(WorkerCommand::ExtractText { document_id, page });
     }
 
+    pub fn search(&self, document_id: DocumentId, request_id: u64, query: String) {
+        let _ = self.command_tx.send(WorkerCommand::Search {
+            document_id,
+            request_id,
+            query,
+        });
+    }
+
+    pub fn cancel_search(&self, document_id: DocumentId, request_id: u64) {
+        let _ = self.command_tx.send(WorkerCommand::CancelSearch {
+            document_id,
+            request_id,
+        });
+    }
+
     pub fn try_recv(&self) -> Result<WorkerMessage, TryRecvError> {
         self.message_rx.try_recv()
     }
@@ -276,33 +374,45 @@ fn run_worker(
             .send(WorkerMessage::Ready { pages, outline })
             .map_err(|_| "viewer stopped".to_string())?;
         let mut documents = HashMap::from([(initial_document_id, document)]);
+        let mut text_cache: HashMap<DocumentId, Vec<Option<CachedPageText>>> =
+            HashMap::from([(initial_document_id, empty_text_cache(pages))]);
+        let mut search_jobs = VecDeque::new();
+        let mut search_highlights: HashMap<DocumentId, SearchHighlights> = HashMap::new();
 
         loop {
             let task = match command_rx.try_recv() {
                 Ok(command) => command.into(),
-                Err(TryRecvError::Disconnected | TryRecvError::Empty) => match priority_rx
-                    .try_recv()
-                {
-                    Ok(request) => WorkerTask::Render(request),
-                    Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => match prefetch_rx.try_recv() {
+                Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
+                    match priority_rx.try_recv() {
                         Ok(request) => WorkerTask::Render(request),
-                        Err(TryRecvError::Disconnected | TryRecvError::Empty) => select_biased! {
-                            recv(command_rx) -> command => match command {
-                                Ok(command) => command.into(),
-                                Err(_) => break,
-                            },
-                            recv(priority_rx) -> request => match request {
-                                Ok(request) => WorkerTask::Render(request),
-                                Err(_) => break,
-                            },
-                            recv(prefetch_rx) -> request => match request {
-                                Ok(request) => WorkerTask::Render(request),
-                                Err(_) => break,
-                            },
-                        },
-                    },
-                },
+                        Err(TryRecvError::Disconnected) => break,
+                        Err(TryRecvError::Empty) => {
+                            if let Some(job) = search_jobs.pop_front() {
+                                WorkerTask::SearchPage(job)
+                            } else {
+                                match prefetch_rx.try_recv() {
+                                    Ok(request) => WorkerTask::Render(request),
+                                    Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
+                                        select_biased! {
+                                            recv(command_rx) -> command => match command {
+                                                Ok(command) => command.into(),
+                                                Err(_) => break,
+                                            },
+                                            recv(priority_rx) -> request => match request {
+                                                Ok(request) => WorkerTask::Render(request),
+                                                Err(_) => break,
+                                            },
+                                            recv(prefetch_rx) -> request => match request {
+                                                Ok(request) => WorkerTask::Render(request),
+                                                Err(_) => break,
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             };
 
             let request = match task {
@@ -326,6 +436,9 @@ fn run_worker(
                             } else {
                                 let outline = extract_outline(&replacement);
                                 documents.insert(document_id, replacement);
+                                text_cache.insert(document_id, empty_text_cache(pages));
+                                search_jobs.retain(|job| job.document_id != document_id);
+                                search_highlights.remove(&document_id);
                                 message_tx
                                     .send(WorkerMessage::Opened {
                                         document_id,
@@ -351,11 +464,18 @@ fn run_worker(
                 }
                 WorkerTask::Close(document_id) => {
                     documents.remove(&document_id);
+                    text_cache.remove(&document_id);
+                    search_jobs.retain(|job| job.document_id != document_id);
+                    search_highlights.remove(&document_id);
                     continue;
                 }
                 WorkerTask::ExtractText { document_id, page } => {
-                    if let Some(document) = documents.get(&document_id) {
-                        let content = extract_page_text(document, page);
+                    if let (Some(document), Some(cache)) = (
+                        documents.get(&document_id),
+                        text_cache.get_mut(&document_id),
+                    ) {
+                        let content = cached_page_text(document, page, cache)
+                            .map_or_else(String::new, |text| text.raw.clone());
                         message_tx
                             .send(WorkerMessage::Text {
                                 document_id,
@@ -363,6 +483,106 @@ fn run_worker(
                                 content,
                             })
                             .map_err(|_| "viewer stopped".to_string())?;
+                    }
+                    continue;
+                }
+                WorkerTask::StartSearch {
+                    document_id,
+                    request_id,
+                    query,
+                } => {
+                    search_jobs.retain(|job| job.document_id != document_id);
+                    search_highlights.remove(&document_id);
+                    let needle = normalize_search_text(&query);
+                    if !needle.is_empty()
+                        && let Some(cache) = text_cache.get(&document_id)
+                    {
+                        let total_pages = u32::try_from(cache.len()).unwrap_or(u32::MAX);
+                        search_jobs.push_front(SearchJob {
+                            document_id,
+                            request_id,
+                            needle,
+                            next_page: 0,
+                            total_pages,
+                            matches: Vec::new(),
+                            total_occurrences: 0,
+                            highlights: HashMap::new(),
+                            last_progress: Instant::now(),
+                        });
+                        message_tx
+                            .send(WorkerMessage::SearchProgress {
+                                document_id,
+                                request_id,
+                                scanned: 0,
+                                total: total_pages,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?;
+                    }
+                    continue;
+                }
+                WorkerTask::CancelSearch {
+                    document_id,
+                    request_id,
+                } => {
+                    search_jobs.retain(|job| {
+                        job.document_id != document_id || job.request_id != request_id
+                    });
+                    if search_highlights
+                        .get(&document_id)
+                        .is_some_and(|highlights| highlights.request_id == request_id)
+                    {
+                        search_highlights.remove(&document_id);
+                    }
+                    continue;
+                }
+                WorkerTask::SearchPage(mut job) => {
+                    let Some(document) = documents.get(&job.document_id) else {
+                        continue;
+                    };
+                    let Some(cache) = text_cache.get_mut(&job.document_id) else {
+                        continue;
+                    };
+                    let (occurrences, rectangles) =
+                        search_page(document, job.next_page, cache, &job.needle);
+                    if occurrences > 0 {
+                        job.matches.push(SearchPageMatch {
+                            page: job.next_page,
+                            occurrences,
+                        });
+                        job.total_occurrences = job.total_occurrences.saturating_add(occurrences);
+                        job.highlights.insert(job.next_page, rectangles);
+                    }
+                    job.next_page = job.next_page.saturating_add(1);
+
+                    if job.next_page >= job.total_pages {
+                        search_highlights.insert(
+                            job.document_id,
+                            SearchHighlights {
+                                request_id: job.request_id,
+                                pages: job.highlights,
+                            },
+                        );
+                        message_tx
+                            .send(WorkerMessage::SearchResults {
+                                document_id: job.document_id,
+                                request_id: job.request_id,
+                                matches: job.matches,
+                                total_occurrences: job.total_occurrences,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?;
+                    } else {
+                        if job.last_progress.elapsed() >= SEARCH_PROGRESS_INTERVAL {
+                            message_tx
+                                .send(WorkerMessage::SearchProgress {
+                                    document_id: job.document_id,
+                                    request_id: job.request_id,
+                                    scanned: job.next_page,
+                                    total: job.total_pages,
+                                })
+                                .map_err(|_| "viewer stopped".to_string())?;
+                            job.last_progress = Instant::now();
+                        }
+                        search_jobs.push_back(job);
                     }
                     continue;
                 }
@@ -417,6 +637,27 @@ fn run_worker(
                 );
                 started.elapsed()
             });
+            let highlight_elapsed = (request.key.search_request_id != 0)
+                .then(|| {
+                    search_highlights
+                        .get(&request.key.document_id)
+                        .filter(|highlights| highlights.request_id == request.key.search_request_id)
+                        .and_then(|highlights| highlights.pages.get(&request.key.page))
+                })
+                .flatten()
+                .map(|rectangles| {
+                    let started = Instant::now();
+                    apply_search_highlights(
+                        &page,
+                        &config,
+                        width,
+                        height,
+                        &mut raw_rgba,
+                        rectangles,
+                        request.key.search_highlight,
+                    );
+                    started.elapsed()
+                });
             let compression_started = Instant::now();
             let compressed_rgba = crate::kitty::compress_rgba(&raw_rgba).map_err(|error| {
                 format!("could not compress page {}: {error}", request.key.page + 1)
@@ -435,6 +676,7 @@ fn run_worker(
                     compressed_rgba,
                     render_elapsed,
                     dark_mode_elapsed,
+                    highlight_elapsed,
                     compression_elapsed,
                     generation: request.generation,
                 }))
@@ -891,22 +1133,251 @@ impl From<WorkerCommand> for WorkerTask {
             WorkerCommand::ExtractText { document_id, page } => {
                 Self::ExtractText { document_id, page }
             }
+            WorkerCommand::Search {
+                document_id,
+                request_id,
+                query,
+            } => Self::StartSearch {
+                document_id,
+                request_id,
+                query,
+            },
+            WorkerCommand::CancelSearch {
+                document_id,
+                request_id,
+            } => Self::CancelSearch {
+                document_id,
+                request_id,
+            },
         }
     }
 }
 
-/// Extracts all selectable text from a page, returning an empty string when the
-/// page has no text layer or cannot be loaded.
-fn extract_page_text(document: &PdfDocument, page: u32) -> String {
-    let Ok(index) = i32::try_from(page) else {
-        return String::new();
+fn empty_text_cache(pages: u32) -> Vec<Option<CachedPageText>> {
+    (0..pages).map(|_| None).collect()
+}
+
+fn cached_page_text<'a>(
+    document: &PdfDocument,
+    page: u32,
+    cache: &'a mut [Option<CachedPageText>],
+) -> Option<&'a CachedPageText> {
+    let index = usize::try_from(page).ok()?;
+    let slot = cache.get_mut(index)?;
+    if slot.is_none() {
+        let page_index = i32::try_from(page).ok()?;
+        let page = document.pages().get(page_index).ok()?;
+        let text = page.text().ok()?;
+        let raw = text.all();
+        let (normalized, source_index_by_byte) =
+            normalize_search_characters(text.chars().iter().filter_map(|character| {
+                character
+                    .unicode_char()
+                    .map(|value| (character.index(), value))
+            }));
+        *slot = Some(CachedPageText {
+            raw,
+            normalized,
+            source_index_by_byte,
+        });
+    }
+    slot.as_ref()
+}
+
+fn normalize_search_text(value: &str) -> String {
+    normalize_search_characters(value.chars().enumerate()).0
+}
+
+fn count_search_matches(haystack: &str, needle: &str) -> u32 {
+    u32::try_from(haystack.match_indices(needle).count()).unwrap_or(u32::MAX)
+}
+
+fn normalize_search_characters(
+    characters: impl IntoIterator<Item = (usize, char)>,
+) -> (String, Vec<usize>) {
+    let mut normalized = String::new();
+    let mut source_index_by_byte = Vec::new();
+    let mut pending_whitespace = None;
+    for (source_index, character) in characters {
+        if character.is_whitespace() {
+            pending_whitespace.get_or_insert(source_index);
+            continue;
+        }
+        if let Some(whitespace_source) = pending_whitespace.take()
+            && !normalized.is_empty()
+        {
+            push_normalized_character(
+                &mut normalized,
+                &mut source_index_by_byte,
+                whitespace_source,
+                ' ',
+            );
+        }
+        for character in character.to_lowercase() {
+            push_normalized_character(
+                &mut normalized,
+                &mut source_index_by_byte,
+                source_index,
+                character,
+            );
+        }
+    }
+    (normalized, source_index_by_byte)
+}
+
+fn push_normalized_character(
+    normalized: &mut String,
+    source_index_by_byte: &mut Vec<usize>,
+    source_index: usize,
+    character: char,
+) {
+    normalized.push(character);
+    source_index_by_byte.extend(std::iter::repeat_n(source_index, character.len_utf8()));
+}
+
+fn search_page(
+    document: &PdfDocument,
+    page: u32,
+    cache: &mut [Option<CachedPageText>],
+    needle: &str,
+) -> (u32, Vec<SearchRect>) {
+    let Some(cached) = cached_page_text(document, page, cache) else {
+        return (0, Vec::new());
     };
-    let Ok(page) = document.pages().get(index) else {
-        return String::new();
+    let source_ranges: Vec<_> = cached
+        .normalized
+        .match_indices(needle)
+        .filter_map(|(start, _)| {
+            let end = start.checked_add(needle.len())?;
+            let first = *cached.source_index_by_byte.get(start)?;
+            let last = *cached.source_index_by_byte.get(end.checked_sub(1)?)?;
+            Some((first, last.saturating_sub(first).saturating_add(1)))
+        })
+        .collect();
+    let occurrences = count_search_matches(&cached.normalized, needle);
+    if source_ranges.is_empty() {
+        return (0, Vec::new());
+    }
+
+    let Ok(page_index) = i32::try_from(page) else {
+        return (occurrences, Vec::new());
     };
-    match page.text() {
-        Ok(text) => text.all(),
-        Err(_) => String::new(),
+    let Ok(page) = document.pages().get(page_index) else {
+        return (occurrences, Vec::new());
+    };
+    let Ok(text) = page.text() else {
+        return (occurrences, Vec::new());
+    };
+    let mut rectangles = Vec::new();
+    for (start, count) in source_ranges {
+        let segments = text.segments_subset(start, count);
+        rectangles.extend(segments.iter().map(|segment| {
+            let bounds = segment.bounds();
+            SearchRect {
+                bottom: bounds.bottom().value,
+                left: bounds.left().value,
+                top: bounds.top().value,
+                right: bounds.right().value,
+            }
+        }));
+    }
+    (occurrences, rectangles)
+}
+
+fn apply_search_highlights(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+    rgba: &mut [u8],
+    rectangles: &[SearchRect],
+    color: [u8; 3],
+) {
+    for rectangle in rectangles {
+        let corners = [
+            (rectangle.left, rectangle.top),
+            (rectangle.right, rectangle.top),
+            (rectangle.left, rectangle.bottom),
+            (rectangle.right, rectangle.bottom),
+        ];
+        let pixels: Vec<_> = corners
+            .into_iter()
+            .filter_map(|(x, y)| {
+                page.points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), config)
+                    .ok()
+            })
+            .collect();
+        if pixels.len() != corners.len() {
+            continue;
+        }
+        let Some(min_x) = pixels.iter().map(|(x, _)| *x).min() else {
+            continue;
+        };
+        let Some(max_x) = pixels.iter().map(|(x, _)| *x).max() else {
+            continue;
+        };
+        let Some(min_y) = pixels.iter().map(|(_, y)| *y).min() else {
+            continue;
+        };
+        let Some(max_y) = pixels.iter().map(|(_, y)| *y).max() else {
+            continue;
+        };
+        let left = min_x.saturating_sub(1).clamp(0, width as i32) as u32;
+        let right = max_x.saturating_add(2).clamp(0, width as i32) as u32;
+        let top = min_y.saturating_sub(1).clamp(0, height as i32) as u32;
+        let bottom = max_y.saturating_add(2).clamp(0, height as i32) as u32;
+        blend_highlight_rectangle(
+            rgba,
+            width,
+            height,
+            PixelRect {
+                left,
+                top,
+                right,
+                bottom,
+            },
+            color,
+        );
+    }
+}
+
+fn blend_highlight_rectangle(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    rectangle: PixelRect,
+    color: [u8; 3],
+) {
+    let left = rectangle.left.min(width);
+    let right = rectangle.right.min(width);
+    let top = rectangle.top.min(height);
+    let bottom = rectangle.bottom.min(height);
+    if left >= right || top >= bottom {
+        return;
+    }
+    let Ok(stride) = usize::try_from(width).map(|width| width.saturating_mul(4)) else {
+        return;
+    };
+    for y in top..bottom {
+        let Ok(row_start) = usize::try_from(y).map(|y| y.saturating_mul(stride)) else {
+            continue;
+        };
+        for x in left..right {
+            let Ok(offset) =
+                usize::try_from(x).map(|x| row_start.saturating_add(x.saturating_mul(4)))
+            else {
+                continue;
+            };
+            let Some(pixel) = rgba.get_mut(offset..offset.saturating_add(4)) else {
+                continue;
+            };
+            for (channel, highlight) in pixel[..3].iter_mut().zip(color) {
+                let original = u16::from(*channel);
+                *channel = ((original * (255 - SEARCH_HIGHLIGHT_ALPHA)
+                    + u16::from(highlight) * SEARCH_HIGHLIGHT_ALPHA)
+                    / 255) as u8;
+            }
+        }
     }
 }
 
@@ -944,15 +1415,22 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DarkModeStyle, DarkModeTransform, FitMode, dark_mode_pixel, darken_rgba, mask_quadrilateral,
+        DarkModeStyle, DarkModeTransform, FitMode, PixelRect, blend_highlight_rectangle,
+        count_search_matches, dark_mode_pixel, darken_rgba, mask_quadrilateral,
+        normalize_search_text,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
 
     #[test]
-    fn image_mask_finds_images_nested_in_transformed_forms() {
-        use super::{image_mask, load_pdfium};
-        use pdfium_render::prelude::{PdfPageObjectsCommon, PdfPagePaperSize, PdfRenderConfig};
+    fn pdfium_image_mask_and_text_cache_work() {
+        use super::{
+            apply_search_highlights, cached_page_text, empty_text_cache, image_mask, load_pdfium,
+            search_page,
+        };
+        use pdfium_render::prelude::{
+            PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints, PdfRenderConfig,
+        };
 
         let pdfium = load_pdfium(None).unwrap();
         let source = pdfium
@@ -989,6 +1467,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mask.iter().filter(|&&value| value == 255).count(), 10_000);
+
+        let mut text_document = pdfium.create_new_pdf().expect("create document");
+        let mut text_page = text_document
+            .pages_mut()
+            .create_page_at_start(PdfPagePaperSize::a4())
+            .expect("create page");
+        let font = text_document.fonts_mut().courier();
+        text_page
+            .objects_mut()
+            .create_text_object(
+                PdfPoints::new(20.0),
+                PdfPoints::new(20.0),
+                "Synthetic Needle synthetic needle",
+                font,
+                PdfPoints::new(12.0),
+            )
+            .expect("create text object");
+        drop(text_page);
+
+        let mut cache = empty_text_cache(1);
+        let text = cached_page_text(&text_document, 0, &mut cache).expect("cached page text");
+        assert_eq!(
+            count_search_matches(&text.normalized, "synthetic needle"),
+            2
+        );
+        let (occurrences, rectangles) =
+            search_page(&text_document, 0, &mut cache, "synthetic needle");
+        assert_eq!(occurrences, 2);
+        assert!(!rectangles.is_empty());
+
+        let page = text_document.pages().get(0).expect("text page");
+        let config = PdfRenderConfig::new()
+            .set_reverse_byte_order(true)
+            .set_target_width(400);
+        let bitmap = page.render_with_config(&config).expect("render text page");
+        let mut highlighted = bitmap.as_raw_bytes();
+        let original = highlighted.clone();
+        apply_search_highlights(
+            &page,
+            &config,
+            bitmap.width() as u32,
+            bitmap.height() as u32,
+            &mut highlighted,
+            &rectangles,
+            [0xff, 0xc7, 0x77],
+        );
+        assert_ne!(highlighted, original);
     }
 
     fn synthetic_image_pdf() -> Vec<u8> {
@@ -1079,5 +1604,33 @@ mod tests {
         assert_eq!(FitMode::Page.cycle(), FitMode::Width);
         assert_eq!(FitMode::Width.cycle(), FitMode::Height);
         assert_eq!(FitMode::Height.cycle(), FitMode::Page);
+    }
+
+    #[test]
+    fn search_normalizes_case_and_whitespace() {
+        let text = normalize_search_text("  Alpha\n\tBETA  alpha beta ");
+
+        assert_eq!(text, "alpha beta alpha beta");
+        assert_eq!(count_search_matches(&text, "alpha beta"), 2);
+    }
+
+    #[test]
+    fn search_highlight_blends_rgb_and_preserves_alpha() {
+        let mut pixels = [0, 0, 0, 123, 255, 255, 255, 45];
+
+        blend_highlight_rectangle(
+            &mut pixels,
+            2,
+            1,
+            PixelRect {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+            [255, 199, 119],
+        );
+
+        assert_eq!(pixels, [88, 68, 41, 123, 255, 255, 255, 45]);
     }
 }

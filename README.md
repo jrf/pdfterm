@@ -47,6 +47,8 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `k` `h` arrows `Backspace` `PageUp` | backward — page, or scroll when the page overflows |
 | `g` / `G` | first / last page |
 | `:` | go-to-page prompt (type a number, `Enter` to jump, `Esc` to cancel) |
+| `/` | search selectable document text |
+| `n` / `N` | next / previous page containing a search match |
 | `m` | cycle fit mode: fit-page → fit-width → fit-height |
 | `i` | toggle Polaris-style dark mode |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
@@ -56,11 +58,16 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `Tab` / `Shift-Tab` | switch tabs |
 | `?` | open the keybinding help menu |
 | `q` | close the current tab, exiting after the last tab |
-| `Esc` | exit immediately |
+| `Esc` | clear the active search; exit immediately when no search is active |
 
 In fit-width and fit-height modes, the movement keys scroll within a page that is
 larger than the viewport and cross into the adjacent page at the edges. The `h`/`l`
 keys and left/right arrows scroll horizontally in fit-height mode.
+
+Search scans and caches selectable text incrementally without blocking foreground
+page rendering. It is case-insensitive, treats runs of whitespace as a single
+space, and highlights matches using the active theme. Image-only PDFs require OCR
+and are reported as having no matches.
 
 ## Configuration
 
