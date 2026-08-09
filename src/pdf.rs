@@ -136,6 +136,7 @@ pub struct PageLinkRect {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageLink {
     pub rect: PageLinkRect,
+    pub label: String,
     pub target: LinkTarget,
 }
 
@@ -1391,12 +1392,18 @@ fn extract_page_links(
     width: u32,
     height: u32,
 ) -> Vec<PageLink> {
+    let page_text = page.text().ok();
     page.links()
         .iter()
         .filter_map(|link| {
             let target = resolve_link_target(document, &link)?;
             let bounds = link.rect().ok()?;
             let rect = page_rect_to_pixels(page, config, width, height, bounds)?;
+            let label = page_text
+                .as_ref()
+                .map(|text| link_text_label(&text.inside_rect(bounds)))
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| link_target_label(&target));
             Some(PageLink {
                 rect: PageLinkRect {
                     left: rect.left,
@@ -1404,10 +1411,28 @@ fn extract_page_links(
                     right: rect.right,
                     bottom: rect.bottom,
                 },
+                label,
                 target,
             })
         })
         .collect()
+}
+
+fn link_text_label(text: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let mut label: String = characters.by_ref().take(80).collect();
+    if characters.next().is_some() {
+        label.push('…');
+    }
+    label
+}
+
+fn link_target_label(target: &LinkTarget) -> String {
+    match target {
+        LinkTarget::Internal { page, .. } => format!("page {}", page + 1),
+        LinkTarget::Uri(uri) => uri.clone(),
+    }
 }
 
 fn resolve_link_target(document: &PdfDocument, link: &PdfLink<'_>) -> Option<LinkTarget> {
@@ -1729,6 +1754,12 @@ mod tests {
         );
 
         assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| link.label == "page 2"));
+        assert!(
+            links
+                .iter()
+                .any(|link| link.label == "https://example.invalid/paper")
+        );
         assert!(links.iter().any(|link| matches!(
             link.target,
             LinkTarget::Internal {
@@ -1881,6 +1912,16 @@ mod tests {
 
         assert_eq!(text, "alpha beta alpha beta");
         assert_eq!(count_search_matches(&text, "alpha beta"), 2);
+    }
+
+    #[test]
+    fn link_labels_normalize_whitespace_and_truncate() {
+        let label = super::link_text_label("  [12]\n nearby   citation  ");
+        assert_eq!(label, "[12] nearby citation");
+
+        let long = super::link_text_label(&"x".repeat(100));
+        assert_eq!(long.chars().count(), 81);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

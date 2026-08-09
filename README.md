@@ -55,6 +55,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `T` | choose and preview a theme for the current session |
 | `y` | copy the current page's text to the clipboard |
 | `L` | toggle link mode and highlight clickable PDF annotations |
+| `Enter` in link mode | open the current page's numbered link picker |
 | `b` | return to the view before the last followed internal link |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
@@ -72,11 +73,12 @@ space, and highlights matches using the active theme. Image-only PDFs require OC
 and are reported as having no matches.
 
 Link mode temporarily enables mouse capture so normal terminal text selection is
-unchanged outside the mode. Click an internal citation or other annotated link to
-jump to its PDF destination; link history is kept independently for each tab.
-External URLs are copied to the local clipboard with OSC 52 instead of being
-opened on the remote machine. Press `Esc` or `L` to leave link mode. Plain citation
-text without a PDF link annotation is not inferred.
+unchanged outside the mode. Click an annotated link, or press `Enter` to open a
+numbered picker for the current page. In the picker, use `j`/`k`, arrows, or type
+an entry number, then press `Enter` to follow it. Link history is kept independently
+for each tab. External URLs are copied to the local clipboard with OSC 52 instead
+of being opened on the remote machine. Press `Esc` or `L` to leave link mode. Plain
+citation text without a PDF link annotation is not inferred.
 
 ## Configuration
 
