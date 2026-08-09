@@ -13,8 +13,7 @@
 
 ## Later
 
-- [ ] Add text search after page navigation meets the latency budget. #feature
-- [ ] Follow internal links and named destinations. #feature
+- [ ] Add an OCR fallback so image-only PDFs are searchable. #feature
 
 ## Scrapped
 
@@ -35,3 +34,8 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 - [x] Copy the current page's text to the clipboard over SSH (OSC 52). #feature
 - [x] List recently opened documents first in the picker. #improvement
 - [x] Load fit mode and invert defaults from a config file. #feature
+- [x] View multiple documents in tabs with independent page state. #feature
+- [x] Add configurable color themes with an interactive picker. #feature
+- [x] Add an interactive keybinding help menu. #feature
+- [x] Add incremental text search that does not block foreground rendering. #feature
+- [x] Follow internal links and named destinations, with a numbered link picker and back navigation. #feature
