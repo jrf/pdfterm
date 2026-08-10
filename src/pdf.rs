@@ -19,6 +19,7 @@ const MAX_FORM_DEPTH: u8 = 32;
 const IMAGE_MASK_SAMPLES: usize = 4;
 const PARALLEL_DARK_MODE_PIXELS: usize = 250_000;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const LINK_INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
 const LINK_HIGHLIGHT_ALPHA: u16 = 40;
 const LINK_BORDER_ALPHA: u16 = 210;
@@ -140,6 +141,14 @@ pub struct PageLink {
     pub target: LinkTarget,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentLink {
+    pub source_page: u32,
+    pub ordinal: u32,
+    pub label: String,
+    pub target: LinkTarget,
+}
+
 #[derive(Debug)]
 pub enum WorkerMessage {
     Ready {
@@ -172,6 +181,14 @@ pub enum WorkerMessage {
         matches: Vec<SearchPageMatch>,
         total_occurrences: u32,
     },
+    LinkIndexProgress {
+        document_id: DocumentId,
+        request_id: u64,
+        links: Vec<DocumentLink>,
+        scanned: u32,
+        total: u32,
+        complete: bool,
+    },
     Frame(Frame),
     Error(String),
 }
@@ -192,6 +209,10 @@ enum WorkerCommand {
         query: String,
     },
     CancelSearch {
+        document_id: DocumentId,
+        request_id: u64,
+    },
+    IndexLinks {
         document_id: DocumentId,
         request_id: u64,
     },
@@ -216,6 +237,11 @@ enum WorkerTask {
         document_id: DocumentId,
         request_id: u64,
     },
+    StartLinkIndex {
+        document_id: DocumentId,
+        request_id: u64,
+    },
+    IndexLinkPage(LinkIndexJob),
     SearchPage(SearchJob),
     Render(RenderRequest),
 }
@@ -229,6 +255,15 @@ struct SearchJob {
     matches: Vec<SearchPageMatch>,
     total_occurrences: u32,
     highlights: HashMap<u32, Vec<SearchRect>>,
+    last_progress: Instant,
+}
+
+struct LinkIndexJob {
+    document_id: DocumentId,
+    request_id: u64,
+    next_page: u32,
+    total_pages: u32,
+    pending_links: Vec<DocumentLink>,
     last_progress: Instant,
 }
 
@@ -317,6 +352,7 @@ impl RenderWorker {
                 | WorkerMessage::Text { .. }
                 | WorkerMessage::SearchProgress { .. }
                 | WorkerMessage::SearchResults { .. }
+                | WorkerMessage::LinkIndexProgress { .. }
                 | WorkerMessage::Frame(_),
             ) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
@@ -368,6 +404,13 @@ impl RenderWorker {
         });
     }
 
+    pub fn index_links(&self, document_id: DocumentId, request_id: u64) {
+        let _ = self.command_tx.send(WorkerCommand::IndexLinks {
+            document_id,
+            request_id,
+        });
+    }
+
     pub fn try_recv(&self) -> Result<WorkerMessage, TryRecvError> {
         self.message_rx.try_recv()
     }
@@ -404,6 +447,7 @@ fn run_worker(
         let mut text_cache: HashMap<DocumentId, Vec<Option<CachedPageText>>> =
             HashMap::from([(initial_document_id, empty_text_cache(pages))]);
         let mut search_jobs = VecDeque::new();
+        let mut link_index_jobs = VecDeque::new();
         let mut search_highlights: HashMap<DocumentId, SearchHighlights> = HashMap::new();
 
         loop {
@@ -414,7 +458,9 @@ fn run_worker(
                         Ok(request) => WorkerTask::Render(request),
                         Err(TryRecvError::Disconnected) => break,
                         Err(TryRecvError::Empty) => {
-                            if let Some(job) = search_jobs.pop_front() {
+                            if let Some(job) = link_index_jobs.pop_front() {
+                                WorkerTask::IndexLinkPage(job)
+                            } else if let Some(job) = search_jobs.pop_front() {
                                 WorkerTask::SearchPage(job)
                             } else {
                                 match prefetch_rx.try_recv() {
@@ -465,6 +511,7 @@ fn run_worker(
                                 documents.insert(document_id, replacement);
                                 text_cache.insert(document_id, empty_text_cache(pages));
                                 search_jobs.retain(|job| job.document_id != document_id);
+                                link_index_jobs.retain(|job| job.document_id != document_id);
                                 search_highlights.remove(&document_id);
                                 message_tx
                                     .send(WorkerMessage::Opened {
@@ -493,6 +540,7 @@ fn run_worker(
                     documents.remove(&document_id);
                     text_cache.remove(&document_id);
                     search_jobs.retain(|job| job.document_id != document_id);
+                    link_index_jobs.retain(|job| job.document_id != document_id);
                     search_highlights.remove(&document_id);
                     continue;
                 }
@@ -559,6 +607,70 @@ fn run_worker(
                         .is_some_and(|highlights| highlights.request_id == request_id)
                     {
                         search_highlights.remove(&document_id);
+                    }
+                    continue;
+                }
+                WorkerTask::StartLinkIndex {
+                    document_id,
+                    request_id,
+                } => {
+                    link_index_jobs.retain(|job| job.document_id != document_id);
+                    let Some(document) = documents.get(&document_id) else {
+                        continue;
+                    };
+                    let total_pages = u32::try_from(document.pages().len()).unwrap_or(u32::MAX);
+                    message_tx
+                        .send(WorkerMessage::LinkIndexProgress {
+                            document_id,
+                            request_id,
+                            links: Vec::new(),
+                            scanned: 0,
+                            total: total_pages,
+                            complete: total_pages == 0,
+                        })
+                        .map_err(|_| "viewer stopped".to_string())?;
+                    if total_pages > 0 {
+                        link_index_jobs.push_front(LinkIndexJob {
+                            document_id,
+                            request_id,
+                            next_page: 0,
+                            total_pages,
+                            pending_links: Vec::new(),
+                            last_progress: Instant::now(),
+                        });
+                    }
+                    continue;
+                }
+                WorkerTask::IndexLinkPage(mut job) => {
+                    let Some(document) = documents.get(&job.document_id) else {
+                        continue;
+                    };
+                    if let Ok(page_index) = i32::try_from(job.next_page)
+                        && let Ok(page) = document.pages().get(page_index)
+                    {
+                        job.pending_links.extend(extract_document_links(
+                            document,
+                            &page,
+                            job.next_page,
+                        ));
+                    }
+                    job.next_page = job.next_page.saturating_add(1);
+                    let complete = job.next_page >= job.total_pages;
+                    if complete || job.last_progress.elapsed() >= LINK_INDEX_PROGRESS_INTERVAL {
+                        message_tx
+                            .send(WorkerMessage::LinkIndexProgress {
+                                document_id: job.document_id,
+                                request_id: job.request_id,
+                                links: std::mem::take(&mut job.pending_links),
+                                scanned: job.next_page,
+                                total: job.total_pages,
+                                complete,
+                            })
+                            .map_err(|_| "viewer stopped".to_string())?;
+                        job.last_progress = Instant::now();
+                    }
+                    if !complete {
+                        link_index_jobs.push_back(job);
                     }
                     continue;
                 }
@@ -1193,6 +1305,13 @@ impl From<WorkerCommand> for WorkerTask {
                 document_id,
                 request_id,
             },
+            WorkerCommand::IndexLinks {
+                document_id,
+                request_id,
+            } => Self::StartLinkIndex {
+                document_id,
+                request_id,
+            },
         }
     }
 }
@@ -1419,6 +1538,24 @@ fn extract_page_links(
         .collect();
     sort_page_links_reading_order(&mut links);
     links
+}
+
+fn extract_document_links(
+    document: &PdfDocument,
+    page: &PdfPage,
+    source_page: u32,
+) -> Vec<DocumentLink> {
+    let config = PdfRenderConfig::new().set_target_width(1_000);
+    extract_page_links(document, page, &config, i32::MAX as u32, i32::MAX as u32)
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, link)| DocumentLink {
+            source_page,
+            ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+            label: link.label,
+            target: link.target,
+        })
+        .collect()
 }
 
 fn sort_page_links_reading_order(links: &mut [PageLink]) {
@@ -1658,7 +1795,8 @@ mod tests {
     fn pdfium_image_mask_and_text_cache_work() {
         use super::{
             LinkTarget, apply_link_highlights, apply_search_highlights, cached_page_text,
-            empty_text_cache, extract_page_links, image_mask, load_pdfium, search_page,
+            empty_text_cache, extract_document_links, extract_page_links, image_mask, load_pdfium,
+            search_page,
         };
         use pdfium_render::prelude::{
             PdfPageObjectsCommon, PdfPagePaperSize, PdfPoints, PdfRenderConfig,
@@ -1784,6 +1922,12 @@ mod tests {
         assert!(links.iter().any(|link| {
             matches!(&link.target, LinkTarget::Uri(uri) if uri == "https://example.invalid/paper")
         }));
+
+        let document_links = extract_document_links(&link_document, &link_page, 6);
+        assert_eq!(document_links.len(), 2);
+        assert!(document_links.iter().all(|link| link.source_page == 6));
+        assert_eq!(document_links[0].ordinal, 0);
+        assert_eq!(document_links[1].ordinal, 1);
 
         let mut link_highlighted = link_bitmap.as_raw_bytes();
         let link_original = link_highlighted.clone();

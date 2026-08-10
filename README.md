@@ -56,13 +56,13 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `T` | choose and preview a theme for the current session |
 | `y` | copy the current page's text to the clipboard |
 | `L` | toggle link mode and highlight clickable PDF annotations |
-| `Enter` in link mode | open the current page's numbered link picker |
+| `Enter` in link mode | open the document-wide numbered link browser |
 | `b` | return to the view before the last followed internal link |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
 | `?` | open the keybinding help menu |
 | `q` | close the current tab, exiting after the last tab |
-| `Esc` | clear the active search; exit immediately when no search is active |
+| `Esc` | close the link browser, clear search, or exit when no mode is active |
 
 In fit-width and fit-height modes, the movement keys scroll within a page that is
 larger than the viewport and cross into the adjacent page at the edges. The `h`/`l`
@@ -75,13 +75,19 @@ and are reported as having no matches.
 
 Link mode temporarily enables mouse capture so normal terminal text selection is
 unchanged outside the mode. Click an annotated link, or press `Enter` to open a
-numbered picker for the current page. In the picker, use `j`/`k`, arrows, or type
-an entry number, then press `Enter` to follow it. Links are ordered top-to-bottom
-and left-to-right, and the selected-link panel shows destination details. Link
-history is kept independently for each tab. External URLs are copied to the local
-clipboard with OSC 52 instead of being opened on the remote machine. Press `Esc`
-or `L` to leave link mode. Plain citation text without a PDF link annotation is
-not inferred.
+document-wide link browser in a Grimoire-style split view. Wide terminals place
+the PDF on the left and a compact link sidebar on the right; narrow terminals
+place the PDF above the links. Links are indexed incrementally behind foreground
+page rendering and shown under explicit source-page headings in the browser. The
+split repositions Kitty's retained page image without rerendering or retransmitting it.
+In the picker, use `j`/`k`, arrows, or type an entry number, then press `Enter` to
+follow it. Links are ordered by source page, then top-to-bottom and left-to-right;
+the selected-link panel shows source and destination details. Link history is kept
+independently for each tab.
+External URLs are copied to the local clipboard with OSC 52 instead of being
+opened on the remote machine. Set `persistent_link_picker = true` to keep the
+split open after following or copying a link; `Esc` closes it. Press `L` to leave
+link mode. Plain citation text without a PDF link annotation is not inferred.
 
 ## Configuration
 
@@ -96,13 +102,27 @@ fit_mode = "page"
 # enable Polaris-style dark mode by default
 dark_mode = true
 
+# keep the link split open after following or copying a link
+persistent_link_picker = true
+
+# percentage of the split assigned to the link browser (default 50; range 20-80)
+link_picker_split_percent = 50
+
+# auto, vertical, horizontal, or floating
+link_picker_layout = "auto"
+
 # load one theme directly and list picker entries explicitly
 theme = "~/.config/themes/tokyo-night-moon.toml"
 theme_catalog = "~/.config/themes/catalog.toml"
 ```
 
-The legacy `invert` key remains accepted as an alias for `dark_mode`. `theme` is
-loaded directly, while `theme_catalog` supplies an explicit `themes = [...]`
+`link_picker_layout = "vertical"` keeps the PDF on the left and links on the
+right; `"horizontal"` keeps the PDF above the links; and `"floating"` places an
+opaque centered browser over the full-size PDF. The default `"auto"` chooses a
+split from the terminal shape. `link_picker_split_percent` controls the link pane
+in split layouts and is ignored by the floating layout. The legacy `invert` key
+remains accepted as an alias for `dark_mode`. `theme` is loaded directly, while
+`theme_catalog` supplies an explicit `themes = [...]`
 array for the picker. pdfterm never scans a theme directory. Both the shared
 `[colors]`/`[ui]` schema and pdfterm's legacy complete-palette schema are accepted. Legacy theme
 files contain the complete color palette using `#RRGGBB` values:

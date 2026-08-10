@@ -7,10 +7,12 @@ use flate2::write::ZlibEncoder;
 
 const PAYLOAD_CHUNK_SIZE: usize = 4096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Placement {
     pub image_id: u32,
     pub columns: u16,
     pub rows: u16,
+    pub z_index: i32,
     /// Source rectangle to display, in image pixels. `None` shows the whole image.
     pub crop: Option<Crop>,
 }
@@ -60,8 +62,8 @@ pub fn transmit_compressed_rgba(
         if index == 0 {
             write!(
                 output,
-                "\x1b_Ga=T,f=32,s={width},v={height},i={},p=1,o=z,c={},r={}{crop},C=1,q=2,m={more};",
-                placement.image_id, placement.columns, placement.rows
+                "\x1b_Ga=T,f=32,s={width},v={height},i={},p=1,o=z,c={},r={},z={}{crop},C=1,q=2,m={more};",
+                placement.image_id, placement.columns, placement.rows, placement.z_index
             )?;
         } else {
             write!(output, "\x1b_Gq=2,m={more};")?;
@@ -74,6 +76,29 @@ pub fn transmit_compressed_rgba(
 
 pub fn delete_image(output: &mut impl Write, image_id: u32) -> io::Result<()> {
     write!(output, "\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")?;
+    output.flush()
+}
+
+pub fn place_image(output: &mut impl Write, placement: Placement) -> io::Result<()> {
+    if placement.columns == 0 || placement.rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "image placement dimensions must be non-zero",
+        ));
+    }
+
+    let crop = match placement.crop {
+        Some(crop) => format!(
+            ",x={},y={},w={},h={}",
+            crop.x, crop.y, crop.width, crop.height
+        ),
+        None => String::new(),
+    };
+    write!(
+        output,
+        "\x1b_Ga=p,i={},p=1,c={},r={},z={}{crop},C=1,q=2\x1b\\",
+        placement.image_id, placement.columns, placement.rows, placement.z_index
+    )?;
     output.flush()
 }
 
@@ -97,6 +122,7 @@ mod tests {
                 image_id: 1,
                 columns: 1,
                 rows: 1,
+                z_index: 0,
                 crop: None,
             },
         )
@@ -119,6 +145,7 @@ mod tests {
                 image_id: 3,
                 columns: 8,
                 rows: 4,
+                z_index: -3,
                 crop: Some(Crop {
                     x: 0,
                     y: 16,
@@ -130,7 +157,7 @@ mod tests {
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains(",c=8,r=4,x=0,y=16,w=8,h=4,C=1"));
+        assert!(output.contains(",c=8,r=4,z=-3,x=0,y=16,w=8,h=4,C=1"));
     }
 
     #[test]
@@ -150,18 +177,46 @@ mod tests {
                 image_id: 7,
                 columns: 8,
                 rows: 4,
+                z_index: 0,
                 crop: None,
             },
         )
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("\x1b_Ga=T,f=32,s=64,v=64,i=7,p=1,o=z,c=8,r=4,C=1,q=2,m="));
+        assert!(output.starts_with("\x1b_Ga=T,f=32,s=64,v=64,i=7,p=1,o=z,c=8,r=4,z=0,C=1,q=2,m="));
         assert!(output.ends_with("\x1b\\"));
         for command in output.split("\x1b\\").filter(|command| !command.is_empty()) {
             let payload = command.split_once(';').unwrap().1;
             assert!(payload.len() <= PAYLOAD_CHUNK_SIZE);
             assert_eq!(payload.len() % 4, 0);
         }
+    }
+
+    #[test]
+    fn replaces_an_existing_placement_without_retransmitting_pixels() {
+        let mut output = Vec::new();
+
+        place_image(
+            &mut output,
+            Placement {
+                image_id: 12,
+                columns: 40,
+                rows: 20,
+                z_index: -3,
+                crop: Some(Crop {
+                    x: 4,
+                    y: 8,
+                    width: 400,
+                    height: 600,
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b_Ga=p,i=12,p=1,c=40,r=20,z=-3,x=4,y=8,w=400,h=600,C=1,q=2\x1b\\"
+        );
     }
 }

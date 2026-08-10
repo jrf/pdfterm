@@ -18,6 +18,9 @@ pub struct Config {
     dark_mode: bool,
     theme: Option<String>,
     theme_catalog: Option<String>,
+    persistent_link_picker: bool,
+    link_picker_split_percent: Option<u16>,
+    link_picker_layout: LinkPickerLayout,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -27,6 +30,16 @@ enum FitModeSetting {
     Page,
     Width,
     Height,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkPickerLayout {
+    #[default]
+    Auto,
+    Vertical,
+    Horizontal,
+    Floating,
 }
 
 impl Config {
@@ -67,6 +80,18 @@ impl Config {
     pub fn theme_catalog(&self) -> Option<&str> {
         self.theme_catalog.as_deref()
     }
+
+    pub fn persistent_link_picker(&self) -> bool {
+        self.persistent_link_picker
+    }
+
+    pub fn link_picker_split_percent(&self) -> u16 {
+        self.link_picker_split_percent.unwrap_or(50).clamp(20, 80)
+    }
+
+    pub fn link_picker_layout(&self) -> LinkPickerLayout {
+        self.link_picker_layout
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -87,7 +112,7 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, LinkPickerLayout};
     use crate::pdf::FitMode;
 
     #[test]
@@ -97,6 +122,9 @@ mod tests {
         assert!(!config.dark_mode());
         assert_eq!(config.theme(), None);
         assert_eq!(config.theme_catalog(), None);
+        assert!(!config.persistent_link_picker());
+        assert_eq!(config.link_picker_split_percent(), 50);
+        assert_eq!(config.link_picker_layout(), LinkPickerLayout::Auto);
     }
 
     #[test]
@@ -111,6 +139,35 @@ mod tests {
     fn accepts_legacy_invert_name() {
         let config: Config = toml::from_str("invert = true\n").expect("config");
         assert!(config.dark_mode());
+    }
+
+    #[test]
+    fn parses_persistent_link_picker() {
+        let config: Config = toml::from_str("persistent_link_picker = true\n").expect("config");
+        assert!(config.persistent_link_picker());
+    }
+
+    #[test]
+    fn parses_and_bounds_link_picker_split_percent() {
+        let config: Config = toml::from_str("link_picker_split_percent = 65\n").expect("config");
+        assert_eq!(config.link_picker_split_percent(), 65);
+
+        let config: Config = toml::from_str("link_picker_split_percent = 100\n").expect("config");
+        assert_eq!(config.link_picker_split_percent(), 80);
+    }
+
+    #[test]
+    fn parses_link_picker_layouts() {
+        for (value, expected) in [
+            ("auto", LinkPickerLayout::Auto),
+            ("vertical", LinkPickerLayout::Vertical),
+            ("horizontal", LinkPickerLayout::Horizontal),
+            ("floating", LinkPickerLayout::Floating),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("link_picker_layout = \"{value}\"\n")).expect("config");
+            assert_eq!(config.link_picker_layout(), expected);
+        }
     }
 
     #[test]
