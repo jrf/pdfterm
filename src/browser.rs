@@ -49,7 +49,7 @@ impl BrowserState {
     }
 
     /// Supplies the recently opened documents, which are listed first in the
-    /// starting directory when no filter is active.
+    /// starting directory and remain available to recursive filtering.
     pub fn set_recents(&mut self, recents: Vec<PathBuf>) {
         self.recents = recents;
         self.load_dir();
@@ -179,6 +179,25 @@ impl BrowserState {
                         });
                     }
                 }
+            }
+            for path in recents {
+                if !path.is_file() || !is_pdf(&path) {
+                    continue;
+                }
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.path == path) {
+                    entry.is_recent = true;
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                entries.push(BrowserEntry {
+                    name,
+                    path,
+                    is_dir: false,
+                    is_recent: true,
+                });
             }
             entries.sort_by(|left, right| left.name.cmp(&right.name));
             let _ = sender.send(entries);
@@ -399,6 +418,8 @@ fn is_pdf(path: &Path) -> bool {
 mod tests {
     use super::BrowserState;
     use std::fs;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn browser_lists_directories_and_pdf_files_only() {
@@ -464,6 +485,32 @@ mod tests {
             .find(|entry| entry.name == "here.pdf")
             .expect("recent entry");
         assert!(entry.is_recent);
+    }
+
+    #[test]
+    fn recursive_filter_keeps_recents_outside_the_search_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("local.pdf"), b"synthetic").expect("local pdf");
+        let other = tempfile::tempdir().expect("other directory");
+        let recent = other.path().join("remote-report.pdf");
+        fs::write(&recent, b"synthetic").expect("recent pdf");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.set_recents(vec![recent.clone()]);
+        browser.preload_recursive();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !browser.poll_recursive() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(browser.recursive_loaded, "recursive scan timed out");
+
+        browser.filter = "remote report".into();
+        browser.rebuild_filter();
+        let matches: Vec<_> = browser.filtered_entries().collect();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, recent);
+        assert!(matches[0].is_recent);
     }
 
     #[test]

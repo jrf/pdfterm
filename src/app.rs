@@ -3568,7 +3568,6 @@ fn picker_entry_line(
     let mut line = Line::from(spans);
     let mut used = line.width();
     if entry.is_recent
-        && browser.filter.is_empty()
         && let Some(parent) = entry.path.parent()
     {
         let parent = shorten_path(&parent.to_string_lossy());
@@ -4474,6 +4473,22 @@ mod tests {
             .collect();
 
         assert!(rendered.contains("Most Recent"));
+        assert!(rendered.contains(&parent));
+
+        browser.filter = "recent".into();
+        browser.rebuild_filter();
+        terminal
+            .draw(|frame| draw_picker(frame, &browser, crate::theme::TOKYO_NIGHT_MOON))
+            .expect("draw filtered picker");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (popup.y + 1..popup.y + popup.height - 1)
+            .flat_map(|y| {
+                (popup.x + 1..popup.x + popup.width - 1)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+
+        assert!(rendered.contains("recent.pdf"));
         assert!(rendered.contains(&parent));
     }
 
