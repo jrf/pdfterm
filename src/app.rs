@@ -155,12 +155,14 @@ struct App {
     visible_image_id: Option<u32>,
     next_image_id: u32,
     last_status_row: Option<u16>,
+    performance_snapshot: Option<PerformanceSnapshot>,
     default_fit: FitMode,
     default_invert: bool,
     goto_input: Option<String>,
     search_input: Option<String>,
     next_search_request_id: u64,
     link_mode: bool,
+    show_performance: bool,
     theme: Palette,
     themes: Vec<(String, Palette)>,
     theme_index: usize,
@@ -235,6 +237,33 @@ struct ViewPosition {
 struct LinkDestination {
     page: u32,
     top_ratio: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PerformanceSnapshot {
+    render_ms: u128,
+    dark_mode_ms: Option<u128>,
+    highlight_ms: Option<u128>,
+    compression_ms: u128,
+    transfer_ms: u128,
+    link_count: usize,
+}
+
+impl PerformanceSnapshot {
+    fn status(self, detailed: bool, link_mode: bool) -> String {
+        let mut status = render_timing_status(
+            self.render_ms,
+            self.dark_mode_ms,
+            self.highlight_ms,
+            self.compression_ms,
+            self.transfer_ms,
+            detailed,
+        );
+        if link_mode {
+            status.push_str(&format!("  {} links", self.link_count));
+        }
+        status
+    }
 }
 
 #[derive(Default)]
@@ -344,6 +373,34 @@ fn terminal_color_rgb(color: crossterm::style::Color) -> [u8; 3] {
     }
 }
 
+fn render_timing_status(
+    render_ms: u128,
+    dark_mode_ms: Option<u128>,
+    highlight_ms: Option<u128>,
+    compression_ms: u128,
+    transfer_ms: u128,
+    detailed: bool,
+) -> String {
+    if detailed {
+        let dark_mode = dark_mode_ms
+            .map(|elapsed| format!("  dark {elapsed}ms"))
+            .unwrap_or_default();
+        let highlight = highlight_ms
+            .map(|elapsed| format!("  highlight {elapsed}ms"))
+            .unwrap_or_default();
+        return format!(
+            "render {render_ms}ms{dark_mode}{highlight}  compress {compression_ms}ms  transfer {transfer_ms}ms"
+        );
+    }
+
+    let total_ms = render_ms
+        + dark_mode_ms.unwrap_or_default()
+        + highlight_ms.unwrap_or_default()
+        + compression_ms
+        + transfer_ms;
+    format!("frame {total_ms}ms")
+}
+
 enum PendingOpen {
     Reload {
         document_id: DocumentId,
@@ -397,12 +454,14 @@ impl App {
             visible_image_id: None,
             next_image_id: 1,
             last_status_row: None,
+            performance_snapshot: None,
             default_fit,
             default_invert,
             goto_input: None,
             search_input: None,
             next_search_request_id: 1,
             link_mode: false,
+            show_performance: false,
             theme: defaults.theme,
             themes: defaults.themes,
             theme_index: defaults.theme_index,
@@ -1074,6 +1133,7 @@ impl App {
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
+            KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
             KeyCode::Char('y') => self.request_copy(output)?,
@@ -1208,6 +1268,16 @@ impl App {
         self.request_current(output)
     }
 
+    fn toggle_performance(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.show_performance = !self.show_performance;
+        let Some(snapshot) = self.performance_snapshot else {
+            return Ok(());
+        };
+        let state = snapshot.status(self.show_performance, self.link_mode);
+        self.draw_status(output, self.viewport()?, &state)?;
+        Ok(())
+    }
+
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
@@ -1216,6 +1286,7 @@ impl App {
         self.generation = self.generation.wrapping_add(1);
         self.worker.begin_generation(self.generation);
         self.pending.clear();
+        self.performance_snapshot = None;
 
         if let Some(frame) = self.tab().cache.get(&key).cloned() {
             self.draw_frame(&frame, viewport, output)?;
@@ -1304,23 +1375,16 @@ impl App {
         if let Some(previous) = self.visible_image_id.replace(image_id) {
             kitty::delete_image(output, previous)?;
         }
-        let dark_mode = frame.dark_mode_elapsed.map_or_else(String::new, |elapsed| {
-            format!("  dark {}ms", elapsed.as_millis())
-        });
-        let highlight = frame.highlight_elapsed.map_or_else(String::new, |elapsed| {
-            format!("  highlight {}ms", elapsed.as_millis())
-        });
-        let state = format!(
-            "render {}ms{dark_mode}{highlight}  compress {}ms  transfer {}ms{}",
-            frame.render_elapsed.as_millis(),
-            frame.compression_elapsed.as_millis(),
-            transfer_elapsed.as_millis(),
-            if self.link_mode {
-                format!("  {} links", frame.links.len())
-            } else {
-                String::new()
-            }
-        );
+        let snapshot = PerformanceSnapshot {
+            render_ms: frame.render_elapsed.as_millis(),
+            dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
+            highlight_ms: frame.highlight_elapsed.map(|elapsed| elapsed.as_millis()),
+            compression_ms: frame.compression_elapsed.as_millis(),
+            transfer_ms: transfer_elapsed.as_millis(),
+            link_count: frame.links.len(),
+        };
+        self.performance_snapshot = Some(snapshot);
+        let state = snapshot.status(self.show_performance, self.link_mode);
         self.draw_status(output, viewport, &state)?;
         Ok(())
     }
@@ -1347,9 +1411,7 @@ impl App {
             mode.push_str("  ");
         }
         let search_status = tab.search.status_label(tab.page);
-        let link_status = self
-            .link_mode
-            .then_some("  link mode · click · enter picker · b back · esc close");
+        let link_status = self.link_mode.then_some("  click/enter: open  esc: close");
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -2537,6 +2599,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
     const VIEWER: &[(&str, &str)] = &[
         ("m", "cycle fit mode"),
         ("i", "toggle dark mode"),
+        ("p", "toggle performance timings"),
         ("t", "table of contents"),
         ("T", "choose theme"),
         ("y", "copy page text"),
@@ -3069,12 +3132,12 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, SearchState,
-        apply_picker_navigation, clear_picker, cycled_tab_index, draw_help_menu, draw_link_picker,
-        draw_picker, draw_theme_picker, filter_outline, link_at_cell, link_picker_label,
-        link_picker_visible_height, outline_start_index, picker_color, picker_rect,
-        search_target_page, shorten_path, stale_status_row, update_link_number_selection,
-        write_clipboard_osc52,
+        BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, PerformanceSnapshot,
+        SearchState, apply_picker_navigation, clear_picker, cycled_tab_index, draw_help_menu,
+        draw_link_picker, draw_picker, draw_theme_picker, filter_outline, link_at_cell,
+        link_picker_label, link_picker_visible_height, outline_start_index, picker_color,
+        picker_rect, render_timing_status, search_target_page, shorten_path, stale_status_row,
+        update_link_number_selection, write_clipboard_osc52,
     };
     use crate::pdf::{LinkTarget, OutlineItem, PageLink, PageLinkRect, SearchPageMatch};
     use crate::terminal::ImagePlacement;
@@ -3089,6 +3152,28 @@ mod tests {
     fn page_navigation_bounds_are_saturating() {
         assert_eq!(0_u32.saturating_sub(1), 0);
         assert_eq!(u32::MAX.saturating_add(1), u32::MAX);
+    }
+
+    #[test]
+    fn render_timings_are_compact_by_default_and_expand_on_demand() {
+        assert_eq!(
+            render_timing_status(15, Some(12), Some(0), 27, 17, false),
+            "frame 71ms"
+        );
+        assert_eq!(
+            render_timing_status(15, Some(12), Some(0), 27, 17, true),
+            "render 15ms  dark 12ms  highlight 0ms  compress 27ms  transfer 17ms"
+        );
+
+        let snapshot = PerformanceSnapshot {
+            render_ms: 15,
+            dark_mode_ms: Some(12),
+            highlight_ms: Some(0),
+            compression_ms: 27,
+            transfer_ms: 17,
+            link_count: 5,
+        };
+        assert_eq!(snapshot.status(false, true), "frame 71ms  5 links");
     }
 
     #[test]
@@ -3487,6 +3572,7 @@ mod tests {
         assert!(rendered.contains("search document"));
         assert!(rendered.contains("next / prev match"));
         assert!(rendered.contains("open link picker"));
+        assert!(rendered.contains("toggle performance timings"));
         assert!(rendered.contains("choose theme"));
         assert!(rendered.contains("open PDF in new tab"));
         assert!(rendered.contains("clear search / exit"));
