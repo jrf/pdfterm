@@ -4,7 +4,7 @@
 
 ![pdfterm rendering an arXiv paper in dark mode inside Kitty](assets/pdfterm-dark-mode-arxiv.png)
 
-The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top and remain searchable alongside recursively discovered PDFs.
+The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top and remain searchable alongside recursively discovered PDFs. Picker searches match filenames and parent directories, with filename matches ranked first. Press `/` to filter a picker; `Esc` clears an active query before closing it.
 
 You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line shows one total render time by default; press `p` to expand it into rendering, dark-mode conversion, compression, and transfer timings.
 
@@ -55,39 +55,64 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |
 | `T` | choose and preview a theme for the current session |
 | `y` | copy the current page's text to the clipboard |
-| `L` | toggle link mode and highlight clickable PDF annotations |
-| `Enter` in link mode | open the document-wide numbered link browser |
+| `Enter` | open the document-wide link browser |
+| `L` | enable mouse link mode, highlight annotations, and open the link browser |
 | `b` | return to the view before the last followed internal link |
 | `f` | open a PDF in a new tab |
 | `Tab` / `Shift-Tab` | switch tabs |
+| `Alt-1` … `Alt-9` | select a numbered tab directly |
 | `?` | open the keybinding help menu |
-| `q` | close the current tab, exiting after the last tab |
-| `Esc` | close the link browser, clear search, or exit when no mode is active |
+| `q` | leave link mode when active; otherwise close the current tab |
+| `Esc` | close a side pane, clear search, or exit when no mode is active |
 
 In fit-width and fit-height modes, the movement keys scroll within a page that is
 larger than the viewport and cross into the adjacent page at the edges. The `h`/`l`
 keys and left/right arrows scroll horizontally in fit-height mode.
 
 Search scans and caches selectable text incrementally without blocking foreground
-page rendering. It is case-insensitive, treats runs of whitespace as a single
-space, and highlights matches using the active theme. Image-only PDFs require OCR
-and are reported as having no matches.
+page rendering. Results open beside the PDF, grouped by outline section and page,
+with one surrounding-text snippet per matching page. Use `j`/`k`, arrows,
+`Ctrl-b`/`Ctrl-f`, or `g`/`G` to navigate, and `Enter` to jump while keeping the
+results visible. In a split layout, `h` focuses the PDF and `l` returns to the
+results (`Tab` toggles focus); `/` starts a new search and `Esc` closes the pane.
+The search is case-insensitive, treats runs of whitespace as a single space, and
+highlights matches using the active theme. Image-only PDFs require OCR and are
+reported as having no matches.
 
-Link mode temporarily enables mouse capture so normal terminal text selection is
-unchanged outside the mode. Click an annotated link, or press `Enter` to open a
-document-wide link browser in a Grimoire-style split view. Wide terminals place
+Mouse link mode temporarily enables mouse capture so normal terminal text selection is
+unchanged outside the mode. Press `L` to enable it, highlight annotations, and
+open the document-wide link browser automatically. Press `Enter` at any time to
+open the same browser without enabling annotation highlighting. It uses a
+Grimoire-style split view. Wide terminals place
 the PDF on the left and a compact link sidebar on the right; narrow terminals
 place the PDF above the links. Links are indexed incrementally behind foreground
-page rendering and shown under explicit source-page headings in the browser. The
+page rendering and grouped by document section and source page when the PDF has
+an outline, with source-page-only headings as a fallback. The
 split repositions Kitty's retained page image without rerendering or retransmitting it.
-In the picker, use `j`/`k`, arrows, or type an entry number, then press `Enter` to
-follow it. Links are ordered by source page, then top-to-bottom and left-to-right;
-the selected-link panel shows source and destination details. Link history is kept
-independently for each tab.
+In the browser, use `j`/`k`, arrows, or type an entry number to preview that
+link's source location in the PDF; rapid selection changes are debounced to
+avoid redundant rendering. Click a row to select it, or press `Enter` to follow
+the selected link. Closing the browser restores the view from before the preview. `Ctrl-f`/`Ctrl-b`
+move by a viewport and `g`/`G` select the first or last link. In a split layout,
+press `h` to focus the PDF and `l` to return to the link list (`Tab` toggles focus
+too); PDF movement keys then navigate the preview without closing the browser.
+Press `q` to close the browser and disable link mode. Floating layout remains
+modal. Press `/` to filter
+by label, source page, destination page, or URL;
+`Esc` clears the filter before closing the picker. Links are ordered by source page,
+then top-to-bottom and left-to-right. Wrapped or column-interleaved PDF annotations
+that share a destination are reconstructed as one readable entry. The selected-link
+panel shows source and destination details plus, when PDF
+text extraction permits it, the surrounding citing text and matching numbered reference.
+Context is cached during background link indexing, so browser navigation does not
+perform additional PDF work. Link history is kept independently for each tab.
 External URLs are copied to the local clipboard with OSC 52 instead of being
 opened on the remote machine. Set `persistent_link_picker = true` to keep the
-split open after following or copying a link; `Esc` closes it. Press `L` to leave
-link mode. Plain citation text without a PDF link annotation is not inferred.
+split open after following or copying a link; `Esc` closes it. Press `s` to cycle
+vertical, horizontal, and floating layouts, or `a` to restore automatic layout
+selection. These runtime layout choices are session-only and do not rewrite the
+configuration file. Press `L` to leave link mode. Plain citation text without a
+PDF link annotation is not inferred.
 
 ## Configuration
 
@@ -181,6 +206,11 @@ foreground = "#c8d3f5"
 
 Recently opened documents are tracked in `$XDG_CACHE_HOME/pdfterm/recent`
 (or `~/.cache/pdfterm/recent`) and shown with their parent directories for context.
+Filtered picker results are labeled `RECENT`, `HERE`, or `SUBDIR` so their source
+remains visible after the recent-files heading is replaced by search results. Use
+`j`/`k` or arrows to move, `Ctrl-b`/`Ctrl-f` to move by a page, and, before
+entering a filter, `g`/`G` to jump to the first or last result. The file, outline,
+theme, link, and search-result pickers use the same navigation conventions.
 
 ## Checks
 

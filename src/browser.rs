@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
@@ -13,6 +12,23 @@ pub struct BrowserEntry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_recent: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserEntrySource {
+    Recent,
+    Here,
+    Subdirectory,
+}
+
+impl BrowserEntrySource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "RECENT",
+            Self::Here => "HERE",
+            Self::Subdirectory => "SUBDIR",
+        }
+    }
 }
 
 pub struct BrowserState {
@@ -211,11 +227,13 @@ impl BrowserState {
         let Ok(entries) = receiver.try_recv() else {
             return false;
         };
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
         self.recursive_entries = entries;
         self.recursive_loaded = true;
         self.recursive_rx = None;
         if !self.filter.is_empty() {
             self.rebuild_filter();
+            self.restore_selection(selected_path.as_deref());
         }
         true
     }
@@ -231,21 +249,53 @@ impl BrowserState {
         }
 
         let pattern = Pattern::parse(&self.filter, CaseMatching::Ignore, Normalization::Smart);
-        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-        let mut buffer = Vec::new();
-        let mut scored: Vec<_> = self
-            .active_source()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let haystack = Utf32Str::new(&entry.name, &mut buffer);
-                pattern
-                    .score(haystack, &mut matcher)
-                    .map(|score| (index, score))
-            })
-            .collect();
-        scored.sort_by_key(|entry| Reverse(entry.1));
-        self.filtered_indices = scored.into_iter().map(|(index, _)| index).collect();
+        let query = self.filter.trim().to_lowercase();
+        let filtered_indices = {
+            let source = self.active_source();
+            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+            let mut buffer = Vec::new();
+            let mut scored: Vec<_> = source
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    let basename = entry
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| entry.name.as_str().into());
+                    let basename_score =
+                        pattern.score(Utf32Str::new(basename.as_ref(), &mut buffer), &mut matcher);
+                    let path = entry.path.to_string_lossy();
+                    let path_score = if entry.name == "../" {
+                        None
+                    } else {
+                        pattern.score(Utf32Str::new(&path, &mut buffer), &mut matcher)
+                    };
+                    let score = basename_score.or(path_score)?;
+                    let basename_lower = basename.to_lowercase();
+                    let match_tier = if basename_lower == query {
+                        3
+                    } else if basename_lower.starts_with(&query) {
+                        2
+                    } else if basename_score.is_some() {
+                        1
+                    } else {
+                        0
+                    };
+                    Some((index, match_tier, score, entry.is_recent))
+                })
+                .collect();
+            scored.sort_by(|left, right| {
+                right
+                    .1
+                    .cmp(&left.1)
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| right.3.cmp(&left.3))
+                    .then_with(|| source[left.0].path.cmp(&source[right.0].path))
+            });
+            scored.into_iter().map(|(index, _, _, _)| index).collect()
+        };
+        self.filtered_indices = filtered_indices;
     }
 
     pub fn filtered_entries(&self) -> impl Iterator<Item = &BrowserEntry> {
@@ -263,22 +313,38 @@ impl BrowserState {
         self.filtered_entries().position(|entry| entry.is_recent)
     }
 
-    pub fn match_indices(&self, name: &str) -> Vec<usize> {
+    pub fn match_indices(&self, value: &str) -> Vec<usize> {
         if self.filter.is_empty() {
             return Vec::new();
         }
-        let pattern = Pattern::parse(&self.filter, CaseMatching::Ignore, Normalization::Smart);
         let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
         let mut buffer = Vec::new();
-        let haystack = Utf32Str::new(name, &mut buffer);
         let mut indices = Vec::new();
-        let _ = pattern.indices(haystack, &mut matcher, &mut indices);
+        for term in self.filter.split_whitespace() {
+            let pattern = Pattern::parse(term, CaseMatching::Ignore, Normalization::Smart);
+            let haystack = Utf32Str::new(value, &mut buffer);
+            let _ = pattern.indices(haystack, &mut matcher, &mut indices);
+        }
         indices.sort_unstable();
         indices.dedup();
         indices
             .into_iter()
             .filter_map(|index| usize::try_from(index).ok())
             .collect()
+    }
+
+    pub fn entry_source(&self, entry: &BrowserEntry) -> Option<BrowserEntrySource> {
+        if entry.name == "../" {
+            return None;
+        }
+        if entry.is_recent {
+            return Some(BrowserEntrySource::Recent);
+        }
+        if entry.path.parent() == Some(self.current_dir.as_path()) {
+            Some(BrowserEntrySource::Here)
+        } else {
+            Some(BrowserEntrySource::Subdirectory)
+        }
     }
 
     pub fn select_down(&mut self) {
@@ -339,6 +405,23 @@ impl BrowserState {
         } else {
             Some(entry.path.clone())
         }
+    }
+
+    fn selected_entry(&self) -> Option<&BrowserEntry> {
+        let real_index = *self.filtered_indices.get(self.selected)?;
+        self.active_source().get(real_index)
+    }
+
+    fn restore_selection(&mut self, path: Option<&Path>) {
+        self.selected = path
+            .and_then(|path| {
+                self.filtered_indices.iter().position(|index| {
+                    self.active_source()
+                        .get(*index)
+                        .is_some_and(|entry| entry.path == path)
+                })
+            })
+            .unwrap_or(0);
     }
 
     fn active_source(&self) -> &[BrowserEntry] {
@@ -421,6 +504,14 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn wait_for_recursive_scan(browser: &mut BrowserState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !browser.poll_recursive() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(browser.recursive_loaded, "recursive scan timed out");
+    }
+
     #[test]
     fn browser_lists_directories_and_pdf_files_only() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -498,11 +589,7 @@ mod tests {
         let mut browser = BrowserState::new(directory.path().to_path_buf());
         browser.set_recents(vec![recent.clone()]);
         browser.preload_recursive();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !browser.poll_recursive() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(browser.recursive_loaded, "recursive scan timed out");
+        wait_for_recursive_scan(&mut browser);
 
         browser.filter = "remote report".into();
         browser.rebuild_filter();
@@ -511,6 +598,64 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, recent);
         assert!(matches[0].is_recent);
+    }
+
+    #[test]
+    fn recursive_filter_matches_parent_directories() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let archive = directory.path().join("research-archive");
+        fs::create_dir(&archive).expect("archive directory");
+        let report = archive.join("report.pdf");
+        fs::write(&report, b"synthetic").expect("report");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.preload_recursive();
+        wait_for_recursive_scan(&mut browser);
+        browser.filter = "research-archive".into();
+        browser.rebuild_filter();
+
+        let matches: Vec<_> = browser.filtered_entries().collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, report);
+    }
+
+    #[test]
+    fn basename_matches_rank_above_parent_directory_matches() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let direct = directory.path().join("report.pdf");
+        fs::write(&direct, b"synthetic").expect("direct report");
+        let archive = directory.path().join("report-archive");
+        fs::create_dir(&archive).expect("archive directory");
+        fs::write(archive.join("notes.pdf"), b"synthetic").expect("nested PDF");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.preload_recursive();
+        wait_for_recursive_scan(&mut browser);
+        browser.filter = "report".into();
+        browser.rebuild_filter();
+
+        assert_eq!(browser.filtered_entries().next().unwrap().path, direct);
+    }
+
+    #[test]
+    fn recursive_results_preserve_the_selected_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let selected = directory.path().join("zeta.pdf");
+        fs::write(&selected, b"synthetic").expect("selected PDF");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        fs::write(nested.join("alpha.pdf"), b"synthetic").expect("nested PDF");
+
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.filter = "pdf".into();
+        browser.rebuild_filter();
+        assert_eq!(browser.selected_entry().unwrap().path, selected);
+
+        browser.preload_recursive();
+        wait_for_recursive_scan(&mut browser);
+
+        assert_eq!(browser.selected_entry().unwrap().path, selected);
+        assert_eq!(browser.selected, 1);
     }
 
     #[test]

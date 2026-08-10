@@ -34,10 +34,11 @@ pub struct OutlineItem {
     pub depth: u16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchPageMatch {
     pub page: u32,
     pub occurrences: u32,
+    pub context: String,
 }
 
 /// How a page is scaled to the terminal viewport.
@@ -144,8 +145,11 @@ pub struct PageLink {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentLink {
     pub source_page: u32,
+    pub source_top_ratio: f32,
     pub ordinal: u32,
     pub label: String,
+    pub source_context: Option<String>,
+    pub reference_context: Option<String>,
     pub target: LinkTarget,
 }
 
@@ -174,6 +178,8 @@ pub enum WorkerMessage {
         request_id: u64,
         scanned: u32,
         total: u32,
+        matches: Vec<SearchPageMatch>,
+        total_occurrences: u32,
     },
     SearchResults {
         document_id: DocumentId,
@@ -590,6 +596,8 @@ fn run_worker(
                                 request_id,
                                 scanned: 0,
                                 total: total_pages,
+                                matches: Vec::new(),
+                                total_occurrences: 0,
                             })
                             .map_err(|_| "viewer stopped".to_string())?;
                     }
@@ -645,6 +653,9 @@ fn run_worker(
                     let Some(document) = documents.get(&job.document_id) else {
                         continue;
                     };
+                    let Some(cache) = text_cache.get_mut(&job.document_id) else {
+                        continue;
+                    };
                     if let Ok(page_index) = i32::try_from(job.next_page)
                         && let Ok(page) = document.pages().get(page_index)
                     {
@@ -652,6 +663,7 @@ fn run_worker(
                             document,
                             &page,
                             job.next_page,
+                            cache,
                         ));
                     }
                     job.next_page = job.next_page.saturating_add(1);
@@ -681,12 +693,13 @@ fn run_worker(
                     let Some(cache) = text_cache.get_mut(&job.document_id) else {
                         continue;
                     };
-                    let (occurrences, rectangles) =
+                    let (occurrences, rectangles, context) =
                         search_page(document, job.next_page, cache, &job.needle);
                     if occurrences > 0 {
                         job.matches.push(SearchPageMatch {
                             page: job.next_page,
                             occurrences,
+                            context,
                         });
                         job.total_occurrences = job.total_occurrences.saturating_add(occurrences);
                         job.highlights.insert(job.next_page, rectangles);
@@ -717,6 +730,8 @@ fn run_worker(
                                     request_id: job.request_id,
                                     scanned: job.next_page,
                                     total: job.total_pages,
+                                    matches: job.matches.clone(),
+                                    total_occurrences: job.total_occurrences,
                                 })
                                 .map_err(|_| "viewer stopped".to_string())?;
                             job.last_progress = Instant::now();
@@ -1403,9 +1418,9 @@ fn search_page(
     page: u32,
     cache: &mut [Option<CachedPageText>],
     needle: &str,
-) -> (u32, Vec<SearchRect>) {
+) -> (u32, Vec<SearchRect>, String) {
     let Some(cached) = cached_page_text(document, page, cache) else {
-        return (0, Vec::new());
+        return (0, Vec::new(), String::new());
     };
     let source_ranges: Vec<_> = cached
         .normalized
@@ -1419,17 +1434,18 @@ fn search_page(
         .collect();
     let occurrences = count_search_matches(&cached.normalized, needle);
     if source_ranges.is_empty() {
-        return (0, Vec::new());
+        return (0, Vec::new(), String::new());
     }
+    let context = search_match_context(cached, source_ranges[0]);
 
     let Ok(page_index) = i32::try_from(page) else {
-        return (occurrences, Vec::new());
+        return (occurrences, Vec::new(), context);
     };
     let Ok(page) = document.pages().get(page_index) else {
-        return (occurrences, Vec::new());
+        return (occurrences, Vec::new(), context);
     };
     let Ok(text) = page.text() else {
-        return (occurrences, Vec::new());
+        return (occurrences, Vec::new(), context);
     };
     let mut rectangles = Vec::new();
     for (start, count) in source_ranges {
@@ -1444,7 +1460,25 @@ fn search_page(
             }
         }));
     }
-    (occurrences, rectangles)
+    (occurrences, rectangles, context)
+}
+
+fn search_match_context(cached: &CachedPageText, range: (usize, usize)) -> String {
+    let (start, count) = range;
+    let start_byte = cached
+        .raw
+        .char_indices()
+        .nth(start)
+        .map_or(cached.raw.len(), |(index, _)| index);
+    let end_byte = cached
+        .raw
+        .char_indices()
+        .nth(start.saturating_add(count))
+        .map_or(cached.raw.len(), |(index, _)| index);
+    context_window(&cached.raw, start_byte..end_byte, 70, 90)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn apply_search_highlights(
@@ -1544,18 +1578,200 @@ fn extract_document_links(
     document: &PdfDocument,
     page: &PdfPage,
     source_page: u32,
+    text_cache: &mut [Option<CachedPageText>],
 ) -> Vec<DocumentLink> {
-    let config = PdfRenderConfig::new().set_target_width(1_000);
-    extract_page_links(document, page, &config, i32::MAX as u32, i32::MAX as u32)
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, link)| DocumentLink {
+    const INDEX_WIDTH: u32 = 1_000;
+    let config = PdfRenderConfig::new().set_target_width(i32::try_from(INDEX_WIDTH).unwrap());
+    let page_width = page.width().value.max(1.0);
+    let index_height =
+        ((INDEX_WIDTH as f32 * page.height().value / page_width).ceil() as u32).max(1);
+    let source_text = cached_page_text(document, source_page, text_cache)
+        .map(|text| normalize_context_text(&text.raw));
+    let mut label_occurrences = HashMap::<String, usize>::new();
+    coalesce_document_link_fragments(
+        extract_page_links(document, page, &config, INDEX_WIDTH, index_height),
+        source_text.as_deref(),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, link)| {
+        let occurrence = label_occurrences.entry(link.label.clone()).or_default();
+        let source_context = source_text
+            .as_deref()
+            .and_then(|text| context_around_label(text, &link.label, *occurrence, 90, 110));
+        *occurrence += 1;
+        let reference_context = match &link.target {
+            LinkTarget::Internal { page, .. } => citation_number(&link.label).and_then(|number| {
+                cached_page_text(document, *page, text_cache)
+                    .and_then(|text| reference_context(&normalize_context_text(&text.raw), number))
+            }),
+            LinkTarget::Uri(_) => None,
+        }
+        .filter(|reference| source_context.as_ref() != Some(reference));
+        DocumentLink {
             source_page,
+            source_top_ratio: (link.rect.top as f32 / index_height as f32).clamp(0.0, 1.0),
             ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
             label: link.label,
+            source_context,
+            reference_context,
             target: link.target,
-        })
-        .collect()
+        }
+    })
+    .collect()
+}
+
+fn coalesce_document_link_fragments(
+    links: Vec<PageLink>,
+    source_text: Option<&str>,
+) -> Vec<PageLink> {
+    let mut combined: Vec<PageLink> = Vec::with_capacity(links.len());
+    for link in links {
+        if let Some(previous) = combined.iter_mut().rev().find(|previous| {
+            previous.target == link.target && link_fragments_are_adjacent(previous.rect, link.rect)
+        }) {
+            append_link_fragment(&mut previous.label, &link.label, source_text);
+            previous.rect = link.rect;
+        } else {
+            combined.push(link);
+        }
+    }
+    combined
+}
+
+fn append_link_fragment(label: &mut String, fragment: &str, source_text: Option<&str>) {
+    if label.is_empty() || fragment.is_empty() {
+        label.push_str(fragment);
+        return;
+    }
+    let spaced = format!("{label} {fragment}");
+    let joined = format!("{label}{fragment}");
+    if source_text.is_some_and(|text| text.contains(&spaced)) {
+        *label = spaced;
+    } else if source_text.is_some_and(|text| text.contains(&joined)) {
+        *label = joined;
+    } else {
+        *label = spaced;
+    }
+}
+
+fn link_fragments_are_adjacent(previous: PageLinkRect, next: PageLinkRect) -> bool {
+    let previous_height = previous.bottom.saturating_sub(previous.top).max(1);
+    let next_height = next.bottom.saturating_sub(next.top).max(1);
+    let line_height = previous_height.max(next_height);
+    let top_delta = previous.top.abs_diff(next.top);
+    let same_line = top_delta <= line_height / 2 + 1
+        && next.left.saturating_sub(previous.right) <= line_height.saturating_mul(2);
+    let wrapped_line = next.top > previous.top
+        && next.top.saturating_sub(previous.top) <= line_height.saturating_mul(2)
+        && next.left < previous.left;
+    same_line || wrapped_line
+}
+
+fn normalize_context_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn citation_number(label: &str) -> Option<&str> {
+    let number = label.trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '[' | ']' | ',' | ';')
+    });
+    (!number.is_empty() && number.chars().all(|character| character.is_ascii_digit()))
+        .then_some(number)
+}
+
+fn context_around_label(
+    text: &str,
+    label: &str,
+    occurrence: usize,
+    before: usize,
+    after: usize,
+) -> Option<String> {
+    let label = normalize_context_text(label);
+    if label.is_empty() {
+        return None;
+    }
+    let range = nth_match(text, &label, occurrence)?;
+    Some(context_window(text, range, before, after))
+}
+
+fn reference_context(text: &str, number: &str) -> Option<String> {
+    let candidates = [
+        format!("[{number}]"),
+        format!("{number}."),
+        format!("{number})"),
+    ];
+    let range = candidates
+        .iter()
+        .find_map(|candidate| nth_match(text, candidate, 0))?;
+    let mut context = context_window(text, range.clone(), 0, 220);
+    if let Some(stripped) = context.strip_prefix('…') {
+        context = stripped.to_string();
+    }
+    if let Some(next_reference) = next_bracketed_number(&context, range.end - range.start) {
+        context.truncate(next_reference);
+        context = context.trim_end().to_string();
+        if range.end < text.len() {
+            context.push('…');
+        }
+    }
+    Some(context)
+}
+
+fn nth_match(text: &str, needle: &str, occurrence: usize) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0;
+    for current in 0..=occurrence {
+        let start = text.get(offset..)?.find(needle)? + offset;
+        let end = start + needle.len();
+        if current == occurrence {
+            return Some(start..end);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn context_window(
+    text: &str,
+    range: std::ops::Range<usize>,
+    before: usize,
+    after: usize,
+) -> String {
+    let characters: Vec<_> = text.chars().collect();
+    let start_character = text[..range.start].chars().count();
+    let end_character = start_character + text[range].chars().count();
+    let mut start = start_character.saturating_sub(before);
+    while start > 0 && !characters[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = end_character.saturating_add(after).min(characters.len());
+    while end < characters.len() && !characters[end].is_whitespace() {
+        end += 1;
+    }
+    let mut context: String = characters[start..end].iter().collect();
+    context = context.trim().to_string();
+    if start > 0 {
+        context.insert(0, '…');
+    }
+    if end < characters.len() {
+        context.push('…');
+    }
+    context
+}
+
+fn next_bracketed_number(text: &str, start: usize) -> Option<usize> {
+    text.get(start..)?;
+    let mut offset = start;
+    while let Some(relative) = text.get(offset..)?.find('[') {
+        let candidate = offset + relative;
+        let after = text.get(candidate + 1..)?;
+        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && after.as_bytes().get(digits) == Some(&b']') {
+            return Some(candidate);
+        }
+        offset = candidate + 1;
+    }
+    None
 }
 
 fn sort_page_links_reading_order(links: &mut [PageLink]) {
@@ -1785,11 +2001,41 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 mod tests {
     use super::{
         DarkModeStyle, DarkModeTransform, FitMode, PixelRect, blend_highlight_rectangle,
-        count_search_matches, dark_mode_pixel, darken_rgba, mask_quadrilateral,
-        normalize_search_text,
+        context_around_label, count_search_matches, dark_mode_pixel, darken_rgba,
+        mask_quadrilateral, normalize_search_text, reference_context,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
+
+    #[test]
+    fn link_context_includes_surrounding_text() {
+        let text = "Earlier work uses sparse retrieval. A realistic limitation appears in dense retrieval [23] under distribution shift. Later work follows.";
+
+        let context = context_around_label(text, "[23]", 0, 40, 20).expect("context");
+
+        assert!(context.contains("limitation appears in dense retrieval [23]"));
+        assert!(context.starts_with('…'));
+        assert!(context.ends_with('…'));
+    }
+
+    #[test]
+    fn link_context_expands_truncated_edges_to_complete_words() {
+        let text = "alpha object representation omega tail";
+
+        let context = context_around_label(text, "representation", 0, 4, 2).expect("context");
+
+        assert_eq!(context, "…object representation omega…");
+    }
+
+    #[test]
+    fn reference_context_stops_before_the_next_numbered_reference() {
+        let text = "[22] Prior et al. Prior work. [23] Weller et al. On theoretical limitations of retrieval. [24] Later et al. Later work.";
+
+        let context = reference_context(text, "23").expect("reference context");
+
+        assert!(context.starts_with("[23] Weller et al."), "{context:?}");
+        assert!(!context.contains("[24]"));
+    }
 
     #[test]
     fn pdfium_image_mask_and_text_cache_work() {
@@ -1862,10 +2108,11 @@ mod tests {
             count_search_matches(&text.normalized, "synthetic needle"),
             2
         );
-        let (occurrences, rectangles) =
+        let (occurrences, rectangles, context) =
             search_page(&text_document, 0, &mut cache, "synthetic needle");
         assert_eq!(occurrences, 2);
         assert!(!rectangles.is_empty());
+        assert!(context.contains("Synthetic Needle"));
 
         let page = text_document.pages().get(0).expect("text page");
         let config = PdfRenderConfig::new()
@@ -1923,9 +2170,17 @@ mod tests {
             matches!(&link.target, LinkTarget::Uri(uri) if uri == "https://example.invalid/paper")
         }));
 
-        let document_links = extract_document_links(&link_document, &link_page, 6);
+        let page_count = u32::try_from(link_document.pages().len()).unwrap();
+        let mut link_text_cache = empty_text_cache(page_count);
+        let document_links =
+            extract_document_links(&link_document, &link_page, 6, &mut link_text_cache);
         assert_eq!(document_links.len(), 2);
         assert!(document_links.iter().all(|link| link.source_page == 6));
+        assert!(
+            document_links
+                .iter()
+                .all(|link| (0.8..=1.0).contains(&link.source_top_ratio))
+        );
         assert_eq!(document_links[0].ordinal, 0);
         assert_eq!(document_links[1].ordinal, 1);
 
@@ -2112,6 +2367,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["10:5", "10:80", "40:20"]
         );
+    }
+
+    #[test]
+    fn adjacent_link_fragments_with_the_same_target_are_coalesced() {
+        use super::{LinkTarget, PageLink, PageLinkRect, coalesce_document_link_fragments};
+
+        let target = LinkTarget::Internal {
+            page: 12,
+            top_ratio: Some(0.5),
+        };
+        let interleaved_target = LinkTarget::Internal {
+            page: 13,
+            top_ratio: Some(0.25),
+        };
+        let links = vec![
+            PageLink {
+                rect: PageLinkRect {
+                    left: 200,
+                    top: 10,
+                    right: 300,
+                    bottom: 30,
+                },
+                label: "(Spelke et al.,".into(),
+                target: target.clone(),
+            },
+            PageLink {
+                rect: PageLinkRect {
+                    left: 200,
+                    top: 20,
+                    right: 300,
+                    bottom: 40,
+                },
+                label: "(Wiskott and Se".into(),
+                target: interleaved_target.clone(),
+            },
+            PageLink {
+                rect: PageLinkRect {
+                    left: 10,
+                    top: 31,
+                    right: 50,
+                    bottom: 51,
+                },
+                label: "1995)".into(),
+                target: target.clone(),
+            },
+            PageLink {
+                rect: PageLinkRect {
+                    left: 10,
+                    top: 41,
+                    right: 80,
+                    bottom: 61,
+                },
+                label: "jnowski, 2002)".into(),
+                target: interleaved_target,
+            },
+            PageLink {
+                rect: PageLinkRect {
+                    left: 10,
+                    top: 100,
+                    right: 60,
+                    bottom: 120,
+                },
+                label: "later mention".into(),
+                target,
+            },
+        ];
+
+        let source_text = "(Spelke et al., 1995) and (Wiskott and Sejnowski, 2002)";
+        let links = coalesce_document_link_fragments(links, Some(source_text));
+
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].label, "(Spelke et al., 1995)");
+        assert_eq!(links[1].label, "(Wiskott and Sejnowski, 2002)");
+        assert_eq!(links[2].label, "later mention");
     }
 
     #[test]

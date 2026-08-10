@@ -21,10 +21,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color as RatatuiColor, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph, Wrap};
 use thiserror::Error;
 
-use crate::browser::BrowserState;
+use crate::browser::{BrowserEntry, BrowserEntrySource, BrowserState};
 use crate::config::{Config, LinkPickerLayout};
 use crate::kitty::{self, Placement};
 use crate::pdf::{
@@ -37,10 +37,40 @@ use crate::theme::Palette;
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
+const LINK_PREVIEW_DELAY: Duration = Duration::from_millis(120);
 const INITIAL_DOCUMENT_ID: DocumentId = 1;
 const PAGE_BACKGROUND_Z_INDEX: i32 = i32::MIN / 2 - 3;
 const PAGE_IMAGE_Z_INDEX: i32 = i32::MIN / 2 - 2;
 const PAGE_BACKGROUND_IMAGE_ID: u32 = u32::MAX - 2;
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
+
+fn synchronized_output<W, T, E>(
+    output: &mut W,
+    operation: impl FnOnce(&mut W) -> Result<T, E>,
+) -> Result<T, E>
+where
+    W: Write,
+    E: From<io::Error>,
+{
+    output
+        .write_all(BEGIN_SYNCHRONIZED_UPDATE)
+        .map_err(E::from)?;
+    let operation_result = operation(output);
+    let finish_result = output
+        .write_all(END_SYNCHRONIZED_UPDATE)
+        .and_then(|()| output.flush());
+    match operation_result {
+        Ok(value) => {
+            finish_result.map_err(E::from)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = finish_result;
+            Err(error)
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -108,11 +138,17 @@ pub fn run(
                     request_id,
                     scanned,
                     total,
+                    matches,
+                    total_occurrences,
                 } => app.receive_search_progress(
                     document_id,
-                    request_id,
-                    scanned,
-                    total,
+                    SearchProgressUpdate {
+                        request_id,
+                        scanned,
+                        total,
+                        matches,
+                        total_occurrences,
+                    },
                     &mut output,
                 )?,
                 WorkerMessage::SearchResults {
@@ -148,6 +184,7 @@ pub fn run(
             }
         }
         app.poll_file_change(&mut output)?;
+        app.poll_link_preview(&mut output)?;
 
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
@@ -198,9 +235,11 @@ struct App {
     default_invert: bool,
     goto_input: Option<String>,
     search_input: Option<String>,
+    search_picker: Option<SearchPickerState>,
     next_search_request_id: u64,
     next_link_request_id: u64,
     link_mode: bool,
+    pending_link_picker_open: bool,
     link_picker: Option<LinkPickerState>,
     persistent_link_picker: bool,
     link_picker_geometry: LinkPickerGeometry,
@@ -276,7 +315,7 @@ struct Tab {
     link_index: LinkIndexState,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ViewPosition {
     page: u32,
     scroll_x: u32,
@@ -294,8 +333,25 @@ struct LinkPickerState {
     page: u32,
     selected: usize,
     number_input: String,
+    filter: String,
+    filtering: bool,
+    focus: LinkPickerFocus,
     selection_key: Option<(u32, u32)>,
     awaiting_current_page: bool,
+    pending_preview: Option<PendingLinkPreview>,
+    preview_origin: Option<ViewPosition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingLinkPreview {
+    selection_key: (u32, u32),
+    ready_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinkPickerFocus {
+    Document,
+    Links,
 }
 
 #[derive(Default)]
@@ -327,12 +383,38 @@ struct LinkIndexProgress {
     indexing: bool,
 }
 
+#[derive(Clone, Copy)]
+struct LinkPickerDocument<'a> {
+    links: &'a [DocumentLink],
+    outline: &'a [OutlineItem],
+}
+
+impl<'a> LinkPickerDocument<'a> {
+    const fn new(links: &'a [DocumentLink], outline: &'a [OutlineItem]) -> Self {
+        Self { links, outline }
+    }
+}
+
 struct LinkIndexUpdate {
     request_id: u64,
     links: Vec<DocumentLink>,
     scanned: u32,
     total: u32,
     complete: bool,
+}
+
+struct SearchProgressUpdate {
+    request_id: u64,
+    scanned: u32,
+    total: u32,
+    matches: Vec<SearchPageMatch>,
+    total_occurrences: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PickerFilter<'a> {
+    query: &'a str,
+    active: bool,
 }
 
 impl From<&LinkIndexState> for LinkIndexProgress {
@@ -351,8 +433,13 @@ impl LinkPickerState {
             page,
             selected: 0,
             number_input: String::new(),
+            filter: String::new(),
+            filtering: false,
+            focus: LinkPickerFocus::Links,
             selection_key: None,
             awaiting_current_page: true,
+            pending_preview: None,
+            preview_origin: None,
         }
     }
 
@@ -429,7 +516,7 @@ impl PerformanceSnapshot {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SearchState {
     query: String,
     request_id: u64,
@@ -438,6 +525,42 @@ struct SearchState {
     scanned: u32,
     total_pages: u32,
     searching: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchPickerState {
+    page: u32,
+    selected: usize,
+    focus: LinkPickerFocus,
+    awaiting_initial_result: bool,
+}
+
+impl SearchPickerState {
+    const fn new(page: u32) -> Self {
+        Self {
+            page,
+            selected: 0,
+            focus: LinkPickerFocus::Links,
+            awaiting_initial_result: true,
+        }
+    }
+
+    fn sync(&mut self, page: u32, matches: &[SearchPageMatch]) {
+        self.page = page;
+        if matches.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        if self.awaiting_initial_result {
+            self.selected = matches
+                .iter()
+                .position(|result| result.page >= page)
+                .unwrap_or(0);
+            self.awaiting_initial_result = false;
+        } else {
+            self.selected = self.selected.min(matches.len() - 1);
+        }
+    }
 }
 
 impl SearchState {
@@ -623,9 +746,11 @@ impl App {
             default_invert,
             goto_input: None,
             search_input: None,
+            search_picker: None,
             next_search_request_id: 1,
             next_link_request_id: 1,
             link_mode: false,
+            pending_link_picker_open: false,
             link_picker: None,
             persistent_link_picker: defaults.persistent_link_picker,
             link_picker_geometry: defaults.link_picker_geometry,
@@ -694,6 +819,7 @@ impl App {
                 tab.pending_destination = None;
                 tab.link_index = LinkIndexState::new(pages);
                 if index == self.active_tab {
+                    self.search_picker = None;
                     self.reset_render_state();
                     self.ensure_link_index();
                     self.request_current(output)?;
@@ -1031,26 +1157,31 @@ impl App {
             searching: true,
         };
         self.worker.search(document_id, request_id, query);
-        self.request_current(output)
+        self.search_picker = Some(SearchPickerState::new(self.tab().page));
+        self.open_search_picker(output)
     }
 
     fn receive_search_progress(
         &mut self,
         document_id: DocumentId,
-        request_id: u64,
-        scanned: u32,
-        total: u32,
+        update: SearchProgressUpdate,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let Some(index) = self.tab_index(document_id) else {
             return Ok(());
         };
-        if self.tabs[index].search.request_id != request_id {
+        if self.tabs[index].search.request_id != update.request_id {
             return Ok(());
         }
-        self.tabs[index].search.scanned = scanned;
-        self.tabs[index].search.total_pages = total;
+        let search = &mut self.tabs[index].search;
+        search.scanned = update.scanned;
+        search.total_pages = update.total;
+        search.matches = update.matches;
+        search.total_occurrences = update.total_occurrences;
         if index == self.active_tab {
+            if self.search_picker.is_some() {
+                self.redraw_search_picker(output)?;
+            }
             self.draw_status(output, self.viewport()?, "")?;
         }
         Ok(())
@@ -1084,6 +1215,9 @@ impl App {
 
         if index != self.active_tab {
             return Ok(());
+        }
+        if let Some(state) = &mut self.search_picker {
+            state.sync(current_page, &self.tabs[index].search.matches);
         }
         if let Some(page) = target_page {
             self.tabs[index].page = page;
@@ -1147,6 +1281,9 @@ impl App {
         let document_id = self.tab().document_id;
         let request_id = self.tab().search.request_id;
         self.worker.cancel_search(document_id, request_id);
+        if self.search_picker.is_some() {
+            self.close_search_picker(output)?;
+        }
         self.tab_mut().search = SearchState::default();
         self.request_current(output)?;
         Ok(true)
@@ -1169,12 +1306,20 @@ impl App {
             execute!(output, DisableMouseCapture)?;
         }
         self.link_mode = enabled;
+        self.pending_link_picker_open = enabled;
         self.ensure_link_index();
-        self.request_current(output)
+        self.request_current(output)?;
+        self.open_pending_link_picker(output)
     }
 
     fn ensure_link_index(&mut self) {
-        if !self.link_mode || self.tab().link_index.started() {
+        if self.link_mode {
+            self.start_link_index();
+        }
+    }
+
+    fn start_link_index(&mut self) {
+        if self.tab().link_index.started() {
             return;
         }
         let request_id = self.next_link_request_id;
@@ -1191,11 +1336,114 @@ impl App {
         self.worker.index_links(document_id, request_id);
     }
 
+    fn schedule_link_preview(&mut self) {
+        let Some(state) = &mut self.link_picker else {
+            return;
+        };
+        let Some(selection_key) = state.selection_key else {
+            return;
+        };
+        state.pending_preview = Some(PendingLinkPreview {
+            selection_key,
+            ready_at: Instant::now() + LINK_PREVIEW_DELAY,
+        });
+    }
+
+    fn poll_link_preview(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        let Some(pending) = self
+            .link_picker
+            .as_ref()
+            .and_then(|state| state.pending_preview)
+        else {
+            return Ok(());
+        };
+        if Instant::now() < pending.ready_at {
+            return Ok(());
+        }
+
+        let selected = {
+            let Some(state) = &mut self.link_picker else {
+                return Ok(());
+            };
+            state.pending_preview = None;
+            if state.selection_key != Some(pending.selection_key) {
+                return Ok(());
+            }
+            state.selected
+        };
+        let Some(link) = self.tab().link_index.links.get(selected).cloned() else {
+            return Ok(());
+        };
+        let origin = ViewPosition {
+            page: self.tab().page,
+            scroll_x: self.tab().scroll_x,
+            scroll_y: self.tab().scroll_y,
+        };
+        let state = self.link_picker.as_mut().expect("link picker state");
+        state.preview_origin.get_or_insert(origin);
+        state.page = link.source_page;
+        state.awaiting_current_page = false;
+
+        let tab = self.tab_mut();
+        tab.page = link.source_page;
+        tab.scroll_x = 0;
+        tab.scroll_y = 0;
+        tab.pending_destination = Some(LinkDestination {
+            page: link.source_page,
+            top_ratio: Some((link.source_top_ratio - 0.08).max(0.0)),
+        });
+        self.request_current(output)
+    }
+
+    fn handle_link_picker_pointer(
+        &mut self,
+        mouse: MouseEvent,
+        output: &mut impl Write,
+    ) -> Result<bool, AppError> {
+        let area = link_picker_area(self.viewport()?);
+        let links = self.tab().link_index.links.clone();
+        let outline = Arc::clone(&self.tab().outline);
+        let Some(state) = self.link_picker.as_ref() else {
+            return Ok(false);
+        };
+        let Some(selected) = link_picker_link_at_position(
+            area,
+            LinkPickerDocument::new(&links, &outline),
+            state,
+            self.link_picker_geometry,
+            mouse.column,
+            mouse.row,
+        ) else {
+            return Ok(false);
+        };
+        if state.selected == selected && state.focus == LinkPickerFocus::Links {
+            if state.pending_preview.is_none() && state.preview_origin.is_none() {
+                self.schedule_link_preview();
+            }
+            return Ok(true);
+        }
+        let state = self.link_picker.as_mut().expect("link picker state");
+        state.focus = LinkPickerFocus::Links;
+        state.select(selected, &links);
+        self.schedule_link_preview();
+        self.redraw_link_picker(output)?;
+        Ok(true)
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, output: &mut impl Write) -> Result<(), AppError> {
-        if !self.link_mode
-            || mouse.kind != MouseEventKind::Down(MouseButton::Left)
-            || self.pending_open.is_some()
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        if self.link_picker.is_some()
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.handle_link_picker_pointer(mouse, output)?
         {
+            return Ok(());
+        }
+        if !self.link_mode || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return Ok(());
         }
         let viewport = self.viewport()?;
@@ -1210,7 +1458,7 @@ impl App {
             self.tab().scroll_x,
             self.tab().scroll_y,
         );
-        let (placement, image_top) = if self.link_picker.is_some() {
+        let (placement, image_top) = if self.link_picker.is_some() || self.search_picker.is_some() {
             let Some(image_id) = self.visible_image_id else {
                 return Ok(());
             };
@@ -1247,6 +1495,12 @@ impl App {
             self.draw_status(output, viewport, "no link here")?;
             return Ok(());
         };
+        if let Some(state) = &mut self.link_picker
+            && matches!(&target, LinkTarget::Internal { .. })
+        {
+            state.pending_preview = None;
+            state.preview_origin = None;
+        }
         if self.link_picker.is_some() && !self.persistent_link_picker {
             self.close_link_picker(output)?;
         }
@@ -1299,10 +1553,10 @@ impl App {
     }
 
     fn open_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if !self.link_mode || self.pending_open.is_some() {
+        if self.pending_open.is_some() {
             return Ok(());
         }
-        self.ensure_link_index();
+        self.start_link_index();
         let viewport = self.viewport()?;
         let key = self.tab().render_key(viewport, self.link_mode);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
@@ -1317,6 +1571,10 @@ impl App {
         let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
         let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
 
+        if !self.link_mode {
+            execute!(output, EnableMouseCapture)?;
+        }
+        self.pending_link_picker_open = false;
         self.link_picker = Some(LinkPickerState::new(self.tab().page));
         show_link_picker_split(
             output,
@@ -1328,6 +1586,22 @@ impl App {
         self.redraw_link_picker(output)
     }
 
+    fn open_pending_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if !self.pending_link_picker_open
+            || !self.link_mode
+            || self.link_picker.is_some()
+            || self.pending_open.is_some()
+        {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let key = self.tab().render_key(viewport, self.link_mode);
+        if !self.tab().cache.contains_key(&key) || self.visible_image_id.is_none() {
+            return Ok(());
+        }
+        self.open_link_picker(output)
+    }
+
     fn redraw_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let Some(_) = self.link_picker else {
             return Ok(());
@@ -1335,6 +1609,7 @@ impl App {
         let viewport = self.viewport()?;
         let page = self.tab().page;
         let links = self.tab().link_index.links.clone();
+        let outline = Arc::clone(&self.tab().outline);
         let progress = LinkIndexProgress::from(&self.tab().link_index);
         let state = self.link_picker.as_mut().expect("link picker state");
         state.sync(page, &links, progress.indexing);
@@ -1342,7 +1617,7 @@ impl App {
         draw_link_picker_terminal(
             output,
             link_picker_area(viewport),
-            &links,
+            LinkPickerDocument::new(&links, &outline),
             &state,
             progress,
             self.link_picker_geometry,
@@ -1351,8 +1626,77 @@ impl App {
         Ok(())
     }
 
+    fn set_link_picker_layout(
+        &mut self,
+        layout: LinkPickerLayout,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if self.link_picker.is_none() && self.search_picker.is_none() {
+            return Ok(());
+        }
+        if self.link_picker_geometry.layout == layout {
+            return self.redraw_active_side_picker(output);
+        }
+        let viewport = self.viewport()?;
+        let area = link_picker_area(viewport);
+        let previous = self.link_picker_geometry;
+        let key = self.tab().render_key(viewport, self.link_mode);
+        let frame = self.tab().cache.get(&key).cloned();
+        let image_id = self.visible_image_id;
+        self.link_picker_geometry.layout = layout;
+        if layout == LinkPickerLayout::Floating
+            && let Some(state) = &mut self.link_picker
+        {
+            state.focus = LinkPickerFocus::Links;
+        }
+        if layout == LinkPickerLayout::Floating
+            && let Some(state) = &mut self.search_picker
+        {
+            state.focus = LinkPickerFocus::Links;
+        }
+        if let (Some(frame), Some(image_id)) = (frame, image_id) {
+            let tab = self.tab();
+            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
+            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
+            restore_link_picker_split(output, area, image, previous, self.theme)?;
+            show_link_picker_split(output, area, image, self.link_picker_geometry, self.theme)?;
+            self.redraw_active_side_picker(output)
+        } else {
+            self.reset_render_state();
+            self.request_current(output)
+        }
+    }
+
+    fn cycle_link_picker_layout(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let area = link_picker_area(self.viewport()?);
+        let layout = next_link_picker_layout(area, self.link_picker_geometry.layout);
+        self.set_link_picker_layout(layout, output)
+    }
+
+    fn redraw_active_side_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.link_picker.is_some() {
+            self.redraw_link_picker(output)
+        } else {
+            self.redraw_search_picker(output)
+        }
+    }
+
     fn close_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.link_picker.take().is_none() {
+        let Some(state) = self.link_picker.take() else {
+            return Ok(());
+        };
+        if !self.link_mode {
+            execute!(output, DisableMouseCapture)?;
+        }
+        if let Some(origin) = state.preview_origin {
+            let tab = self.tab_mut();
+            tab.page = origin.page.min(tab.page_count - 1);
+            tab.scroll_x = origin.scroll_x;
+            tab.scroll_y = origin.scroll_y;
+            tab.pending_destination = None;
+            self.clear_viewer(output)?;
+            self.reset_render_state();
+            self.request_current(output)?;
             return Ok(());
         }
         let viewport = self.viewport()?;
@@ -1377,107 +1721,391 @@ impl App {
         Ok(())
     }
 
+    fn close_link_picker_and_exit_link_mode(
+        &mut self,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        self.close_link_picker(output)?;
+        if self.link_mode {
+            self.set_link_mode(false, output)?;
+        }
+        Ok(())
+    }
+
+    fn open_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let key = self.tab().render_key(viewport, self.link_mode);
+        let frame = self.tab().cache.get(&key).cloned();
+        let image_id = self.visible_image_id;
+        if let (Some(frame), Some(image_id)) = (frame, image_id) {
+            let tab = self.tab();
+            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
+            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
+            show_link_picker_split(
+                output,
+                link_picker_area(viewport),
+                image,
+                self.link_picker_geometry,
+                self.theme,
+            )?;
+            self.redraw_search_picker(output)
+        } else {
+            self.reset_render_state();
+            self.request_current(output)
+        }
+    }
+
+    fn redraw_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let Some(_) = self.search_picker else {
+            return Ok(());
+        };
+        let viewport = self.viewport()?;
+        let page = self.tab().page;
+        let search = self.tab().search.clone();
+        let outline = Arc::clone(&self.tab().outline);
+        let state = self.search_picker.as_mut().expect("search picker state");
+        state.sync(page, &search.matches);
+        let state = state.clone();
+        draw_search_picker_terminal(
+            output,
+            link_picker_area(viewport),
+            &search,
+            &outline,
+            &state,
+            self.link_picker_geometry,
+            self.theme,
+        )?;
+        Ok(())
+    }
+
+    fn close_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.search_picker.take().is_none() {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let key = self.tab().render_key(viewport, self.link_mode);
+        let frame = self.tab().cache.get(&key).cloned();
+        let image_id = self.visible_image_id;
+        if let (Some(frame), Some(image_id)) = (frame, image_id) {
+            let tab = self.tab();
+            let placement = viewport.place(frame.width, frame.height, tab.scroll_x, tab.scroll_y);
+            let image = LinkPickerImage::new(image_id, &frame, placement, viewport);
+            restore_link_picker_split(
+                output,
+                link_picker_area(viewport),
+                image,
+                self.link_picker_geometry,
+                self.theme,
+            )?;
+        } else {
+            self.reset_render_state();
+            self.request_current(output)?;
+        }
+        Ok(())
+    }
+
+    fn handle_search_picker_key(
+        &mut self,
+        key: KeyEvent,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let area = link_picker_area(self.viewport()?);
+        let layout = resolved_link_picker_layout(area, self.link_picker_geometry.layout);
+        if let Some(focus) = link_picker_focus_for_key(
+            self.search_picker
+                .as_ref()
+                .expect("search picker state")
+                .focus,
+            layout,
+            key,
+        ) {
+            self.search_picker
+                .as_mut()
+                .expect("search picker state")
+                .focus = focus;
+            return self.redraw_search_picker(output);
+        }
+        match key.code {
+            KeyCode::Esc => return self.close_search_picker(output),
+            KeyCode::Char('/') => {
+                self.close_search_picker(output)?;
+                return self.begin_search(output);
+            }
+            KeyCode::Char('s') => return self.cycle_link_picker_layout(output),
+            KeyCode::Char('a') => {
+                return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
+            }
+            _ => {}
+        }
+        if self
+            .search_picker
+            .as_ref()
+            .is_some_and(|state| state.focus == LinkPickerFocus::Document)
+        {
+            return self.handle_link_picker_document_key(key, output);
+        }
+
+        let visible_height = link_picker_visible_height(area, self.link_picker_geometry);
+        let matches = self.tab().search.matches.clone();
+        let selected = self
+            .search_picker
+            .as_ref()
+            .expect("search picker state")
+            .selected;
+        if let Some(next) =
+            link_picker_navigation_index(selected, matches.len(), key, visible_height)
+        {
+            self.search_picker
+                .as_mut()
+                .expect("search picker state")
+                .selected = next;
+            self.redraw_search_picker(output)?;
+        } else if key.code == KeyCode::Enter
+            && let Some(result) = matches.get(selected)
+        {
+            self.set_page(result.page, output)?;
+        }
+        Ok(())
+    }
+
     fn handle_link_picker_key(
         &mut self,
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        match key.code {
-            KeyCode::Esc => return self.close_link_picker(output),
-            KeyCode::Char('L') => {
-                self.close_link_picker(output)?;
-                return self.set_link_mode(false, output);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let filtering = self
+            .link_picker
+            .as_ref()
+            .is_some_and(|state| state.filtering);
+        let has_filter = self
+            .link_picker
+            .as_ref()
+            .is_some_and(|state| !state.filter.is_empty());
+        let area = link_picker_area(self.viewport()?);
+        let layout = resolved_link_picker_layout(area, self.link_picker_geometry.layout);
+        if !filtering
+            && let Some(focus) = link_picker_focus_for_key(
+                self.link_picker.as_ref().expect("link picker state").focus,
+                layout,
+                key,
+            )
+        {
+            let state = self.link_picker.as_mut().expect("link picker state");
+            state.focus = focus;
+            if focus == LinkPickerFocus::Document {
+                state.pending_preview = None;
             }
-            KeyCode::Char('b') => {
+            return self.redraw_link_picker(output);
+        }
+        match key.code {
+            KeyCode::Esc if filtering || has_filter => {
+                let state = self.link_picker.as_mut().expect("link picker state");
+                state.filter.clear();
+                state.filtering = false;
+                state.number_input.clear();
+                state.awaiting_current_page = true;
+                return self.redraw_link_picker(output);
+            }
+            KeyCode::Esc => return self.close_link_picker(output),
+            KeyCode::Char('/') if !filtering && !control && !alt => {
+                let state = self.link_picker.as_mut().expect("link picker state");
+                state.filtering = true;
+                state.focus = LinkPickerFocus::Links;
+                state.number_input.clear();
+                return self.redraw_link_picker(output);
+            }
+            KeyCode::Char('s') if !filtering => return self.cycle_link_picker_layout(output),
+            KeyCode::Char('a') if !filtering => {
+                return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
+            }
+            KeyCode::Char('L') if !filtering => {
+                return self.close_link_picker_and_exit_link_mode(output);
+            }
+            KeyCode::Char('q') if !filtering => {
+                return self.close_link_picker_and_exit_link_mode(output);
+            }
+            KeyCode::Char('b') if !filtering && !control && !alt => {
                 self.follow_link_back(output)?;
                 return Ok(());
             }
             _ => {}
         }
 
+        if self
+            .link_picker
+            .as_ref()
+            .is_some_and(|state| state.focus == LinkPickerFocus::Document)
+        {
+            return self.handle_link_picker_document_key(key, output);
+        }
+
         let viewport = self.viewport()?;
         let links = self.tab().link_index.links.clone();
-        let link_count = links.len();
         let indexing = self.tab().link_index.indexing;
         let page = self.tab().page;
         let visible_height =
             link_picker_visible_height(link_picker_area(viewport), self.link_picker_geometry);
         let state = self.link_picker.as_mut().expect("link picker state");
         state.sync(page, &links, indexing);
+        let selected_before = state.selected;
 
-        let mut redraw = true;
-        let mut target = None;
-        match key.code {
-            KeyCode::Enter => {
-                target = links.get(state.selected).map(|link| link.target.clone());
-                state.number_input.clear();
-                redraw = false;
-            }
-            KeyCode::Down | KeyCode::Char('j') if link_count > 0 => {
-                let selected = if state.selected + 1 == link_count {
-                    0
-                } else {
-                    state.selected + 1
-                };
-                state.select(selected, &links);
-                state.number_input.clear();
-            }
-            KeyCode::Up | KeyCode::Char('k') if link_count > 0 => {
-                let selected = if state.selected == 0 {
-                    link_count - 1
-                } else {
-                    state.selected - 1
-                };
-                state.select(selected, &links);
-                state.number_input.clear();
-            }
-            KeyCode::Home if link_count > 0 => {
-                state.select(0, &links);
-                state.number_input.clear();
-            }
-            KeyCode::End if link_count > 0 => {
-                state.select(link_count - 1, &links);
-                state.number_input.clear();
-            }
-            KeyCode::PageDown if link_count > 0 => {
-                state.select(
-                    (state.selected + visible_height).min(link_count - 1),
-                    &links,
-                );
-                state.number_input.clear();
-            }
-            KeyCode::PageUp if link_count > 0 => {
-                state.select(state.selected.saturating_sub(visible_height), &links);
-                state.number_input.clear();
-            }
-            KeyCode::Backspace => {
-                state.number_input.pop();
-                if let Some(index) = link_number_index(&state.number_input, link_count) {
-                    state.select(index, &links);
+        let input_consumed = if state.filtering {
+            match key.code {
+                KeyCode::Enter => {
+                    state.filtering = false;
+                    false
                 }
-            }
-            KeyCode::Char(digit) if digit.is_ascii_digit() => {
-                if let Some(index) =
-                    update_link_number_selection(&mut state.number_input, digit, link_count)
-                {
-                    state.select(index, &links);
+                KeyCode::Backspace => {
+                    state.filter.pop();
+                    true
                 }
+                KeyCode::Char(character) if !control && !alt => {
+                    state.filter.push(character);
+                    true
+                }
+                _ => false,
             }
-            _ => redraw = false,
+        } else {
+            false
+        };
+        let filtered = filter_document_links(&links, &state.filter);
+        if !filtered.contains(&state.selected)
+            && let Some(first) = filtered.first().copied()
+        {
+            state.select(first, &links);
         }
+        let selected_position = filtered
+            .iter()
+            .position(|index| *index == state.selected)
+            .unwrap_or(0);
+        let navigation = (!input_consumed)
+            .then(|| {
+                link_picker_navigation_index(selected_position, filtered.len(), key, visible_height)
+            })
+            .flatten();
+        let mut explicit_selection = navigation.is_some();
+        let mut redraw = navigation.is_some();
+        let mut target = None;
+        if input_consumed {
+            redraw = true;
+        } else if let Some(selected) = navigation {
+            state.select(filtered[selected], &links);
+            state.number_input.clear();
+        } else {
+            match key.code {
+                KeyCode::Enter => {
+                    target = filtered
+                        .get(selected_position)
+                        .and_then(|index| links.get(*index))
+                        .map(|link| link.target.clone());
+                    state.number_input.clear();
+                    redraw = false;
+                }
+                KeyCode::Backspace => {
+                    state.number_input.pop();
+                    if let Some(index) = link_number_index(&state.number_input, filtered.len()) {
+                        state.select(filtered[index], &links);
+                        explicit_selection = true;
+                    }
+                    redraw = true;
+                }
+                KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                    if let Some(index) =
+                        update_link_number_selection(&mut state.number_input, digit, filtered.len())
+                    {
+                        state.select(filtered[index], &links);
+                        explicit_selection = true;
+                    }
+                    redraw = true;
+                }
+                _ => redraw = false,
+            }
+        }
+        let selection_changed = state.selected != selected_before;
 
         if let Some(target) = target {
+            if matches!(&target, LinkTarget::Internal { .. }) {
+                let state = self.link_picker.as_mut().expect("link picker state");
+                state.pending_preview = None;
+                state.preview_origin = None;
+            }
             if !self.persistent_link_picker {
                 self.close_link_picker(output)?;
             }
             self.follow_link(target, output)?;
         } else if redraw {
+            if selection_changed || explicit_selection {
+                self.schedule_link_preview();
+            }
             self.redraw_link_picker(output)?;
         }
         Ok(())
     }
 
+    fn handle_link_picker_document_key(
+        &mut self,
+        key: KeyEvent,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if matches!(
+            key.code,
+            KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Up
+                | KeyCode::Char('k')
+                | KeyCode::PageDown
+                | KeyCode::Char(' ')
+                | KeyCode::PageUp
+                | KeyCode::Backspace
+                | KeyCode::Right
+                | KeyCode::Left
+                | KeyCode::Char('g')
+                | KeyCode::Home
+                | KeyCode::Char('G')
+                | KeyCode::End
+                | KeyCode::Char('m')
+                | KeyCode::Char('i')
+        ) {
+            let state = self.link_picker.as_mut().expect("link picker state");
+            state.pending_preview = None;
+            state.preview_origin = None;
+        }
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_view(Axis::Vertical, true, false, output)?
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_view(Axis::Vertical, false, false, output)?
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.move_view(Axis::Vertical, true, true, output)?
+            }
+            KeyCode::PageUp | KeyCode::Backspace => {
+                self.move_view(Axis::Vertical, false, true, output)?
+            }
+            KeyCode::Right => self.move_view(Axis::Horizontal, true, false, output)?,
+            KeyCode::Left => self.move_view(Axis::Horizontal, false, false, output)?,
+            KeyCode::Char('g') | KeyCode::Home => self.set_page(0, output)?,
+            KeyCode::Char('G') | KeyCode::End => {
+                self.set_page(self.tab().page_count - 1, output)?
+            }
+            KeyCode::Char('m') => self.cycle_fit(output)?,
+            KeyCode::Char('i') => self.toggle_invert(output)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
+        if self.search_picker.is_some() {
+            self.handle_search_picker_key(key, output)?;
+            return Ok(false);
+        }
         if self.link_picker.is_some() {
             self.handle_link_picker_key(key, output)?;
             return Ok(false);
@@ -1490,8 +2118,13 @@ impl App {
             self.handle_goto_key(key, output)?;
             return Ok(false);
         }
+        if let Some(index) = numbered_tab_index(key) {
+            self.select_tab(index, output)?;
+            return Ok(false);
+        }
         match key.code {
             KeyCode::Char('?') => self.open_help(output)?,
+            KeyCode::Char('q') if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Char('q') => return self.close_current(output),
             KeyCode::Char(':') => self.begin_goto(output)?,
             KeyCode::Char('/') => self.begin_search(output)?,
@@ -1499,7 +2132,7 @@ impl App {
             KeyCode::Char('N') => self.navigate_search(false, output)?,
             KeyCode::Char('L') => self.toggle_link_mode(output)?,
             KeyCode::Char('b') => self.follow_link_back(output)?,
-            KeyCode::Enter if self.link_mode => self.open_link_picker(output)?,
+            KeyCode::Enter => self.open_link_picker(output)?,
             KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
@@ -1726,12 +2359,24 @@ impl App {
             if current_key == key {
                 self.draw_frame(&frame, viewport, output)?;
                 self.prefetch_neighbors(key);
+                self.open_pending_link_picker(output)?;
             }
         }
         Ok(())
     }
 
     fn draw_frame(
+        &mut self,
+        frame: &Frame,
+        viewport: Viewport,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        synchronized_output(output, |output| {
+            self.draw_frame_unsynchronized(frame, viewport, output)
+        })
+    }
+
+    fn draw_frame_unsynchronized(
         &mut self,
         frame: &Frame,
         viewport: Viewport,
@@ -1764,7 +2409,7 @@ impl App {
                 crop: placement.crop,
             },
         };
-        let positioned = if self.link_picker.is_some() {
+        let positioned = if self.link_picker.is_some() || self.search_picker.is_some() {
             let area = link_picker_area(viewport);
             let (preview, _) = link_picker_panes(area, self.link_picker_geometry);
             position_link_picker_image(
@@ -1801,16 +2446,30 @@ impl App {
         self.performance_snapshot = Some(snapshot);
         let state = snapshot.status(self.show_performance, self.link_mode);
         let links = self.tab().link_index.links.clone();
+        let outline = Arc::clone(&self.tab().outline);
         let progress = LinkIndexProgress::from(&self.tab().link_index);
+        let search = self.tab().search.clone();
         if let Some(link_picker) = &mut self.link_picker {
             link_picker.sync(frame.key.page, &links, progress.indexing);
             let link_picker = link_picker.clone();
-            draw_link_picker_terminal(
+            draw_link_picker_terminal_unsynchronized(
                 output,
                 link_picker_area(viewport),
-                &links,
+                LinkPickerDocument::new(&links, &outline),
                 &link_picker,
                 progress,
+                self.link_picker_geometry,
+                self.theme,
+            )?;
+        } else if let Some(search_picker) = &mut self.search_picker {
+            search_picker.sync(frame.key.page, &search.matches);
+            let search_picker = search_picker.clone();
+            draw_search_picker_terminal_unsynchronized(
+                output,
+                link_picker_area(viewport),
+                &search,
+                &outline,
+                &search_picker,
                 self.link_picker_geometry,
                 self.theme,
             )?;
@@ -1921,7 +2580,15 @@ impl App {
         if self.tabs.len() < 2 || self.pending_open.is_some() {
             return Ok(());
         }
-        self.active_tab = cycled_tab_index(self.active_tab, self.tabs.len(), direction);
+        let index = cycled_tab_index(self.active_tab, self.tabs.len(), direction);
+        self.select_tab(index, output)
+    }
+
+    fn select_tab(&mut self, index: usize, output: &mut impl Write) -> Result<(), AppError> {
+        if index >= self.tabs.len() || index == self.active_tab || self.pending_open.is_some() {
+            return Ok(());
+        }
+        self.active_tab = index;
         self.clear_viewer(output)?;
         self.reset_render_state();
         self.ensure_link_index();
@@ -2132,6 +2799,16 @@ fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
     }
 }
 
+fn numbered_tab_index(key: KeyEvent) -> Option<usize> {
+    let digit = match key.code {
+        KeyCode::Char(digit) if ('1'..='9').contains(&digit) => digit,
+        _ => return None,
+    };
+    key.modifiers
+        .contains(KeyModifiers::ALT)
+        .then(|| usize::from(digit as u8 - b'1'))
+}
+
 fn pick_pdf(
     directory: PathBuf,
     output: &mut impl Write,
@@ -2144,6 +2821,7 @@ fn pick_pdf(
     let mut terminal = Terminal::new(backend)?;
     let mut redraw = true;
     let mut visible_height = 1;
+    let mut filtering = false;
 
     let selection = loop {
         if browser.poll_recursive() {
@@ -2154,7 +2832,7 @@ fn pick_pdf(
             let area = terminal.size()?;
             visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
             browser.adjust_scroll(visible_height);
-            terminal.draw(|frame| draw_picker(frame, &browser, theme))?;
+            terminal.draw(|frame| draw_picker(frame, &browser, filtering, theme))?;
             redraw = false;
         }
 
@@ -2172,25 +2850,32 @@ fn pick_pdf(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if apply_picker_navigation(&mut browser, key, visible_height) {
+        if apply_picker_navigation(&mut browser, key, visible_height, filtering) {
             redraw = true;
             continue;
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Esc => break None,
+            KeyCode::Esc if filtering => {
+                clear_picker_filter(&mut browser);
+                filtering = false;
+            }
+            KeyCode::Esc if !clear_picker_filter(&mut browser) => break None,
+            KeyCode::Esc => {}
+            KeyCode::Char('/') if !control && !alt => filtering = true,
             KeyCode::Enter => {
                 if let Some(path) = browser.enter_selected() {
                     break Some(path);
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if filtering => {
                 browser.filter.pop();
                 browser.rebuild_filter();
                 browser.select_first();
                 browser.scroll_offset = 0;
             }
-            KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char(character) if filtering && !control && !alt => {
                 browser.filter.push(character);
                 browser.rebuild_filter();
                 browser.select_first();
@@ -2254,7 +2939,13 @@ fn pick_theme(
     current: usize,
     output: &mut impl Write,
 ) -> Result<Option<usize>, AppError> {
-    let mut selected = current.min(themes.len().saturating_sub(1));
+    let mut filter = String::new();
+    let mut filtered = filter_theme_indices(themes, &filter);
+    let mut selected = filtered
+        .iter()
+        .position(|index| *index == current)
+        .unwrap_or(0);
+    let mut filtering = false;
     let backend = CrosstermBackend::new(&mut *output);
     let mut terminal = Terminal::new(backend)?;
     let mut redraw = true;
@@ -2264,8 +2955,10 @@ fn pick_theme(
         if redraw {
             terminal.autoresize()?;
             let area = terminal.size()?;
-            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(3).max(1));
-            terminal.draw(|frame| draw_theme_picker(frame, themes, selected))?;
+            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
+            terminal.draw(|frame| {
+                draw_theme_picker(frame, themes, &filtered, selected, &filter, filtering)
+            })?;
             redraw = false;
         }
 
@@ -2283,20 +2976,55 @@ fn pick_theme(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        let last = themes.len().saturating_sub(1);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let last = filtered.len().saturating_sub(1);
         match key.code {
+            KeyCode::Esc if filtering => {
+                let actual = filtered.get(selected).copied().unwrap_or(current);
+                filter.clear();
+                filtered = filter_theme_indices(themes, &filter);
+                selected = filtered
+                    .iter()
+                    .position(|index| *index == actual)
+                    .unwrap_or(0);
+                filtering = false;
+            }
             KeyCode::Esc => break None,
-            KeyCode::Enter => break Some(selected),
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Char('/') if !control && !alt => filtering = true,
+            KeyCode::Enter => break filtered.get(selected).copied(),
+            KeyCode::Down => {
                 selected = if selected == last { 0 } else { selected + 1 };
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 selected = if selected == 0 { last } else { selected - 1 };
             }
+            KeyCode::Char('j') if !filtering => {
+                selected = if selected == last { 0 } else { selected + 1 };
+            }
+            KeyCode::Char('k') if !filtering => {
+                selected = if selected == 0 { last } else { selected - 1 };
+            }
+            KeyCode::Char('f') if control => {
+                selected = (selected + visible_height).min(last);
+            }
+            KeyCode::Char('b') if control => selected = selected.saturating_sub(visible_height),
+            KeyCode::Char('g') if !filtering && !control && !alt => selected = 0,
+            KeyCode::Char('G') if !filtering && !control && !alt => selected = last,
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = last,
             KeyCode::PageDown => selected = (selected + visible_height).min(last),
             KeyCode::PageUp => selected = selected.saturating_sub(visible_height),
+            KeyCode::Backspace if filtering => {
+                filter.pop();
+                filtered = filter_theme_indices(themes, &filter);
+                selected = 0;
+            }
+            KeyCode::Char(character) if filtering && !control && !alt => {
+                filter.push(character);
+                filtered = filter_theme_indices(themes, &filter);
+                selected = 0;
+            }
             _ => continue,
         }
         redraw = true;
@@ -2308,7 +3036,23 @@ fn pick_theme(
 fn draw_link_picker_terminal(
     output: &mut impl Write,
     area: Rect,
-    links: &[DocumentLink],
+    document: LinkPickerDocument<'_>,
+    state: &LinkPickerState,
+    progress: LinkIndexProgress,
+    geometry: LinkPickerGeometry,
+    theme: Palette,
+) -> io::Result<()> {
+    synchronized_output(output, |output| {
+        draw_link_picker_terminal_unsynchronized(
+            output, area, document, state, progress, geometry, theme,
+        )
+    })
+}
+
+fn draw_link_picker_terminal_unsynchronized(
+    output: &mut impl Write,
+    area: Rect,
+    document: LinkPickerDocument<'_>,
     state: &LinkPickerState,
     progress: LinkIndexProgress,
     geometry: LinkPickerGeometry,
@@ -2317,7 +3061,41 @@ fn draw_link_picker_terminal(
     let backend = CrosstermBackend::new(&mut *output);
     let mut terminal = Terminal::new(backend)?;
     terminal
-        .draw(|frame| draw_link_picker(frame, area, links, state, progress, geometry, theme))?;
+        .draw(|frame| draw_link_picker(frame, area, document, state, progress, geometry, theme))?;
+    drop(terminal);
+    execute!(output, Hide)?;
+    Ok(())
+}
+
+fn draw_search_picker_terminal(
+    output: &mut impl Write,
+    area: Rect,
+    search: &SearchState,
+    outline: &[OutlineItem],
+    state: &SearchPickerState,
+    geometry: LinkPickerGeometry,
+    theme: Palette,
+) -> io::Result<()> {
+    synchronized_output(output, |output| {
+        draw_search_picker_terminal_unsynchronized(
+            output, area, search, outline, state, geometry, theme,
+        )
+    })
+}
+
+fn draw_search_picker_terminal_unsynchronized(
+    output: &mut impl Write,
+    area: Rect,
+    search: &SearchState,
+    outline: &[OutlineItem],
+    state: &SearchPickerState,
+    geometry: LinkPickerGeometry,
+    theme: Palette,
+) -> io::Result<()> {
+    let backend = CrosstermBackend::new(&mut *output);
+    let mut terminal = Terminal::new(backend)?;
+    terminal
+        .draw(|frame| draw_search_picker(frame, area, search, outline, state, geometry, theme))?;
     drop(terminal);
     execute!(output, Hide)?;
     Ok(())
@@ -2421,6 +3199,54 @@ fn resolved_link_picker_layout(area: Rect, layout: LinkPickerLayout) -> LinkPick
         }
         LinkPickerLayout::Auto => LinkPickerLayout::Horizontal,
         layout => layout,
+    }
+}
+
+fn next_link_picker_layout(area: Rect, layout: LinkPickerLayout) -> LinkPickerLayout {
+    match resolved_link_picker_layout(area, layout) {
+        LinkPickerLayout::Vertical => LinkPickerLayout::Horizontal,
+        LinkPickerLayout::Horizontal => LinkPickerLayout::Floating,
+        LinkPickerLayout::Floating => LinkPickerLayout::Vertical,
+        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
+    }
+}
+
+const fn link_picker_layout_name(layout: LinkPickerLayout) -> &'static str {
+    match layout {
+        LinkPickerLayout::Auto => "auto",
+        LinkPickerLayout::Vertical => "vertical",
+        LinkPickerLayout::Horizontal => "horizontal",
+        LinkPickerLayout::Floating => "floating",
+    }
+}
+
+fn link_picker_layout_status(area: Rect, layout: LinkPickerLayout) -> String {
+    if layout == LinkPickerLayout::Auto {
+        format!(
+            "auto/{}",
+            link_picker_layout_name(resolved_link_picker_layout(area, layout))
+        )
+    } else {
+        link_picker_layout_name(layout).to_string()
+    }
+}
+
+fn link_picker_focus_for_key(
+    current: LinkPickerFocus,
+    layout: LinkPickerLayout,
+    key: KeyEvent,
+) -> Option<LinkPickerFocus> {
+    if layout == LinkPickerLayout::Floating {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('h') => Some(LinkPickerFocus::Document),
+        KeyCode::Char('l') => Some(LinkPickerFocus::Links),
+        KeyCode::Tab | KeyCode::BackTab => Some(match current {
+            LinkPickerFocus::Document => LinkPickerFocus::Links,
+            LinkPickerFocus::Links => LinkPickerFocus::Document,
+        }),
+        _ => None,
     }
 }
 
@@ -2548,6 +3374,63 @@ fn update_link_number_selection(
     }
 }
 
+fn link_picker_navigation_index(
+    selected: usize,
+    link_count: usize,
+    key: KeyEvent,
+    visible_height: usize,
+) -> Option<usize> {
+    if link_count == 0 {
+        return None;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some((selected + 1) % link_count),
+        KeyCode::Up | KeyCode::Char('k') => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
+        KeyCode::Char('f') if control => Some((selected + visible_height).min(link_count - 1)),
+        KeyCode::Char('b') if control => Some(selected.saturating_sub(visible_height)),
+        KeyCode::Char('g') if !control && !alt => Some(0),
+        KeyCode::Char('G') if !control && !alt => Some(link_count - 1),
+        KeyCode::Home => Some(0),
+        KeyCode::End => Some(link_count - 1),
+        KeyCode::PageDown => Some((selected + visible_height).min(link_count - 1)),
+        KeyCode::PageUp => Some(selected.saturating_sub(visible_height)),
+        _ => None,
+    }
+}
+
+fn filter_document_links(links: &[DocumentLink], filter: &str) -> Vec<usize> {
+    let terms: Vec<_> = filter
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .collect();
+    links
+        .iter()
+        .enumerate()
+        .filter_map(|(index, link)| {
+            if terms.is_empty() {
+                return Some(index);
+            }
+            let target = match &link.target {
+                LinkTarget::Internal { page, .. } => format!("pdf page {}", page + 1),
+                LinkTarget::Uri(uri) => uri.clone(),
+            };
+            let haystack = format!(
+                "{} source page {} {}",
+                link.label,
+                link.source_page + 1,
+                target
+            )
+            .to_lowercase();
+            terms
+                .iter()
+                .all(|term| haystack.contains(term))
+                .then_some(index)
+        })
+        .collect()
+}
+
 fn pick_outline(
     items: &[OutlineItem],
     current_page: u32,
@@ -2562,6 +3445,7 @@ fn pick_outline(
     let mut terminal = Terminal::new(backend)?;
     let mut redraw = true;
     let mut visible_height = 1;
+    let mut filtering = false;
 
     let selection = loop {
         if redraw {
@@ -2580,7 +3464,10 @@ fn pick_outline(
                     &filtered,
                     selected,
                     scroll_offset,
-                    &filter,
+                    PickerFilter {
+                        query: &filter,
+                        active: filtering,
+                    },
                     theme,
                 )
             })?;
@@ -2602,9 +3489,18 @@ fn pick_outline(
             continue;
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let last = filtered.len().saturating_sub(1);
         match key.code {
+            KeyCode::Esc if filtering => {
+                filter.clear();
+                filtered = filter_outline(items, &filter);
+                selected = outline_start_index(items, current_page);
+                scroll_offset = 0;
+                filtering = false;
+            }
             KeyCode::Esc => break None,
+            KeyCode::Char('/') if !control && !alt => filtering = true,
             KeyCode::Enter => {
                 if let Some(index) = filtered.get(selected) {
                     break Some(items[*index].page);
@@ -2612,19 +3508,25 @@ fn pick_outline(
             }
             KeyCode::Down => selected = (selected + 1).min(last),
             KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Char('j') if control => selected = (selected + 1).min(last),
-            KeyCode::Char('k') if control => selected = selected.saturating_sub(1),
+            KeyCode::Char('j') if !filtering => selected = (selected + 1).min(last),
+            KeyCode::Char('k') if !filtering => selected = selected.saturating_sub(1),
+            KeyCode::Char('f') if control => {
+                selected = (selected + visible_height).min(last);
+            }
+            KeyCode::Char('b') if control => selected = selected.saturating_sub(visible_height),
+            KeyCode::Char('g') if !filtering && !control && !alt => selected = 0,
+            KeyCode::Char('G') if !filtering && !control && !alt => selected = last,
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = last,
             KeyCode::PageDown => selected = (selected + visible_height).min(last),
             KeyCode::PageUp => selected = selected.saturating_sub(visible_height),
-            KeyCode::Backspace => {
+            KeyCode::Backspace if filtering => {
                 filter.pop();
                 filtered = filter_outline(items, &filter);
                 selected = 0;
                 scroll_offset = 0;
             }
-            KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char(character) if filtering && !control && !alt => {
                 filter.push(character);
                 filtered = filter_outline(items, &filter);
                 selected = 0;
@@ -2678,7 +3580,7 @@ fn draw_outline(
     filtered: &[usize],
     selected: usize,
     scroll_offset: usize,
-    filter: &str,
+    filter: PickerFilter<'_>,
     theme: Palette,
 ) {
     let colors = PickerTheme::from(theme);
@@ -2710,15 +3612,18 @@ fn draw_outline(
     ])
     .split(inner);
 
-    let filter_line = if filter.is_empty() {
+    let filter_line = if filter.query.is_empty() && !filter.active {
         Line::from(Span::styled(
-            " type to filter...",
+            " / to filter",
             Style::default().fg(colors.muted).bg(colors.chrome),
         ))
     } else {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(colors.accent).bg(colors.chrome)),
-            Span::styled(filter, Style::default().fg(colors.text).bg(colors.chrome)),
+            Span::styled(" / ", Style::default().fg(colors.accent).bg(colors.chrome)),
+            Span::styled(
+                filter.query.to_string(),
+                Style::default().fg(colors.text).bg(colors.chrome),
+            ),
         ])
     };
     frame.render_widget(
@@ -2776,7 +3681,14 @@ fn draw_outline(
 
     frame.render_widget(
         Paragraph::new(picker_hint_line(
-            &[("enter", "jump"), ("esc", "close")],
+            &[
+                ("j/k", "select"),
+                ("^b/^f", "page"),
+                ("g/G", "ends"),
+                ("/", "filter"),
+                ("enter", "jump"),
+                ("esc", if filter.active { "clear" } else { "close" }),
+            ],
             None,
             colors,
         ))
@@ -2789,13 +3701,26 @@ fn apply_picker_navigation(
     browser: &mut BrowserState,
     key: KeyEvent,
     visible_height: usize,
+    filtering: bool,
 ) -> bool {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Down => browser.select_down(),
         KeyCode::Up => browser.select_up(),
-        KeyCode::Char('j') if control => browser.select_down(),
-        KeyCode::Char('k') if control => browser.select_up(),
+        KeyCode::Char('j') if !filtering => browser.select_down(),
+        KeyCode::Char('k') if !filtering => browser.select_up(),
+        KeyCode::Char('f') if control => browser.page_down(visible_height),
+        KeyCode::Char('b') if control => browser.page_up(visible_height),
+        KeyCode::Char('g')
+            if !control && !key.modifiers.contains(KeyModifiers::ALT) && !filtering =>
+        {
+            browser.select_first();
+        }
+        KeyCode::Char('G')
+            if !control && !key.modifiers.contains(KeyModifiers::ALT) && !filtering =>
+        {
+            browser.select_last();
+        }
         KeyCode::Home => browser.select_first(),
         KeyCode::End => browser.select_last(),
         KeyCode::PageDown => browser.page_down(visible_height),
@@ -2805,7 +3730,18 @@ fn apply_picker_navigation(
     true
 }
 
-fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette) {
+fn clear_picker_filter(browser: &mut BrowserState) -> bool {
+    if browser.filter.is_empty() {
+        return false;
+    }
+    browser.filter.clear();
+    browser.rebuild_filter();
+    browser.select_first();
+    browser.scroll_offset = 0;
+    true
+}
+
+fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, filtering: bool, theme: Palette) {
     let colors = PickerTheme::from(theme);
     let entries: Vec<_> = browser.filtered_entries().collect();
     let area = frame.area();
@@ -2837,14 +3773,14 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
     ])
     .split(inner);
 
-    let filter = if browser.filter.is_empty() {
+    let filter = if browser.filter.is_empty() && !filtering {
         Line::from(Span::styled(
-            " type to filter...",
+            " / to filter",
             Style::default().fg(colors.muted).bg(colors.chrome),
         ))
     } else {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(colors.accent).bg(colors.chrome)),
+            Span::styled(" / ", Style::default().fg(colors.accent).bg(colors.chrome)),
             Span::styled(
                 browser.filter.as_str(),
                 Style::default().fg(colors.text).bg(colors.chrome),
@@ -2897,10 +3833,7 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
     );
 
     let status = if browser.recursive_loading() {
-        Some((
-            format!("scanning • {} shown", entries.len()),
-            colors.loading,
-        ))
+        Some((format!("scan • {}", entries.len()), colors.loading))
     } else {
         let position = if entries.is_empty() {
             0
@@ -2909,71 +3842,145 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, theme: Palette)
         };
         Some((format!("{position}/{}", entries.len()), colors.muted))
     };
+    let escape_action = if filtering || !browser.filter.is_empty() {
+        "clear"
+    } else {
+        "close"
+    };
+    let mut bindings = vec![("j/k", ""), ("^b/^f", "page"), ("g/G", "ends")];
+    bindings.push(("/", "filter"));
+    bindings.push(("enter", "open"));
+    bindings.push(("esc", escape_action));
     frame.render_widget(
-        Paragraph::new(picker_hint_line(
-            &[("enter", "open"), ("esc", "close")],
-            status,
-            colors,
-        ))
-        .style(Style::default().bg(colors.chrome)),
+        Paragraph::new(picker_hint_line(&bindings, status, colors))
+            .style(Style::default().bg(colors.chrome)),
         rows[2],
     );
 }
 
-fn draw_link_picker(
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SearchPickerDisplayRow {
+    Section(usize),
+    Match(usize),
+    Context(usize),
+}
+
+fn search_picker_display_rows(
+    matches: &[SearchPageMatch],
+    outline: &[OutlineItem],
+) -> Vec<SearchPickerDisplayRow> {
+    let mut rows = Vec::with_capacity(matches.len().saturating_mul(3));
+    let mut previous_section = None;
+    for (index, result) in matches.iter().enumerate() {
+        let section = link_picker_section_index(outline, result.page);
+        if section != previous_section {
+            if let Some(section) = section {
+                rows.push(SearchPickerDisplayRow::Section(section));
+            }
+            previous_section = section;
+        }
+        rows.push(SearchPickerDisplayRow::Match(index));
+        if !result.context.is_empty() {
+            rows.push(SearchPickerDisplayRow::Context(index));
+        }
+    }
+    rows
+}
+
+fn search_picker_row_window(
+    rows: &[SearchPickerDisplayRow],
+    selected: usize,
+    visible_height: usize,
+) -> (usize, usize) {
+    let selected_row = rows
+        .iter()
+        .position(|row| matches!(row, SearchPickerDisplayRow::Match(index) if *index == selected))
+        .unwrap_or(0);
+    let height = visible_height.max(1).min(rows.len());
+    let start = selected_row
+        .saturating_sub(height / 3)
+        .min(rows.len().saturating_sub(height));
+    (start, start + height)
+}
+
+fn draw_search_picker(
     frame: &mut RatatuiFrame,
     area: Rect,
-    links: &[DocumentLink],
-    state: &LinkPickerState,
-    progress: LinkIndexProgress,
+    search: &SearchState,
+    outline: &[OutlineItem],
+    state: &SearchPickerState,
     geometry: LinkPickerGeometry,
     theme: Palette,
 ) {
-    let selected = state.selected;
-    let page = state.page;
+    let layout = resolved_link_picker_layout(area, geometry.layout);
+    let results_focused =
+        state.focus == LinkPickerFocus::Links || layout == LinkPickerLayout::Floating;
     let mut colors = PickerTheme::from(theme);
     colors.surface = picker_color(theme.bg_dark);
     colors.chrome = picker_color(theme.bg_dark1);
     let (_, pane) = link_picker_panes(area, geometry);
     frame.render_widget(RatatuiClear, pane);
-    let pane_borders = match resolved_link_picker_layout(area, geometry.layout) {
+    let borders = match layout {
         LinkPickerLayout::Vertical => Borders::LEFT,
         LinkPickerLayout::Horizontal => Borders::TOP,
         LinkPickerLayout::Floating => Borders::ALL,
         LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
     };
-    let pane_block = Block::default()
-        .borders(pane_borders)
+    let block = Block::default()
+        .borders(borders)
         .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(colors.border));
-    let inner = pane_block.inner(pane);
-    frame.render_widget(pane_block, pane);
-    let detail_height = link_picker_detail_height(inner.height);
+        .border_style(Style::default().fg(if results_focused {
+            colors.accent
+        } else {
+            colors.border
+        }));
+    let inner = block.inner(pane);
+    frame.render_widget(block, pane);
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(detail_height),
-        Constraint::Length(1),
+        Constraint::Length(u16::from(layout == LinkPickerLayout::Floating)),
     ])
     .split(inner);
 
     let mut header = vec![
         Span::styled(
-            " Links ",
+            " Search ",
             Style::default()
-                .fg(colors.accent)
+                .fg(if results_focused {
+                    colors.accent
+                } else {
+                    colors.muted
+                })
                 .bg(colors.chrome)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            links.len().to_string(),
+            truncated_search_query(&search.query, 36),
+            Style::default().fg(colors.text).bg(colors.chrome),
+        ),
+        Span::styled(
+            format!(
+                "  · {} hits on {} pages",
+                search.total_occurrences,
+                search.matches.len()
+            ),
             Style::default().fg(colors.muted).bg(colors.chrome),
         ),
     ];
-    if progress.indexing {
+    if search.searching {
         header.push(Span::styled(
-            format!("  indexing {}/{}", progress.scanned, progress.total_pages),
+            format!("  scanning {}/{}", search.scanned, search.total_pages),
             Style::default().fg(colors.loading).bg(colors.chrome),
+        ));
+    }
+    if !results_focused {
+        header.push(Span::styled(
+            "  PDF focused  · l: results",
+            Style::default()
+                .fg(colors.loading)
+                .bg(colors.chrome)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     frame.render_widget(
@@ -2987,12 +3994,268 @@ fn draw_link_picker(
         rows[0],
     );
 
-    if links.is_empty() {
+    if search.matches.is_empty() {
+        let message = if search.searching {
+            "Scanning document text…"
+        } else {
+            "No matches"
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(colors.muted).bg(colors.surface)),
+            rows[1],
+        );
+    } else {
+        let display_rows = search_picker_display_rows(&search.matches, outline);
+        let (start, end) = search_picker_row_window(
+            &display_rows,
+            state.selected,
+            usize::from(rows[1].height).max(1),
+        );
+        let width = usize::from(rows[1].width);
+        let number_width = search.matches.len().to_string().len().max(1);
+        let lines: Vec<_> = display_rows[start..end]
+            .iter()
+            .map(|row| match row {
+                SearchPickerDisplayRow::Section(index) => {
+                    link_picker_section_heading_line(&outline[*index].title, width, colors)
+                }
+                SearchPickerDisplayRow::Match(index) => search_picker_match_line(
+                    *index,
+                    &search.matches[*index],
+                    state,
+                    number_width,
+                    width,
+                    results_focused,
+                    colors,
+                ),
+                SearchPickerDisplayRow::Context(index) => search_picker_context_line(
+                    *index,
+                    &search.matches[*index].context,
+                    state,
+                    width,
+                    results_focused,
+                    colors,
+                ),
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(colors.surface)),
+            rows[1],
+        );
+    }
+
+    if layout == LinkPickerLayout::Floating {
+        let position = usize::from(!search.matches.is_empty()) * (state.selected + 1);
+        frame.render_widget(
+            Paragraph::new(picker_hint_line(
+                &[
+                    ("j/k C-b/f g/G", "navigate"),
+                    ("/", "new search"),
+                    ("enter", "jump"),
+                    ("s/a", "layout"),
+                    ("esc", "close"),
+                ],
+                Some((format!("{position}/{}", search.matches.len()), colors.muted)),
+                colors,
+            ))
+            .style(Style::default().bg(colors.chrome)),
+            rows[2],
+        );
+    }
+}
+
+fn search_picker_match_line(
+    index: usize,
+    result: &SearchPageMatch,
+    state: &SearchPickerState,
+    number_width: usize,
+    width: usize,
+    focused: bool,
+    colors: PickerTheme,
+) -> Line<'static> {
+    let selected = focused && index == state.selected;
+    let background = if selected {
+        colors.selection
+    } else {
+        colors.surface
+    };
+    let hits = if result.occurrences == 1 {
+        "hit"
+    } else {
+        "hits"
+    };
+    let current = if result.page == state.page {
+        " · current"
+    } else {
+        ""
+    };
+    let label = format!(
+        "{:>number_width$}  Page {} · {} {hits}{current}",
+        index + 1,
+        result.page + 1,
+        result.occurrences
+    );
+    Line::from(vec![
+        Span::styled(
+            if selected { "▌ " } else { "  " },
+            Style::default().fg(colors.accent).bg(background),
+        ),
+        Span::styled(
+            truncate_right(&label, width.saturating_sub(2)),
+            Style::default()
+                .fg(colors.text)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn search_picker_context_line(
+    index: usize,
+    context: &str,
+    state: &SearchPickerState,
+    width: usize,
+    focused: bool,
+    colors: PickerTheme,
+) -> Line<'static> {
+    let background = if focused && index == state.selected {
+        colors.selection
+    } else {
+        colors.surface
+    };
+    Line::from(vec![
+        Span::styled("    ", Style::default().bg(background)),
+        Span::styled(
+            truncate_right(context, width.saturating_sub(4)),
+            Style::default().fg(colors.text_dim).bg(background),
+        ),
+    ])
+}
+
+fn draw_link_picker(
+    frame: &mut RatatuiFrame,
+    area: Rect,
+    document: LinkPickerDocument<'_>,
+    state: &LinkPickerState,
+    progress: LinkIndexProgress,
+    geometry: LinkPickerGeometry,
+    theme: Palette,
+) {
+    let LinkPickerDocument { links, outline } = document;
+    let selected = state.selected;
+    let page = state.page;
+    let layout = resolved_link_picker_layout(area, geometry.layout);
+    let links_focused =
+        state.focus == LinkPickerFocus::Links || layout == LinkPickerLayout::Floating;
+    let filtered = filter_document_links(links, &state.filter);
+    let selected_position = filtered.iter().position(|index| *index == selected);
+    let mut colors = PickerTheme::from(theme);
+    colors.surface = picker_color(theme.bg_dark);
+    colors.chrome = picker_color(theme.bg_dark1);
+    let (_, pane) = link_picker_panes(area, geometry);
+    frame.render_widget(RatatuiClear, pane);
+    let pane_borders = match layout {
+        LinkPickerLayout::Vertical => Borders::LEFT,
+        LinkPickerLayout::Horizontal => Borders::TOP,
+        LinkPickerLayout::Floating => Borders::ALL,
+        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
+    };
+    let pane_block = Block::default()
+        .borders(pane_borders)
+        .style(Style::default().bg(colors.surface).fg(colors.text))
+        .border_style(Style::default().fg(if links_focused {
+            colors.accent
+        } else {
+            colors.border
+        }));
+    let inner = pane_block.inner(pane);
+    frame.render_widget(pane_block, pane);
+    let detail_height = link_picker_detail_height(inner.height);
+    let footer_height = u16::from(layout == LinkPickerLayout::Floating);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(detail_height),
+        Constraint::Length(footer_height),
+    ])
+    .split(inner);
+
+    let mut header = vec![
+        Span::styled(
+            " Links ",
+            Style::default()
+                .fg(if links_focused {
+                    colors.accent
+                } else {
+                    colors.muted
+                })
+                .bg(colors.chrome)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if state.filter.is_empty() {
+                links.len().to_string()
+            } else {
+                format!("{}/{}", filtered.len(), links.len())
+            },
+            Style::default().fg(colors.muted).bg(colors.chrome),
+        ),
+        Span::styled(
+            format!("  · {}", link_picker_layout_status(area, geometry.layout)),
+            Style::default().fg(colors.muted).bg(colors.chrome),
+        ),
+    ];
+    if !links_focused {
+        header.push(Span::styled(
+            "  PDF focused  · l: links",
+            Style::default()
+                .fg(colors.loading)
+                .bg(colors.chrome)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if progress.indexing {
+        header.push(Span::styled(
+            format!("  indexing {}/{}", progress.scanned, progress.total_pages),
+            Style::default().fg(colors.loading).bg(colors.chrome),
+        ));
+    }
+    if state.filtering || !state.filter.is_empty() {
+        header.push(Span::styled(
+            "  / ",
+            Style::default()
+                .fg(colors.accent)
+                .bg(colors.chrome)
+                .add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::styled(
+            if state.filter.is_empty() {
+                "type to filter…".to_string()
+            } else {
+                state.filter.clone()
+            },
+            Style::default().fg(colors.text).bg(colors.chrome),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(header))
+            .style(Style::default().bg(colors.chrome))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(colors.border)),
+            ),
+        rows[0],
+    );
+
+    if filtered.is_empty() {
         let message = if progress.indexing {
             format!(
                 "Indexing document links · {}/{} pages",
                 progress.scanned, progress.total_pages
             )
+        } else if !state.filter.is_empty() {
+            format!("No links match ‘{}’", state.filter)
         } else {
             "No annotated links in this document".to_string()
         };
@@ -3001,21 +4264,25 @@ fn draw_link_picker(
             rows[1],
         );
     } else {
-        let display_rows = link_picker_display_rows(links);
+        let display_rows = link_picker_display_rows(links, &filtered, outline);
         let visible_height = usize::from(rows[1].height).max(1);
         let (start, end) = link_picker_row_window(&display_rows, selected, visible_height);
         let width = usize::from(rows[1].width);
-        let number_width = links.len().to_string().len().max(1);
+        let number_width = filtered.len().to_string().len().max(1);
         let lines: Vec<_> = display_rows[start..end]
             .iter()
-            .map(|display_row| match *display_row {
-                LinkPickerDisplayRow::Page(source_page) => {
-                    link_picker_page_heading_line(source_page, source_page == page, width, colors)
+            .map(|display_row| match display_row {
+                LinkPickerDisplayRow::Section(index) => {
+                    link_picker_section_heading_line(&outline[*index].title, width, colors)
                 }
-                LinkPickerDisplayRow::Link(index) => link_picker_entry_line(
-                    index,
-                    &links[index],
-                    selected,
+                LinkPickerDisplayRow::Page(source_page) => {
+                    link_picker_page_heading_line(*source_page, *source_page == page, width, colors)
+                }
+                LinkPickerDisplayRow::Link { index, ordinal } => link_picker_entry_line(
+                    *ordinal,
+                    *index,
+                    &links[*index],
+                    if links_focused { selected } else { usize::MAX },
                     number_width,
                     width,
                     colors,
@@ -3029,60 +4296,164 @@ fn draw_link_picker(
     }
 
     if detail_height > 0
+        && let Some(position) = selected_position
         && let Some(link) = links.get(selected)
     {
-        draw_link_picker_detail(frame, rows[2], link, selected, colors);
+        draw_link_picker_detail(frame, rows[2], link, position, colors);
     }
 
-    let status = if links.is_empty() {
-        "no links".to_string()
-    } else {
-        format!("{}/{}", selected + 1, links.len())
-    };
-    let action = match links.get(selected).map(|link| &link.target) {
-        Some(LinkTarget::Uri(_)) => "copy URL",
-        _ => "jump",
-    };
-    let compact_bindings = [("j/k", ""), ("#", ""), ("↵", ""), ("esc", "")];
-    let full_bindings = [
-        ("j/k", "move"),
-        ("#", "select"),
-        ("enter", action),
-        ("esc", "close"),
-    ];
-    let bindings = if rows[3].width < 48 {
-        compact_bindings.as_slice()
-    } else {
-        full_bindings.as_slice()
-    };
-    frame.render_widget(
-        Paragraph::new(picker_hint_line(
-            bindings,
-            Some((status, colors.muted)),
-            colors,
-        ))
-        .style(Style::default().bg(colors.chrome)),
-        rows[3],
-    );
+    if layout == LinkPickerLayout::Floating {
+        let status = if filtered.is_empty() {
+            if state.filter.is_empty() {
+                "no links".to_string()
+            } else {
+                "no matches".to_string()
+            }
+        } else {
+            format!("{}/{}", selected_position.unwrap_or(0) + 1, filtered.len())
+        };
+        let action = match selected_position
+            .and_then(|_| links.get(selected))
+            .map(|link| &link.target)
+        {
+            Some(LinkTarget::Uri(_)) => "copy URL",
+            _ => "jump",
+        };
+        let escape_action = if state.filtering || !state.filter.is_empty() {
+            "clear"
+        } else {
+            "close"
+        };
+        let compact_bindings = [("j/k", ""), ("/", ""), ("#", ""), ("↵", ""), ("esc", "")];
+        let medium_bindings = [
+            ("j/k C-b/f g/G", ""),
+            ("/", ""),
+            ("#", ""),
+            ("enter", action),
+            ("esc", ""),
+        ];
+        let full_bindings = [
+            ("j/k C-b/f g/G", "navigate"),
+            ("/", "filter"),
+            ("#", "select"),
+            ("enter", action),
+            ("s/a", "layout"),
+            ("esc", escape_action),
+        ];
+        let bindings = if rows[3].width < 48 {
+            compact_bindings.as_slice()
+        } else if rows[3].width < 110 {
+            medium_bindings.as_slice()
+        } else {
+            full_bindings.as_slice()
+        };
+        frame.render_widget(
+            Paragraph::new(picker_hint_line(
+                bindings,
+                Some((status, colors.muted)),
+                colors,
+            ))
+            .style(Style::default().bg(colors.chrome)),
+            rows[3],
+        );
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LinkPickerDisplayRow {
+    Section(usize),
     Page(u32),
-    Link(usize),
+    Link { index: usize, ordinal: usize },
 }
 
-fn link_picker_display_rows(links: &[DocumentLink]) -> Vec<LinkPickerDisplayRow> {
-    let mut rows = Vec::with_capacity(links.len());
+fn link_picker_display_rows(
+    links: &[DocumentLink],
+    filtered: &[usize],
+    outline: &[OutlineItem],
+) -> Vec<LinkPickerDisplayRow> {
+    let mut rows = Vec::with_capacity(filtered.len().saturating_mul(2));
+    let mut previous_section = None;
     let mut previous_page = None;
-    for (index, link) in links.iter().enumerate() {
+    for (ordinal, index) in filtered.iter().copied().enumerate() {
+        let link = &links[index];
+        let section = link_picker_section_index(outline, link.source_page);
+        if section != previous_section {
+            if let Some(section) = section {
+                rows.push(LinkPickerDisplayRow::Section(section));
+            }
+            previous_section = section;
+            previous_page = None;
+        }
         if previous_page != Some(link.source_page) {
             rows.push(LinkPickerDisplayRow::Page(link.source_page));
             previous_page = Some(link.source_page);
         }
-        rows.push(LinkPickerDisplayRow::Link(index));
+        rows.push(LinkPickerDisplayRow::Link { index, ordinal });
     }
     rows
+}
+
+fn link_picker_link_at_position(
+    area: Rect,
+    document: LinkPickerDocument<'_>,
+    state: &LinkPickerState,
+    geometry: LinkPickerGeometry,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let list_area = link_picker_list_area(area, geometry);
+    if column < list_area.x
+        || column >= list_area.x.saturating_add(list_area.width)
+        || row < list_area.y
+        || row >= list_area.y.saturating_add(list_area.height)
+    {
+        return None;
+    }
+    let filtered = filter_document_links(document.links, &state.filter);
+    let display_rows = link_picker_display_rows(document.links, &filtered, document.outline);
+    let (start, end) = link_picker_row_window(
+        &display_rows,
+        state.selected,
+        usize::from(list_area.height).max(1),
+    );
+    let offset = usize::from(row.saturating_sub(list_area.y));
+    match display_rows
+        .get(start + offset)
+        .filter(|_| start + offset < end)
+    {
+        Some(LinkPickerDisplayRow::Link { index, .. }) => Some(*index),
+        _ => None,
+    }
+}
+
+fn link_picker_list_area(area: Rect, geometry: LinkPickerGeometry) -> Rect {
+    let layout = resolved_link_picker_layout(area, geometry.layout);
+    let (_, pane) = link_picker_panes(area, geometry);
+    let borders = match layout {
+        LinkPickerLayout::Vertical => Borders::LEFT,
+        LinkPickerLayout::Horizontal => Borders::TOP,
+        LinkPickerLayout::Floating => Borders::ALL,
+        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
+    };
+    let inner = Block::default().borders(borders).inner(pane);
+    let detail_height = link_picker_detail_height(inner.height);
+    let footer_height = u16::from(layout == LinkPickerLayout::Floating);
+    Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(detail_height),
+        Constraint::Length(footer_height),
+    ])
+    .split(inner)[1]
+}
+
+fn link_picker_section_index(outline: &[OutlineItem], page: u32) -> Option<usize> {
+    outline
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.page <= page)
+        .max_by_key(|(index, item)| (item.page, *index))
+        .map(|(index, _)| index)
 }
 
 fn link_picker_row_window(
@@ -3092,7 +4463,12 @@ fn link_picker_row_window(
 ) -> (usize, usize) {
     let selected_row = rows
         .iter()
-        .position(|row| *row == LinkPickerDisplayRow::Link(selected))
+        .position(|row| {
+            matches!(
+                row,
+                LinkPickerDisplayRow::Link { index, .. } if *index == selected
+            )
+        })
         .unwrap_or(0);
     let height = visible_height.max(1).min(rows.len());
     let max_start = rows.len().saturating_sub(height);
@@ -3131,7 +4507,41 @@ fn link_picker_page_heading_line(
     Line::from(spans)
 }
 
+fn link_picker_section_heading_line(
+    title: &str,
+    width: usize,
+    colors: PickerTheme,
+) -> Line<'static> {
+    let prefix = " Section  ";
+    let label = truncate_right(title, width.saturating_sub(Line::raw(prefix).width() + 1));
+    let mut line = Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default()
+                .fg(colors.loading)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{label} "),
+            Style::default()
+                .fg(colors.text)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let used = line.width();
+    if used < width {
+        line.spans.push(Span::styled(
+            "─".repeat(width - used),
+            Style::default().fg(colors.border).bg(colors.surface),
+        ));
+    }
+    line
+}
+
 fn link_picker_entry_line(
+    ordinal: usize,
     index: usize,
     link: &DocumentLink,
     selected: usize,
@@ -3146,7 +4556,7 @@ fn link_picker_entry_line(
         colors.surface
     };
     let style = Style::default().fg(colors.text).bg(background);
-    let number = format!("{:>number_width$}  ", index + 1);
+    let number = format!("{:>number_width$}  ", ordinal + 1);
     let prefix_width = 2 + Line::raw(number.as_str()).width();
     let label = truncate_right(
         &link_picker_label(&link.label),
@@ -3231,10 +4641,63 @@ fn draw_link_picker_detail(
             ),
         ]),
     ];
+    let mut lines = lines;
+    let truncate_context = inner.height <= 4;
+    if let Some(context) = link.source_context.as_deref() {
+        lines.push(link_picker_context_line(
+            "Context",
+            context,
+            width,
+            truncate_context,
+            colors.loading,
+            colors,
+        ));
+    }
+    if let Some(context) = link.reference_context.as_deref() {
+        lines.push(link_picker_context_line(
+            "Reference",
+            context,
+            width,
+            truncate_context,
+            colors.recent,
+            colors,
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
+        Paragraph::new(lines)
+            .style(Style::default().bg(colors.surface))
+            .wrap(Wrap { trim: true }),
         inner,
     );
+}
+
+fn link_picker_context_line(
+    label: &'static str,
+    context: &str,
+    width: usize,
+    truncate: bool,
+    label_color: RatatuiColor,
+    colors: PickerTheme,
+) -> Line<'static> {
+    let label = format!("{label}  ");
+    let context = if truncate {
+        truncate_right(
+            context,
+            width.saturating_sub(Line::raw(label.as_str()).width()),
+        )
+    } else {
+        context.to_string()
+    };
+    Line::from(vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(label_color)
+                .bg(colors.surface)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(context, Style::default().fg(colors.text).bg(colors.surface)),
+    ])
 }
 
 fn link_picker_label(label: &str) -> String {
@@ -3258,8 +4721,13 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         (":", "go to page"),
         ("/", "search document"),
         ("n / N", "next / prev match"),
-        ("Enter (links)", "document links"),
+        ("Enter", "browse PDF links"),
+        ("h / l (split)", "focus PDF/pane"),
+        ("/ (pane)", "filter/new search"),
+        ("Ctrl-b/f (pane)", "page results"),
+        ("g / G (pane)", "first/last"),
         ("Tab / Shift-Tab", "switch tabs"),
+        ("Alt-1 … Alt-9", "select tab"),
     ];
     const VIEWER: &[(&str, &str)] = &[
         ("m", "cycle fit mode"),
@@ -3268,11 +4736,12 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("t", "table of contents"),
         ("T", "choose theme"),
         ("y", "copy page text"),
-        ("L", "toggle clickable links"),
+        ("L", "link mode + browser"),
+        ("s / a", "cycle / auto side layout"),
         ("b", "return from followed link"),
         ("f", "open PDF in new tab"),
-        ("q", "close tab / exit"),
-        ("Esc", "clear search / exit"),
+        ("q", "leave mode / close tab"),
+        ("Esc", "close / clear / exit"),
         ("?", "open help"),
     ];
 
@@ -3352,9 +4821,28 @@ fn help_lines(
     lines
 }
 
-fn draw_theme_picker(frame: &mut RatatuiFrame, themes: &[(String, Palette)], selected: usize) {
+fn filter_theme_indices(themes: &[(String, Palette)], filter: &str) -> Vec<usize> {
+    let filter = filter.trim().to_lowercase();
+    themes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (name, _))| {
+            (filter.is_empty() || name.to_lowercase().contains(&filter)).then_some(index)
+        })
+        .collect()
+}
+
+fn draw_theme_picker(
+    frame: &mut RatatuiFrame,
+    themes: &[(String, Palette)],
+    filtered: &[usize],
+    selected: usize,
+    filter: &str,
+    filtering: bool,
+) {
+    let selected_theme = filtered.get(selected).copied().unwrap_or(0);
     let theme = themes
-        .get(selected)
+        .get(selected_theme)
         .map_or(crate::theme::TOKYO_NIGHT_MOON, |(_, theme)| *theme);
     let colors = PickerTheme::from(theme);
     let area = frame.area();
@@ -3378,18 +4866,43 @@ fn draw_theme_picker(frame: &mut RatatuiFrame, themes: &[(String, Palette)], sel
         );
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
-    let visible_height = usize::from(rows[0].height).max(1);
+    let filter_line = if filter.is_empty() && !filtering {
+        Line::from(Span::styled(
+            " / to filter",
+            Style::default().fg(colors.muted).bg(colors.chrome),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(" / ", Style::default().fg(colors.accent).bg(colors.chrome)),
+            Span::styled(
+                filter.to_string(),
+                Style::default().fg(colors.text).bg(colors.chrome),
+            ),
+        ])
+    };
+    frame.render_widget(
+        Paragraph::new(filter_line).style(Style::default().bg(colors.chrome)),
+        rows[0],
+    );
+
+    let visible_height = usize::from(rows[1].height).max(1);
     let first_visible = selected.saturating_add(1).saturating_sub(visible_height);
-    let width = usize::from(rows[0].width);
-    let lines: Vec<_> = themes
+    let width = usize::from(rows[1].width);
+    let lines: Vec<_> = filtered
         .iter()
         .enumerate()
         .skip(first_visible)
         .take(visible_height)
-        .map(|(index, (name, _))| {
-            let is_selected = index == selected;
+        .map(|(position, index)| {
+            let is_selected = position == selected;
+            let name = &themes[*index].0;
             let background = if is_selected {
                 colors.selection
             } else {
@@ -3418,18 +4931,32 @@ fn draw_theme_picker(frame: &mut RatatuiFrame, themes: &[(String, Palette)], sel
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(colors.surface)),
-        rows[0],
+        rows[1],
     );
 
-    let status = Some((format!("{}/{}", selected + 1, themes.len()), colors.muted));
+    let status = Some((
+        format!(
+            "{}/{}",
+            usize::from(!filtered.is_empty()) * (selected + 1),
+            filtered.len()
+        ),
+        colors.muted,
+    ));
     frame.render_widget(
         Paragraph::new(picker_hint_line(
-            &[("j/k", "select"), ("enter", "apply"), ("esc", "cancel")],
+            &[
+                ("j/k", "select"),
+                ("^b/^f", "page"),
+                ("g/G", "ends"),
+                ("/", "filter"),
+                ("enter", "apply"),
+                ("esc", if filtering { "clear" } else { "cancel" }),
+            ],
             status,
             colors,
         ))
         .style(Style::default().bg(colors.chrome)),
-        rows[1],
+        rows[2],
     );
 }
 
@@ -3502,7 +5029,7 @@ fn truncate_right(value: &str, max_width: usize) -> String {
 }
 
 fn picker_entry_line(
-    entry: &crate::browser::BrowserEntry,
+    entry: &BrowserEntry,
     browser: &BrowserState,
     selected: bool,
     width: usize,
@@ -3535,18 +5062,30 @@ fn picker_entry_line(
         Span::styled(icon, Style::default().fg(icon_color).bg(background)),
     ];
 
-    let matches = browser.match_indices(&entry.name);
-    let basename_start = if entry.is_dir {
+    let display_name = if browser.filter.is_empty() || entry.name == "../" {
+        entry.name.clone()
+    } else {
+        let mut name = entry
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| entry.name.clone());
+        if entry.is_dir && !name.ends_with('/') {
+            name.push('/');
+        }
+        name
+    };
+    let matches = browser.match_indices(&display_name);
+    let basename_start = if entry.is_dir || !browser.filter.is_empty() {
         0
     } else {
-        entry
-            .name
+        display_name
             .char_indices()
             .rev()
             .find(|(_, character)| *character == '/')
-            .map_or(0, |(index, _)| entry.name[..=index].chars().count())
+            .map_or(0, |(index, _)| display_name[..=index].chars().count())
     };
-    for (index, character) in entry.name.chars().enumerate() {
+    for (index, character) in display_name.chars().enumerate() {
         let foreground = if matches.binary_search(&index).is_ok() {
             colors.matched
         } else if index < basename_start || entry.name == "../" {
@@ -3567,23 +5106,68 @@ fn picker_entry_line(
 
     let mut line = Line::from(spans);
     let mut used = line.width();
-    if entry.is_recent
-        && let Some(parent) = entry.path.parent()
-    {
-        let parent = shorten_path(&parent.to_string_lossy());
+    let source = (!browser.filter.is_empty())
+        .then(|| browser.entry_source(entry))
+        .flatten();
+    let show_parent = entry.is_recent || source == Some(BrowserEntrySource::Subdirectory);
+    let parent = show_parent
+        .then(|| entry.path.parent())
+        .flatten()
+        .map(|parent| shorten_path(&parent.to_string_lossy()));
+    if entry.is_recent || source.is_some() {
         let available = width.saturating_sub(used + 2);
-        if available >= 3 {
-            let parent = truncate_left(&parent, available);
-            let parent_width = Line::raw(parent.as_str()).width();
-            let gap = width.saturating_sub(used + parent_width);
+        let label = source.map(BrowserEntrySource::label);
+        let label_width = label.map_or(0, |label| Line::raw(label).width());
+        let separator_width = usize::from(label.is_some() && parent.is_some()) * 2;
+        if available >= label_width + separator_width + usize::from(parent.is_some()) {
+            let parent_width = available.saturating_sub(label_width + separator_width);
+            let parent = parent.map(|parent| truncate_left(&parent, parent_width));
+            let context_width = label_width
+                + separator_width
+                + parent
+                    .as_deref()
+                    .map_or(0, |parent| Line::raw(parent).width());
+            let gap = width.saturating_sub(used + context_width);
             line.spans.push(Span::styled(
                 " ".repeat(gap),
                 Style::default().bg(background),
             ));
-            line.spans.push(Span::styled(
-                parent,
-                Style::default().fg(colors.text_dim).bg(background),
-            ));
+            if let Some(label) = label {
+                let foreground = match source {
+                    Some(BrowserEntrySource::Recent) => colors.recent,
+                    Some(BrowserEntrySource::Here) => colors.loading,
+                    Some(BrowserEntrySource::Subdirectory) => colors.directory,
+                    None => colors.muted,
+                };
+                line.spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(foreground)
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if label.is_some() && parent.is_some() {
+                line.spans
+                    .push(Span::styled("  ", Style::default().bg(background)));
+            }
+            if let Some(parent) = parent {
+                let matches = browser.match_indices(&parent);
+                for (index, character) in parent.chars().enumerate() {
+                    let matched = matches.binary_search(&index).is_ok();
+                    let mut style = Style::default()
+                        .fg(if matched {
+                            colors.matched
+                        } else {
+                            colors.text_dim
+                        })
+                        .bg(background);
+                    if matched {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    line.spans.push(Span::styled(character.to_string(), style));
+                }
+            }
             used = width;
         }
     }
@@ -3646,21 +5230,35 @@ fn picker_rect(area: Rect) -> Rect {
 }
 
 fn link_picker_detail_height(height: u16) -> u16 {
-    if height >= 10 { 3 } else { 0 }
+    if height >= 24 {
+        8
+    } else if height >= 14 {
+        6
+    } else if height >= 9 {
+        5
+    } else {
+        0
+    }
 }
 
 fn link_picker_visible_height(area: Rect, geometry: LinkPickerGeometry) -> usize {
     let (_, pane) = link_picker_panes(area, geometry);
-    let border_height = match resolved_link_picker_layout(area, geometry.layout) {
+    let layout = resolved_link_picker_layout(area, geometry.layout);
+    let border_height = match layout {
         LinkPickerLayout::Vertical => 0,
         LinkPickerLayout::Horizontal => 1,
         LinkPickerLayout::Floating => 2,
         LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
     };
+    let chrome_height = if layout == LinkPickerLayout::Floating {
+        3
+    } else {
+        2
+    };
     let content_height = pane.height.saturating_sub(border_height);
     usize::from(
         content_height
-            .saturating_sub(3 + link_picker_detail_height(content_height))
+            .saturating_sub(chrome_height + link_picker_detail_height(content_height))
             .max(1),
     )
 }
@@ -3805,13 +5403,17 @@ impl FileWatcher {
 mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
-        LinkPickerGeometry, LinkPickerImage, LinkPickerState, PerformanceSnapshot, PositionedImage,
-        SearchState, apply_picker_navigation, clear_picker, cycled_tab_index, draw_help_menu,
-        draw_link_picker, draw_picker, draw_theme_picker, filter_outline, link_at_cell,
-        link_picker_label, link_picker_panes, link_picker_visible_height, outline_start_index,
-        picker_color, picker_rect, render_timing_status, restore_link_picker_split,
-        search_target_page, shorten_path, show_link_picker_split, stale_status_row,
-        update_link_number_selection, write_clipboard_osc52,
+        LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
+        PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState,
+        apply_picker_navigation, clear_picker, clear_picker_filter, cycled_tab_index,
+        draw_help_menu, draw_link_picker, draw_picker, draw_search_picker, draw_theme_picker,
+        filter_document_links, filter_outline, filter_theme_indices, link_at_cell,
+        link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
+        link_picker_list_area, link_picker_navigation_index, link_picker_panes,
+        link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
+        outline_start_index, picker_color, picker_rect, render_timing_status,
+        restore_link_picker_split, search_target_page, shorten_path, show_link_picker_split,
+        stale_status_row, synchronized_output, update_link_number_selection, write_clipboard_osc52,
     };
     use crate::config::LinkPickerLayout;
     use crate::kitty::Placement;
@@ -3824,12 +5426,34 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use std::fs;
+    use std::io::{self, Write};
     use std::time::{Duration, Instant, SystemTime};
 
     #[test]
     fn page_navigation_bounds_are_saturating() {
         assert_eq!(0_u32.saturating_sub(1), 0);
         assert_eq!(u32::MAX.saturating_add(1), u32::MAX);
+    }
+
+    #[test]
+    fn synchronized_output_closes_successful_and_failed_updates() {
+        let mut successful = Vec::new();
+        let result: io::Result<()> = synchronized_output(&mut successful, |output| {
+            output.write_all(b"complete frame")
+        });
+        result.expect("successful synchronized update");
+        assert_eq!(successful, b"\x1b[?2026hcomplete frame\x1b[?2026l");
+
+        let mut failed = Vec::new();
+        let result: io::Result<()> = synchronized_output(&mut failed, |output| {
+            output.write_all(b"partial frame")?;
+            Err(io::Error::other("render failed"))
+        });
+        assert_eq!(
+            result.expect_err("failed synchronized update").kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(failed, b"\x1b[?2026hpartial frame\x1b[?2026l");
     }
 
     #[test]
@@ -3860,6 +5484,18 @@ mod tests {
         assert_eq!(cycled_tab_index(2, 3, 1), 0);
         assert_eq!(cycled_tab_index(2, 3, -1), 1);
         assert_eq!(cycled_tab_index(0, 3, -1), 2);
+        assert_eq!(
+            numbered_tab_index(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)),
+            Some(0)
+        );
+        assert_eq!(
+            numbered_tab_index(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT)),
+            Some(8)
+        );
+        assert_eq!(
+            numbered_tab_index(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]
@@ -3868,14 +5504,17 @@ mod tests {
             SearchPageMatch {
                 page: 2,
                 occurrences: 1,
+                context: String::new(),
             },
             SearchPageMatch {
                 page: 5,
                 occurrences: 2,
+                context: String::new(),
             },
             SearchPageMatch {
                 page: 9,
                 occurrences: 1,
+                context: String::new(),
             },
         ];
 
@@ -3905,6 +5544,7 @@ mod tests {
         search.matches = vec![SearchPageMatch {
             page: 4,
             occurrences: 3,
+            context: String::new(),
         }];
         search.total_occurrences = 3;
         assert_eq!(search.highlight_request_id(4), 1);
@@ -3913,6 +5553,77 @@ mod tests {
             search.status_label(4).as_deref(),
             Some("  search 1/1 · 3 hits  /needle")
         );
+    }
+
+    #[test]
+    fn search_picker_groups_contextual_results_by_section_and_page() {
+        let search = SearchState {
+            query: "representation".into(),
+            request_id: 1,
+            matches: vec![
+                SearchPageMatch {
+                    page: 0,
+                    occurrences: 2,
+                    context: "…visual representation learning from video…".into(),
+                },
+                SearchPageMatch {
+                    page: 2,
+                    occurrences: 1,
+                    context: "…a representation objective used in prior work…".into(),
+                },
+            ],
+            total_occurrences: 3,
+            scanned: 3,
+            total_pages: 3,
+            searching: false,
+        };
+        let outline = vec![
+            OutlineItem {
+                title: "Introduction".into(),
+                page: 0,
+                depth: 0,
+            },
+            OutlineItem {
+                title: "Methods".into(),
+                page: 2,
+                depth: 0,
+            },
+        ];
+        let mut state = SearchPickerState::new(0);
+        state.sync(0, &search.matches);
+        let area = Rect::new(0, 0, 160, 30);
+        let geometry = LinkPickerGeometry::new(50, LinkPickerLayout::Vertical);
+        let (_, pane) = link_picker_panes(area, geometry);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_search_picker(
+                    frame,
+                    area,
+                    &search,
+                    &outline,
+                    &state,
+                    geometry,
+                    crate::theme::TOKYO_NIGHT_MOON,
+                )
+            })
+            .expect("draw search picker");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (pane.y..pane.y + pane.height)
+            .flat_map(|y| {
+                (pane.x..pane.x + pane.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+
+        assert!(rendered.contains("Search representation"));
+        assert!(rendered.contains("3 hits on 2 pages"));
+        assert!(rendered.contains("Section  Introduction"));
+        assert!(rendered.contains("Page 1 · 2 hits · current"));
+        assert!(rendered.contains("visual representation learning"));
+        assert!(rendered.contains("Section  Methods"));
+        assert!(rendered.contains("Page 3 · 1 hit"));
     }
 
     #[test]
@@ -4023,12 +5734,171 @@ mod tests {
     }
 
     #[test]
+    fn link_picker_supports_page_and_end_navigation_keys() {
+        let control = KeyModifiers::CONTROL;
+        assert_eq!(
+            link_picker_navigation_index(3, 30, KeyEvent::new(KeyCode::Char('f'), control), 10,),
+            Some(13)
+        );
+        assert_eq!(
+            link_picker_navigation_index(13, 30, KeyEvent::new(KeyCode::Char('b'), control), 10,),
+            Some(3)
+        );
+        assert_eq!(
+            link_picker_navigation_index(
+                13,
+                30,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                10,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            link_picker_navigation_index(
+                13,
+                30,
+                KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+                10,
+            ),
+            Some(29)
+        );
+        assert_eq!(
+            link_picker_navigation_index(
+                13,
+                30,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                10,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn split_link_picker_focuses_document_and_links_without_affecting_floating_layout() {
+        let plain = KeyModifiers::NONE;
+        assert_eq!(
+            link_picker_focus_for_key(
+                LinkPickerFocus::Links,
+                LinkPickerLayout::Vertical,
+                KeyEvent::new(KeyCode::Char('h'), plain),
+            ),
+            Some(LinkPickerFocus::Document)
+        );
+        assert_eq!(
+            link_picker_focus_for_key(
+                LinkPickerFocus::Document,
+                LinkPickerLayout::Horizontal,
+                KeyEvent::new(KeyCode::Char('l'), plain),
+            ),
+            Some(LinkPickerFocus::Links)
+        );
+        assert_eq!(
+            link_picker_focus_for_key(
+                LinkPickerFocus::Links,
+                LinkPickerLayout::Vertical,
+                KeyEvent::new(KeyCode::Tab, plain),
+            ),
+            Some(LinkPickerFocus::Document)
+        );
+        assert_eq!(
+            link_picker_focus_for_key(
+                LinkPickerFocus::Links,
+                LinkPickerLayout::Floating,
+                KeyEvent::new(KeyCode::Char('h'), plain),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn link_picker_filter_matches_labels_pages_and_urls() {
+        let links = vec![
+            DocumentLink {
+                source_page: 1,
+                source_top_ratio: 0.1,
+                ordinal: 0,
+                label: "(Grill et al., 2020)".into(),
+                source_context: None,
+                reference_context: None,
+                target: LinkTarget::Internal {
+                    page: 10,
+                    top_ratio: None,
+                },
+            },
+            DocumentLink {
+                source_page: 2,
+                source_top_ratio: 0.2,
+                ordinal: 0,
+                label: "project page".into(),
+                source_context: None,
+                reference_context: None,
+                target: LinkTarget::Uri("https://example.invalid/paper".into()),
+            },
+        ];
+        assert_eq!(filter_document_links(&links, "grill"), vec![0]);
+        assert_eq!(filter_document_links(&links, "source page 3"), vec![1]);
+        assert_eq!(filter_document_links(&links, "example paper"), vec![1]);
+        assert!(filter_document_links(&links, "missing").is_empty());
+    }
+
+    #[test]
+    fn link_picker_pointer_rows_resolve_only_link_entries() {
+        let links = vec![
+            DocumentLink {
+                source_page: 1,
+                source_top_ratio: 0.2,
+                ordinal: 0,
+                label: "first".into(),
+                source_context: None,
+                reference_context: None,
+                target: LinkTarget::Internal {
+                    page: 4,
+                    top_ratio: None,
+                },
+            },
+            DocumentLink {
+                source_page: 2,
+                source_top_ratio: 0.4,
+                ordinal: 0,
+                label: "second".into(),
+                source_context: None,
+                reference_context: None,
+                target: LinkTarget::Internal {
+                    page: 5,
+                    top_ratio: None,
+                },
+            },
+        ];
+        let area = Rect::new(0, 0, 160, 30);
+        let geometry = LinkPickerGeometry::new(50, LinkPickerLayout::Auto);
+        let list = link_picker_list_area(area, geometry);
+        let state = LinkPickerState::new(0);
+        let document = LinkPickerDocument::new(&links, &[]);
+
+        assert_eq!(
+            link_picker_link_at_position(area, document, &state, geometry, list.x, list.y),
+            None
+        );
+        assert_eq!(
+            link_picker_link_at_position(area, document, &state, geometry, list.x, list.y + 1),
+            Some(0)
+        );
+        assert_eq!(
+            link_picker_link_at_position(area, document, &state, geometry, list.x, list.y + 3),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn persistent_link_picker_tracks_the_current_page_in_the_document_index() {
         let links = vec![
             DocumentLink {
                 source_page: 0,
+                source_top_ratio: 0.1,
                 ordinal: 0,
                 label: "first".into(),
+                source_context: None,
+                reference_context: None,
                 target: LinkTarget::Internal {
                     page: 4,
                     top_ratio: None,
@@ -4036,8 +5906,11 @@ mod tests {
             },
             DocumentLink {
                 source_page: 4,
+                source_top_ratio: 0.2,
                 ordinal: 0,
                 label: "current".into(),
+                source_context: None,
+                reference_context: None,
                 target: LinkTarget::Internal {
                     page: 6,
                     top_ratio: None,
@@ -4045,8 +5918,11 @@ mod tests {
             },
             DocumentLink {
                 source_page: 6,
+                source_top_ratio: 0.3,
                 ordinal: 0,
                 label: "later".into(),
+                source_context: None,
+                reference_context: None,
                 target: LinkTarget::Internal {
                     page: 7,
                     top_ratio: None,
@@ -4068,8 +5944,14 @@ mod tests {
         let links = vec![
             DocumentLink {
                 source_page: 2,
+                source_top_ratio: 0.2,
                 ordinal: 0,
                 label: "[12]".into(),
+                source_context: Some(
+                    "Prior work identifies the same limitation [12] in dense retrieval. Additional synthetic context continues onto a second line for validation."
+                        .into(),
+                ),
+                reference_context: Some("[12] Example et al. A synthetic reference title.".into()),
                 target: LinkTarget::Internal {
                     page: 7,
                     top_ratio: None,
@@ -4077,9 +5959,24 @@ mod tests {
             },
             DocumentLink {
                 source_page: 3,
+                source_top_ratio: 0.3,
                 ordinal: 0,
                 label: "project page".into(),
+                source_context: None,
+                reference_context: None,
                 target: LinkTarget::Uri("https://example.invalid/paper".into()),
+            },
+        ];
+        let outline = vec![
+            OutlineItem {
+                title: "Introduction".into(),
+                page: 2,
+                depth: 0,
+            },
+            OutlineItem {
+                title: "Project links".into(),
+                page: 3,
+                depth: 0,
             },
         ];
         let mut state = LinkPickerState::new(2);
@@ -4096,7 +5993,7 @@ mod tests {
                 draw_link_picker(
                     frame,
                     area,
-                    &links,
+                    LinkPickerDocument::new(&links, &outline),
                     &state,
                     LinkIndexProgress {
                         scanned: 12,
@@ -4121,14 +6018,138 @@ mod tests {
             .collect();
 
         assert!(rendered.contains("Links 2"));
+        assert!(rendered.contains("auto/vertical"));
+        assert!(rendered.contains("Section  Introduction"));
+        assert!(rendered.contains("Section  Project links"));
         assert!(rendered.contains("Page 3 · current"));
         assert!(rendered.contains("citation [12]"));
         assert!(!rendered.contains("PDF page 8"));
         assert!(rendered.contains("project page"));
         assert!(!rendered.contains("Selected"));
         assert!(rendered.contains("Page 4 → https://example.invalid/paper"));
-        assert!(rendered.contains("copy URL"));
-        assert!(rendered.contains("2/2"));
+        assert!(!rendered.contains("copy URL"));
+        assert!(!rendered.contains("2/2"));
+
+        state.focus = LinkPickerFocus::Document;
+        terminal
+            .draw(|frame| {
+                draw_link_picker(
+                    frame,
+                    area,
+                    LinkPickerDocument::new(&links, &outline),
+                    &state,
+                    LinkIndexProgress {
+                        scanned: 12,
+                        total_pages: 12,
+                        indexing: false,
+                    },
+                    geometry,
+                    crate::theme::TOKYO_NIGHT_MOON,
+                )
+            })
+            .expect("draw document-focused split");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (pane.y..pane.y + pane.height)
+            .flat_map(|y| {
+                (pane.x..pane.x + pane.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+        assert!(rendered.contains("PDF focused  · l: links"));
+
+        state.focus = LinkPickerFocus::Links;
+
+        state.select(0, &links);
+        terminal
+            .draw(|frame| {
+                draw_link_picker(
+                    frame,
+                    area,
+                    LinkPickerDocument::new(&links, &outline),
+                    &state,
+                    LinkIndexProgress {
+                        scanned: 12,
+                        total_pages: 12,
+                        indexing: false,
+                    },
+                    geometry,
+                    crate::theme::TOKYO_NIGHT_MOON,
+                )
+            })
+            .expect("draw citation context");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (pane.y..pane.y + pane.height)
+            .flat_map(|y| {
+                (pane.x..pane.x + pane.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+        assert!(rendered.contains("Context  Prior work identifies"));
+        assert!(rendered.contains("second line for validation."));
+        assert!(rendered.contains("Reference  [12] Example et al."));
+
+        state.filter = "project".into();
+        state.filtering = true;
+        state.select(1, &links);
+        terminal
+            .draw(|frame| {
+                draw_link_picker(
+                    frame,
+                    area,
+                    LinkPickerDocument::new(&links, &outline),
+                    &state,
+                    LinkIndexProgress {
+                        scanned: 12,
+                        total_pages: 12,
+                        indexing: false,
+                    },
+                    geometry,
+                    crate::theme::TOKYO_NIGHT_MOON,
+                )
+            })
+            .expect("draw filtered links");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (pane.y..pane.y + pane.height)
+            .flat_map(|y| {
+                (pane.x..pane.x + pane.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+        assert!(rendered.contains("Links 1/2"));
+        assert!(rendered.contains("/ project"));
+        assert!(!rendered.contains("citation [12]"));
+        assert!(!rendered.contains("1/1"));
+
+        state.filter.clear();
+        state.filtering = false;
+        state.select(0, &links);
+
+        let compact_area = Rect::new(0, 0, 80, 24);
+        let compact_geometry = LinkPickerGeometry::new(50, LinkPickerLayout::Horizontal);
+        let (_, compact_pane) = link_picker_panes(compact_area, compact_geometry);
+        terminal
+            .draw(|frame| {
+                draw_link_picker(
+                    frame,
+                    compact_area,
+                    LinkPickerDocument::new(&links, &outline),
+                    &state,
+                    LinkIndexProgress {
+                        scanned: 12,
+                        total_pages: 12,
+                        indexing: false,
+                    },
+                    compact_geometry,
+                    crate::theme::TOKYO_NIGHT_MOON,
+                )
+            })
+            .expect("draw compact horizontal citation context");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (compact_pane.y..compact_pane.y + compact_pane.height)
+            .flat_map(|y| {
+                (compact_pane.x..compact_pane.x + compact_pane.width)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+        assert!(rendered.contains("Context  Prior work identifies"));
+        assert!(rendered.contains("Reference  [12] Example et al."));
     }
 
     #[test]
@@ -4145,7 +6166,7 @@ mod tests {
                 draw_link_picker(
                     frame,
                     area,
-                    &[],
+                    LinkPickerDocument::new(&[], &[]),
                     &state,
                     LinkIndexProgress {
                         scanned: 28,
@@ -4172,8 +6193,11 @@ mod tests {
     fn floating_link_picker_is_centered_opaque_and_bordered() {
         let links = vec![DocumentLink {
             source_page: 0,
+            source_top_ratio: 0.1,
             ordinal: 0,
             label: "project page".into(),
+            source_context: None,
+            reference_context: None,
             target: LinkTarget::Uri("https://example.invalid/paper".into()),
         }];
         let state = LinkPickerState::new(0);
@@ -4188,7 +6212,7 @@ mod tests {
                 draw_link_picker(
                     frame,
                     area,
-                    &links,
+                    LinkPickerDocument::new(&links, &[]),
                     &state,
                     LinkIndexProgress {
                         scanned: 1,
@@ -4209,14 +6233,24 @@ mod tests {
             buffer[(popup.x + popup.width / 2, popup.y + popup.height / 2)].bg,
             picker_color(crate::theme::TOKYO_NIGHT_MOON.bg_dark)
         );
+        let rendered: String = (popup.y..popup.y + popup.height)
+            .flat_map(|y| {
+                (popup.x..popup.x + popup.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+        assert!(rendered.contains("j/k C-b/f g/G"));
+        assert!(rendered.contains("esc"));
     }
 
     #[test]
-    fn document_link_sidebar_uses_compact_controls_when_narrow() {
+    fn split_link_sidebar_has_no_navigation_footer() {
         let links = vec![DocumentLink {
             source_page: 0,
+            source_top_ratio: 0.1,
             ordinal: 0,
             label: "project page".into(),
+            source_context: None,
+            reference_context: None,
             target: LinkTarget::Uri("https://example.invalid/paper".into()),
         }];
         let state = LinkPickerState::new(0);
@@ -4231,7 +6265,7 @@ mod tests {
                 draw_link_picker(
                     frame,
                     area,
-                    &links,
+                    LinkPickerDocument::new(&links, &[]),
                     &state,
                     LinkIndexProgress {
                         scanned: 1,
@@ -4250,10 +6284,11 @@ mod tests {
             })
             .collect();
 
-        assert!(rendered.contains("j/k"));
-        assert!(rendered.contains("↵"));
-        assert!(rendered.contains("esc"));
-        assert!(rendered.contains("1/1"));
+        assert!(!rendered.contains("j/k"));
+        assert!(!rendered.contains("↵"));
+        assert!(!rendered.contains("s/a"));
+        assert!(!rendered.contains("esc"));
+        assert!(!rendered.contains("1/1"));
     }
 
     #[test]
@@ -4263,14 +6298,14 @@ mod tests {
                 Rect::new(0, 0, 100, 30),
                 LinkPickerGeometry::new(50, LinkPickerLayout::Auto),
             ),
-            24
+            20
         );
         assert_eq!(
             link_picker_visible_height(
                 Rect::new(0, 0, 20, 8),
                 LinkPickerGeometry::new(50, LinkPickerLayout::Auto),
             ),
-            5
+            6
         );
     }
 
@@ -4280,6 +6315,23 @@ mod tests {
         assert_eq!(link_picker_label("8,"), "citation [8]");
         assert_eq!(link_picker_label("34]"), "citation [34]");
         assert_eq!(link_picker_label("project page"), "project page");
+    }
+
+    #[test]
+    fn link_picker_cycles_explicit_layouts_from_the_resolved_layout() {
+        let wide = Rect::new(0, 0, 120, 30);
+        assert_eq!(
+            next_link_picker_layout(wide, LinkPickerLayout::Auto),
+            LinkPickerLayout::Horizontal
+        );
+        assert_eq!(
+            next_link_picker_layout(wide, LinkPickerLayout::Horizontal),
+            LinkPickerLayout::Floating
+        );
+        assert_eq!(
+            next_link_picker_layout(wide, LinkPickerLayout::Floating),
+            LinkPickerLayout::Vertical
+        );
     }
 
     #[test]
@@ -4309,16 +6361,92 @@ mod tests {
         assert_eq!(browser.selected, 0);
         assert!(apply_picker_navigation(
             &mut browser,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            10,
+            false,
+        ));
+        assert_eq!(browser.selected, 1);
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            10,
+            false,
+        ));
+        assert_eq!(browser.selected, 0);
+        assert!(apply_picker_navigation(
+            &mut browser,
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             10,
+            false,
         ));
         assert_eq!(browser.selected, 1);
         assert!(apply_picker_navigation(
             &mut browser,
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             10,
+            false,
         ));
         assert_eq!(browser.selected, 0);
+    }
+
+    #[test]
+    fn picker_supports_page_and_end_navigation_keys() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for index in 0..8 {
+            fs::write(directory.path().join(format!("{index}.pdf")), b"synthetic").expect("PDF");
+        }
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            3,
+            false,
+        ));
+        assert_eq!(browser.selected, 3);
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            3,
+            false,
+        ));
+        assert_eq!(browser.selected, 0);
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            3,
+            false,
+        ));
+        assert_eq!(browser.selected, browser.filtered_indices.len() - 1);
+        assert!(apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            3,
+            false,
+        ));
+        assert_eq!(browser.selected, 0);
+
+        browser.filter = "one".into();
+        browser.rebuild_filter();
+        assert!(!apply_picker_navigation(
+            &mut browser,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            3,
+            true,
+        ));
+    }
+
+    #[test]
+    fn picker_escape_clears_the_filter_before_closing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("one.pdf"), b"synthetic").expect("PDF");
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.filter = "one".into();
+        browser.rebuild_filter();
+
+        assert!(clear_picker_filter(&mut browser));
+        assert!(browser.filter.is_empty());
+        assert!(!clear_picker_filter(&mut browser));
     }
 
     #[test]
@@ -4340,7 +6468,7 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_picker(frame, &browser, crate::theme::TOKYO_NIGHT_MOON))
+            .draw(|frame| draw_picker(frame, &browser, false, crate::theme::TOKYO_NIGHT_MOON))
             .expect("draw picker");
         let buffer = terminal.backend().buffer();
         let right = popup.x + popup.width - 1;
@@ -4364,7 +6492,7 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_picker(frame, &browser, theme))
+            .draw(|frame| draw_picker(frame, &browser, false, theme))
             .expect("draw picker");
         let buffer = terminal.backend().buffer();
 
@@ -4402,7 +6530,7 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_theme_picker(frame, &themes, 1))
+            .draw(|frame| draw_theme_picker(frame, &themes, &[0, 1], 1, "", false))
             .expect("draw theme picker");
         let buffer = terminal.backend().buffer();
         let rendered: String = (popup.y..popup.y + popup.height)
@@ -4415,6 +6543,7 @@ mod tests {
         assert!(rendered.contains("tokyo-night-moon"));
         assert!(rendered.contains("synthetic-theme"));
         assert!(rendered.contains("Themes"));
+        assert_eq!(filter_theme_indices(&themes, "synthetic"), vec![1]);
     }
 
     #[test]
@@ -4440,11 +6569,17 @@ mod tests {
         assert!(rendered.contains("Viewer"));
         assert!(rendered.contains("search document"));
         assert!(rendered.contains("next / prev match"));
-        assert!(rendered.contains("document links"));
+        assert!(rendered.contains("browse PDF links"));
+        assert!(rendered.contains("filter/new search"));
+        assert!(!rendered.contains("hover (links)"));
+        assert!(rendered.contains("select tab"));
+        assert!(rendered.contains("link mode + browser"));
+        assert!(rendered.contains("leave mode / close tab"));
+        assert!(rendered.contains("cycle / auto side layout"));
         assert!(rendered.contains("toggle performance timings"));
         assert!(rendered.contains("choose theme"));
         assert!(rendered.contains("open PDF in new tab"));
-        assert!(rendered.contains("clear search / exit"));
+        assert!(rendered.contains("close / clear / exit"));
         assert!(rendered.contains("? / esc / q"));
     }
 
@@ -4462,7 +6597,7 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_picker(frame, &browser, crate::theme::TOKYO_NIGHT_MOON))
+            .draw(|frame| draw_picker(frame, &browser, false, crate::theme::TOKYO_NIGHT_MOON))
             .expect("draw picker");
         let buffer = terminal.backend().buffer();
         let rendered: String = (popup.y + 1..popup.y + popup.height - 1)
@@ -4478,7 +6613,7 @@ mod tests {
         browser.filter = "recent".into();
         browser.rebuild_filter();
         terminal
-            .draw(|frame| draw_picker(frame, &browser, crate::theme::TOKYO_NIGHT_MOON))
+            .draw(|frame| draw_picker(frame, &browser, true, crate::theme::TOKYO_NIGHT_MOON))
             .expect("draw filtered picker");
         let buffer = terminal.backend().buffer();
         let rendered: String = (popup.y + 1..popup.y + popup.height - 1)
@@ -4489,6 +6624,7 @@ mod tests {
             .collect();
 
         assert!(rendered.contains("recent.pdf"));
+        assert!(rendered.contains("RECENT"));
         assert!(rendered.contains(&parent));
     }
 
