@@ -398,7 +398,7 @@ fn render_timing_status(
         + highlight_ms.unwrap_or_default()
         + compression_ms
         + transfer_ms;
-    format!("frame {total_ms}ms")
+    format!("render {total_ms}ms")
 }
 
 enum PendingOpen {
@@ -3158,7 +3158,7 @@ mod tests {
     fn render_timings_are_compact_by_default_and_expand_on_demand() {
         assert_eq!(
             render_timing_status(15, Some(12), Some(0), 27, 17, false),
-            "frame 71ms"
+            "render 71ms"
         );
         assert_eq!(
             render_timing_status(15, Some(12), Some(0), 27, 17, true),
@@ -3173,7 +3173,7 @@ mod tests {
             transfer_ms: 17,
             link_count: 5,
         };
-        assert_eq!(snapshot.status(false, true), "frame 71ms  5 links");
+        assert_eq!(snapshot.status(false, true), "render 71ms  5 links");
     }
 
     #[test]
