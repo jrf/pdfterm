@@ -1903,6 +1903,9 @@ impl App {
             return self.redraw_link_picker(output);
         }
         match key.code {
+            KeyCode::Esc | KeyCode::Char('q') if self.link_mode => {
+                return self.close_link_picker_and_exit_link_mode(output);
+            }
             KeyCode::Esc if filtering || has_filter => {
                 let state = self.link_picker.as_mut().expect("link picker state");
                 state.filter.clear();
@@ -4741,7 +4744,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("b", "return from followed link"),
         ("f", "open PDF in new tab"),
         ("q", "leave mode / close tab"),
-        ("Esc", "close / clear / exit"),
+        ("Esc", "leave mode / clear / exit"),
         ("?", "open help"),
     ];
 
@@ -6579,7 +6582,7 @@ mod tests {
         assert!(rendered.contains("toggle performance timings"));
         assert!(rendered.contains("choose theme"));
         assert!(rendered.contains("open PDF in new tab"));
-        assert!(rendered.contains("close / clear / exit"));
+        assert!(rendered.contains("leave mode / clear / exit"));
         assert!(rendered.contains("? / esc / q"));
     }
 

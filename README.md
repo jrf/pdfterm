@@ -63,7 +63,7 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `Alt-1` … `Alt-9` | select a numbered tab directly |
 | `?` | open the keybinding help menu |
 | `q` | leave link mode when active; otherwise close the current tab |
-| `Esc` | close a side pane, clear search, or exit when no mode is active |
+| `Esc` | leave link mode; otherwise close a pane, clear search, or exit |
 
 In fit-width and fit-height modes, the movement keys scroll within a page that is
 larger than the viewport and cross into the adjacent page at the edges. The `h`/`l`
@@ -96,10 +96,11 @@ the selected link. Closing the browser restores the view from before the preview
 move by a viewport and `g`/`G` select the first or last link. In a split layout,
 press `h` to focus the PDF and `l` to return to the link list (`Tab` toggles focus
 too); PDF movement keys then navigate the preview without closing the browser.
-Press `q` to close the browser and disable link mode. Floating layout remains
-modal. Press `/` to filter
+While link mode is active, press `Esc` or `q` once to close the browser and
+disable link mode. Floating layout remains modal. Press `/` to filter
 by label, source page, destination page, or URL;
-`Esc` clears the filter before closing the picker. Links are ordered by source page,
+when the browser was opened with `Enter`, `Esc` clears the filter before closing
+the picker. Links are ordered by source page,
 then top-to-bottom and left-to-right. Wrapped or column-interleaved PDF annotations
 that share a destination are reconstructed as one readable entry. The selected-link
 panel shows source and destination details plus, when PDF
