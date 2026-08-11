@@ -197,7 +197,9 @@ installed theme for the current session; picker changes do not rewrite
 `config.toml`.
 
 Dark mode uses `bg_dark` and `fg` for the document background and foreground by
-default. A theme can override those choices independently:
+default. Low-contrast dark-blue text inside PDF link annotations is lifted
+toward the theme's `cyan` so links remain readable. A theme can override the
+document background and foreground independently:
 
 ```toml
 [document]

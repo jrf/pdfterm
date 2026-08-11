@@ -23,6 +23,8 @@ const LINK_INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
 const LINK_HIGHLIGHT_ALPHA: u16 = 40;
 const LINK_BORDER_ALPHA: u16 = 210;
+const DARK_LINK_BLUE_DOMINANCE: u8 = 28;
+const MINIMUM_DARK_LINK_CONTRAST: f32 = 4.5;
 
 pub type DocumentId = u64;
 
@@ -804,8 +806,30 @@ fn run_worker(
             } else {
                 Vec::new()
             };
-            let highlight_elapsed = (search_rectangles.is_some() || !links.is_empty()).then(|| {
+            let dark_mode_link_rectangles = if request.key.invert {
+                if request.key.link_mode {
+                    links.iter().map(|link| link.rect).collect()
+                } else {
+                    extract_page_link_rectangles(&page, &config, width, height)
+                }
+            } else {
+                Vec::new()
+            };
+            let highlight_elapsed = (search_rectangles.is_some()
+                || !links.is_empty()
+                || !dark_mode_link_rectangles.is_empty())
+            .then(|| {
                 let started = Instant::now();
+                if !dark_mode_link_rectangles.is_empty() {
+                    apply_dark_mode_link_contrast(
+                        &mut raw_rgba,
+                        width,
+                        height,
+                        &dark_mode_link_rectangles,
+                        request.key.dark_mode_style,
+                        request.key.link_highlight,
+                    );
+                }
                 if let Some(rectangles) = search_rectangles {
                     apply_search_highlights(
                         &page,
@@ -1574,6 +1598,27 @@ fn extract_page_links(
     links
 }
 
+fn extract_page_link_rectangles(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+) -> Vec<PageLinkRect> {
+    page.links()
+        .iter()
+        .filter_map(|link| {
+            let bounds = link.rect().ok()?;
+            let rect = page_rect_to_pixels(page, config, width, height, bounds)?;
+            Some(PageLinkRect {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            })
+        })
+        .collect()
+}
+
 fn extract_document_links(
     document: &PdfDocument,
     page: &PdfPage,
@@ -1910,6 +1955,86 @@ fn apply_link_highlights(
     }
 }
 
+fn apply_dark_mode_link_contrast(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    rectangles: &[PageLinkRect],
+    style: DarkModeStyle,
+    accent: [u8; 3],
+) {
+    let Ok(stride) = usize::try_from(width).map(|width| width.saturating_mul(4)) else {
+        return;
+    };
+    for rectangle in rectangles {
+        let left = rectangle.left.min(width);
+        let right = rectangle.right.min(width);
+        let top = rectangle.top.min(height);
+        let bottom = rectangle.bottom.min(height);
+        for y in top..bottom {
+            let Ok(row_start) = usize::try_from(y).map(|y| y.saturating_mul(stride)) else {
+                continue;
+            };
+            for x in left..right {
+                let Ok(offset) =
+                    usize::try_from(x).map(|x| row_start.saturating_add(x.saturating_mul(4)))
+                else {
+                    continue;
+                };
+                let Some(pixel) = rgba.get_mut(offset..offset.saturating_add(4)) else {
+                    continue;
+                };
+                let original = [pixel[0], pixel[1], pixel[2]];
+                let adjusted = accessible_dark_link_pixel(original, style, accent);
+                pixel[..3].copy_from_slice(&adjusted);
+            }
+        }
+    }
+}
+
+fn accessible_dark_link_pixel(pixel: [u8; 3], style: DarkModeStyle, accent: [u8; 3]) -> [u8; 3] {
+    if pixel[2].saturating_sub(pixel[0].max(pixel[1])) < DARK_LINK_BLUE_DOMINANCE
+        || contrast_ratio(pixel, style.background) >= MINIMUM_DARK_LINK_CONTRAST
+    {
+        return pixel;
+    }
+
+    for target in [accent, style.foreground] {
+        for amount in [64, 96, 128, 160, 192, 224, 255] {
+            let candidate = std::array::from_fn(|channel| {
+                lerp_channel(pixel[channel], target[channel], amount)
+            });
+            if contrast_ratio(candidate, style.background) >= MINIMUM_DARK_LINK_CONTRAST {
+                return candidate;
+            }
+        }
+    }
+    pixel
+}
+
+fn contrast_ratio(first: [u8; 3], second: [u8; 3]) -> f32 {
+    let first = relative_luminance(first);
+    let second = relative_luminance(second);
+    let (lighter, darker) = if first >= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn relative_luminance(color: [u8; 3]) -> f32 {
+    let linear = color.map(|channel| {
+        let channel = f32::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
+}
+
 fn blend_highlight_rectangle(
     rgba: &mut [u8],
     width: u32,
@@ -2000,8 +2125,9 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DarkModeStyle, DarkModeTransform, FitMode, PixelRect, blend_highlight_rectangle,
-        context_around_label, count_search_matches, dark_mode_pixel, darken_rgba,
+        DarkModeStyle, DarkModeTransform, FitMode, PageLinkRect, PixelRect,
+        accessible_dark_link_pixel, apply_dark_mode_link_contrast, blend_highlight_rectangle,
+        context_around_label, contrast_ratio, count_search_matches, dark_mode_pixel, darken_rgba,
         mask_quadrilateral, normalize_search_text, reference_context,
     };
 
@@ -2284,6 +2410,57 @@ mod tests {
             dark_mode_pixel([20, 100, 200], DarkModeTransform::new(NEUTRAL_DARK_MODE));
         assert!(blue > green);
         assert!(green > red);
+    }
+
+    #[test]
+    fn dark_mode_lifts_low_contrast_blue_only_inside_link_annotations() {
+        let style = DarkModeStyle::new([30, 32, 48], [200, 211, 245]);
+        let accent = [134, 225, 252];
+        let transformed = dark_mode_pixel([0, 0, 255], DarkModeTransform::new(style));
+        assert!(contrast_ratio(transformed, style.background) < 4.5);
+
+        let adjusted = accessible_dark_link_pixel(transformed, style, accent);
+        assert_ne!(adjusted, transformed);
+        assert!(contrast_ratio(adjusted, style.background) >= 4.5);
+        assert_eq!(accessible_dark_link_pixel(accent, style, accent), accent);
+
+        let mut pixels = [
+            transformed[0],
+            transformed[1],
+            transformed[2],
+            255,
+            transformed[0],
+            transformed[1],
+            transformed[2],
+            128,
+            transformed[0],
+            transformed[1],
+            transformed[2],
+            64,
+        ];
+        apply_dark_mode_link_contrast(
+            &mut pixels,
+            3,
+            1,
+            &[PageLinkRect {
+                left: 1,
+                top: 0,
+                right: 2,
+                bottom: 1,
+            }],
+            style,
+            accent,
+        );
+        assert_eq!(
+            &pixels[..4],
+            &[transformed[0], transformed[1], transformed[2], 255]
+        );
+        assert_eq!(&pixels[4..7], &adjusted);
+        assert_eq!(pixels[7], 128);
+        assert_eq!(
+            &pixels[8..],
+            &[transformed[0], transformed[1], transformed[2], 64]
+        );
     }
 
     #[test]
