@@ -39,9 +39,7 @@ const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LINK_PREVIEW_DELAY: Duration = Duration::from_millis(120);
 const INITIAL_DOCUMENT_ID: DocumentId = 1;
-const PAGE_BACKGROUND_Z_INDEX: i32 = i32::MIN / 2 - 3;
 const PAGE_IMAGE_Z_INDEX: i32 = i32::MIN / 2 - 2;
-const PAGE_BACKGROUND_IMAGE_ID: u32 = u32::MAX - 2;
 const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
@@ -2482,26 +2480,7 @@ impl App {
     }
 
     fn prepare_image_canvas(&self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
-        execute!(output, ResetColor)?;
-        for row in viewport.top..viewport.top.saturating_add(viewport.rows) {
-            execute!(output, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        }
-
-        let background = kitty::compress_rgba(&rgba_pixel(self.theme.bg, u8::MAX))?;
-        execute!(output, MoveTo(0, viewport.top))?;
-        kitty::transmit_compressed_rgba(
-            output,
-            &background,
-            1,
-            1,
-            Placement {
-                image_id: PAGE_BACKGROUND_IMAGE_ID,
-                columns: viewport.columns,
-                rows: viewport.rows,
-                z_index: PAGE_BACKGROUND_Z_INDEX,
-                crop: None,
-            },
-        )
+        clear_image_canvas(output, viewport)
     }
 
     fn draw_status(
@@ -3111,6 +3090,14 @@ struct PositionedImage {
     placement: Placement,
 }
 
+fn clear_image_canvas(output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+    execute!(output, ResetColor)?;
+    for row in viewport.top..viewport.top.saturating_add(viewport.rows) {
+        execute!(output, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinkPickerImage {
     image_id: u32,
@@ -3338,13 +3325,6 @@ fn restore_link_picker_split(
         Hide
     )?;
     output.flush()
-}
-
-fn rgba_pixel(color: crossterm::style::Color, alpha: u8) -> [u8; 4] {
-    match color {
-        crossterm::style::Color::Rgb { r, g, b } => [r, g, b, alpha],
-        _ => [0, 0, 0, alpha],
-    }
 }
 
 fn link_number_index(input: &str, link_count: usize) -> Option<usize> {
@@ -5408,10 +5388,10 @@ mod tests {
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
         PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState,
-        apply_picker_navigation, clear_picker, clear_picker_filter, cycled_tab_index,
-        draw_help_menu, draw_link_picker, draw_picker, draw_search_picker, draw_theme_picker,
-        filter_document_links, filter_outline, filter_theme_indices, link_at_cell,
-        link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
+        apply_picker_navigation, clear_image_canvas, clear_picker, clear_picker_filter,
+        cycled_tab_index, draw_help_menu, draw_link_picker, draw_picker, draw_search_picker,
+        draw_theme_picker, filter_document_links, filter_outline, filter_theme_indices,
+        link_at_cell, link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
         link_picker_list_area, link_picker_navigation_index, link_picker_panes,
         link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
         outline_start_index, picker_color, picker_rect, render_timing_status,
@@ -5423,7 +5403,7 @@ mod tests {
     use crate::pdf::{
         DocumentLink, LinkTarget, OutlineItem, PageLink, PageLinkRect, SearchPageMatch,
     };
-    use crate::terminal::ImagePlacement;
+    use crate::terminal::{ImagePlacement, Viewport};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6639,6 +6619,31 @@ mod tests {
 
         assert!(output.windows(4).any(|window| window == b"\x1b[2J"));
         assert!(output.windows(6).any(|window| window == b"\x1b[?25l"));
+    }
+
+    #[test]
+    fn image_canvas_uses_terminal_background_without_a_scaled_graphics_layer() {
+        let mut output = Vec::new();
+        let viewport = Viewport {
+            columns: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            top: 0,
+            status_row: 24,
+        };
+
+        clear_image_canvas(&mut output, viewport).expect("prepare canvas");
+
+        assert!(!output.windows(3).any(|window| window == b"\x1b_"));
+        assert!(output.windows(4).any(|window| window == b"\x1b[0m"));
+        assert_eq!(
+            output
+                .windows(4)
+                .filter(|window| *window == b"\x1b[2K")
+                .count(),
+            usize::from(viewport.rows)
+        );
     }
 
     #[test]
