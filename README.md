@@ -198,8 +198,9 @@ installed theme for the current session; picker changes do not rewrite
 
 Dark mode uses `bg_dark` and `fg` for the document background and foreground by
 default. Low-contrast dark-blue text inside PDF link annotations is lifted
-toward the theme's `cyan` so links remain readable. A theme can override the
-document background and foreground independently:
+toward the document foreground, with the theme's `cyan` as a fallback, so links
+remain readable. A theme can override the document background and foreground
+independently:
 
 ```toml
 [document]

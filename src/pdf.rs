@@ -22,7 +22,9 @@ const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const LINK_INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
 const LINK_HIGHLIGHT_ALPHA: u16 = 40;
+const DARK_LINK_HIGHLIGHT_ALPHA: u16 = 10;
 const LINK_BORDER_ALPHA: u16 = 210;
+const DARK_LINK_BORDER_ALPHA: u16 = 150;
 const DARK_LINK_BLUE_DOMINANCE: u8 = 28;
 const MINIMUM_DARK_LINK_CONTRAST: f32 = 4.5;
 
@@ -848,6 +850,7 @@ fn run_worker(
                         height,
                         &links,
                         request.key.link_highlight,
+                        request.key.invert,
                     );
                 }
                 started.elapsed()
@@ -1922,6 +1925,7 @@ fn apply_link_highlights(
     height: u32,
     links: &[PageLink],
     color: [u8; 3],
+    dark_mode: bool,
 ) {
     for link in links {
         let rect = PixelRect {
@@ -1930,27 +1934,46 @@ fn apply_link_highlights(
             right: link.rect.right,
             bottom: link.rect.bottom,
         };
-        blend_rectangle(rgba, width, height, rect, color, LINK_HIGHLIGHT_ALPHA);
+        let fill_alpha = if dark_mode {
+            DARK_LINK_HIGHLIGHT_ALPHA
+        } else {
+            LINK_HIGHLIGHT_ALPHA
+        };
+        blend_rectangle(rgba, width, height, rect, color, fill_alpha);
         let border = 2;
-        for edge in [
-            PixelRect {
-                bottom: rect.top.saturating_add(border),
-                ..rect
-            },
-            PixelRect {
-                top: rect.bottom.saturating_sub(border),
-                ..rect
-            },
-            PixelRect {
-                right: rect.left.saturating_add(border),
-                ..rect
-            },
-            PixelRect {
-                left: rect.right.saturating_sub(border),
-                ..rect
-            },
-        ] {
-            blend_rectangle(rgba, width, height, edge, color, LINK_BORDER_ALPHA);
+        if dark_mode {
+            blend_rectangle(
+                rgba,
+                width,
+                height,
+                PixelRect {
+                    top: rect.bottom.saturating_sub(border),
+                    ..rect
+                },
+                color,
+                DARK_LINK_BORDER_ALPHA,
+            );
+        } else {
+            for edge in [
+                PixelRect {
+                    bottom: rect.top.saturating_add(border),
+                    ..rect
+                },
+                PixelRect {
+                    top: rect.bottom.saturating_sub(border),
+                    ..rect
+                },
+                PixelRect {
+                    right: rect.left.saturating_add(border),
+                    ..rect
+                },
+                PixelRect {
+                    left: rect.right.saturating_sub(border),
+                    ..rect
+                },
+            ] {
+                blend_rectangle(rgba, width, height, edge, color, LINK_BORDER_ALPHA);
+            }
         }
     }
 }
@@ -1999,7 +2022,8 @@ fn accessible_dark_link_pixel(pixel: [u8; 3], style: DarkModeStyle, accent: [u8;
         return pixel;
     }
 
-    for target in [accent, style.foreground] {
+    let foreground = style.foreground;
+    for target in [foreground, accent] {
         for amount in [64, 96, 128, 160, 192, 224, 255] {
             let candidate = std::array::from_fn(|channel| {
                 lerp_channel(pixel[channel], target[channel], amount)
@@ -2125,10 +2149,10 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DarkModeStyle, DarkModeTransform, FitMode, PageLinkRect, PixelRect,
-        accessible_dark_link_pixel, apply_dark_mode_link_contrast, blend_highlight_rectangle,
-        context_around_label, contrast_ratio, count_search_matches, dark_mode_pixel, darken_rgba,
-        mask_quadrilateral, normalize_search_text, reference_context,
+        DarkModeStyle, DarkModeTransform, FitMode, LinkTarget, PageLink, PageLinkRect, PixelRect,
+        accessible_dark_link_pixel, apply_dark_mode_link_contrast, apply_link_highlights,
+        blend_highlight_rectangle, context_around_label, contrast_ratio, count_search_matches,
+        dark_mode_pixel, darken_rgba, mask_quadrilateral, normalize_search_text, reference_context,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
@@ -2318,6 +2342,7 @@ mod tests {
             link_height,
             &links,
             [0x86, 0xe1, 0xfc],
+            false,
         );
         assert_ne!(link_highlighted, link_original);
     }
@@ -2461,6 +2486,30 @@ mod tests {
             &pixels[8..],
             &[transformed[0], transformed[1], transformed[2], 64]
         );
+    }
+
+    #[test]
+    fn dark_mode_link_highlight_uses_a_subtle_fill_and_underline() {
+        let color = [134, 225, 252];
+        let link = PageLink {
+            rect: PageLinkRect {
+                left: 1,
+                top: 1,
+                right: 5,
+                bottom: 4,
+            },
+            label: "reader@example.invalid".into(),
+            target: LinkTarget::Uri("mailto:reader@example.invalid".into()),
+        };
+        let mut pixels = [30, 32, 48, 255].repeat(6 * 5);
+
+        apply_link_highlights(&mut pixels, 6, 5, &[link], color, true);
+
+        let fill = &pixels[(6 + 2) * 4..(6 + 2) * 4 + 3];
+        let underline = &pixels[(3 * 6 + 2) * 4..(3 * 6 + 2) * 4 + 3];
+        assert_eq!(fill, &[34, 39, 56]);
+        assert_eq!(underline, &[92, 148, 171]);
+        assert_eq!(&pixels[..4], &[30, 32, 48, 255]);
     }
 
     #[test]
