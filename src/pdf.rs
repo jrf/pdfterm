@@ -22,9 +22,8 @@ const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const LINK_INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
 const LINK_HIGHLIGHT_ALPHA: u16 = 40;
-const DARK_LINK_HIGHLIGHT_ALPHA: u16 = 10;
 const LINK_BORDER_ALPHA: u16 = 210;
-const DARK_LINK_BORDER_ALPHA: u16 = 150;
+const DARK_LINK_BORDER_ALPHA: u16 = 96;
 const DARK_LINK_BLUE_DOMINANCE: u8 = 28;
 const MINIMUM_DARK_LINK_CONTRAST: f32 = 4.5;
 
@@ -1934,26 +1933,21 @@ fn apply_link_highlights(
             right: link.rect.right,
             bottom: link.rect.bottom,
         };
-        let fill_alpha = if dark_mode {
-            DARK_LINK_HIGHLIGHT_ALPHA
-        } else {
-            LINK_HIGHLIGHT_ALPHA
-        };
-        blend_rectangle(rgba, width, height, rect, color, fill_alpha);
-        let border = 2;
         if dark_mode {
             blend_rectangle(
                 rgba,
                 width,
                 height,
                 PixelRect {
-                    top: rect.bottom.saturating_sub(border),
+                    top: rect.bottom.saturating_sub(1),
                     ..rect
                 },
                 color,
                 DARK_LINK_BORDER_ALPHA,
             );
         } else {
+            blend_rectangle(rgba, width, height, rect, color, LINK_HIGHLIGHT_ALPHA);
+            let border = 2;
             for edge in [
                 PixelRect {
                     bottom: rect.top.saturating_add(border),
@@ -1994,6 +1988,29 @@ fn apply_dark_mode_link_contrast(
         let right = rectangle.right.min(width);
         let top = rectangle.top.min(height);
         let bottom = rectangle.bottom.min(height);
+        let Some(background) = dominant_rectangle_color(rgba, width, height, *rectangle) else {
+            continue;
+        };
+        let Some(ink) = darkest_blue_link_ink(rgba, width, height, *rectangle, background) else {
+            continue;
+        };
+        let target = if contrast_ratio(style.foreground, background) >= MINIMUM_DARK_LINK_CONTRAST {
+            style.foreground
+        } else {
+            accent
+        };
+        let direction = [
+            f32::from(ink[0]) - f32::from(background[0]),
+            f32::from(ink[1]) - f32::from(background[1]),
+            f32::from(ink[2]) - f32::from(background[2]),
+        ];
+        let denominator = direction
+            .iter()
+            .map(|channel| channel * channel)
+            .sum::<f32>();
+        if denominator < 1.0 {
+            continue;
+        }
         for y in top..bottom {
             let Ok(row_start) = usize::try_from(y).map(|y| y.saturating_mul(stride)) else {
                 continue;
@@ -2008,32 +2025,110 @@ fn apply_dark_mode_link_contrast(
                     continue;
                 };
                 let original = [pixel[0], pixel[1], pixel[2]];
-                let adjusted = accessible_dark_link_pixel(original, style, accent);
+                if !is_blue_link_ink(original, background) {
+                    continue;
+                }
+                let delta = [
+                    f32::from(original[0]) - f32::from(background[0]),
+                    f32::from(original[1]) - f32::from(background[1]),
+                    f32::from(original[2]) - f32::from(background[2]),
+                ];
+                let coverage = delta
+                    .iter()
+                    .zip(direction)
+                    .map(|(channel, direction)| channel * direction)
+                    .sum::<f32>()
+                    / denominator;
+                let coverage = coverage.clamp(0.0, 1.0);
+                if coverage < 0.02 {
+                    continue;
+                }
+                let adjusted: [u8; 3] = std::array::from_fn(|channel| {
+                    blend_channel(background[channel], target[channel], coverage)
+                });
                 pixel[..3].copy_from_slice(&adjusted);
             }
         }
     }
 }
 
-fn accessible_dark_link_pixel(pixel: [u8; 3], style: DarkModeStyle, accent: [u8; 3]) -> [u8; 3] {
-    if pixel[2].saturating_sub(pixel[0].max(pixel[1])) < DARK_LINK_BLUE_DOMINANCE
-        || contrast_ratio(pixel, style.background) >= MINIMUM_DARK_LINK_CONTRAST
-    {
-        return pixel;
-    }
-
-    let foreground = style.foreground;
-    for target in [foreground, accent] {
-        for amount in [64, 96, 128, 160, 192, 224, 255] {
-            let candidate = std::array::from_fn(|channel| {
-                lerp_channel(pixel[channel], target[channel], amount)
-            });
-            if contrast_ratio(candidate, style.background) >= MINIMUM_DARK_LINK_CONTRAST {
-                return candidate;
+fn dominant_rectangle_color(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    rectangle: PageLinkRect,
+) -> Option<[u8; 3]> {
+    let left = rectangle.left.min(width);
+    let right = rectangle.right.min(width);
+    let top = rectangle.top.min(height);
+    let bottom = rectangle.bottom.min(height);
+    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
+    let mut colors = HashMap::<u16, (u32, [u64; 3])>::new();
+    for y in top..bottom {
+        let row_start = usize::try_from(y).ok()?.checked_mul(stride)?;
+        for x in left..right {
+            let offset = row_start.checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?;
+            let pixel = rgba.get(offset..offset.checked_add(3)?)?;
+            let key = (u16::from(pixel[0] >> 3) << 10)
+                | (u16::from(pixel[1] >> 3) << 5)
+                | u16::from(pixel[2] >> 3);
+            let entry = colors.entry(key).or_insert((0, [0; 3]));
+            entry.0 += 1;
+            for (sum, channel) in entry.1.iter_mut().zip(pixel) {
+                *sum += u64::from(*channel);
             }
         }
     }
-    pixel
+    let (_, (count, sums)) = colors.into_iter().max_by_key(|(_, (count, _))| *count)?;
+    Some(std::array::from_fn(|channel| {
+        u8::try_from(sums[channel] / u64::from(count)).unwrap_or(u8::MAX)
+    }))
+}
+
+fn darkest_blue_link_ink(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    rectangle: PageLinkRect,
+    background: [u8; 3],
+) -> Option<[u8; 3]> {
+    let left = rectangle.left.min(width);
+    let right = rectangle.right.min(width);
+    let top = rectangle.top.min(height);
+    let bottom = rectangle.bottom.min(height);
+    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
+    let mut farthest = None;
+    let mut farthest_distance = 0_u32;
+    for y in top..bottom {
+        let row_start = usize::try_from(y).ok()?.checked_mul(stride)?;
+        for x in left..right {
+            let offset = row_start.checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?;
+            let pixel = rgba.get(offset..offset.checked_add(3)?)?;
+            let pixel = [pixel[0], pixel[1], pixel[2]];
+            if !is_blue_link_ink(pixel, background) {
+                continue;
+            }
+            let distance = pixel
+                .iter()
+                .zip(background)
+                .map(|(channel, background)| u32::from(channel.abs_diff(background)).pow(2))
+                .sum();
+            if distance > farthest_distance {
+                farthest = Some(pixel);
+                farthest_distance = distance;
+            }
+        }
+    }
+    farthest
+}
+
+fn is_blue_link_ink(pixel: [u8; 3], background: [u8; 3]) -> bool {
+    pixel[2].saturating_sub(pixel[0].max(pixel[1])) >= DARK_LINK_BLUE_DOMINANCE
+        && relative_luminance(pixel) > relative_luminance(background) + 0.005
+        && pixel
+            .iter()
+            .zip(background)
+            .any(|(channel, background)| channel.abs_diff(background) >= 8)
 }
 
 fn contrast_ratio(first: [u8; 3], second: [u8; 3]) -> f32 {
@@ -2150,9 +2245,9 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 mod tests {
     use super::{
         DarkModeStyle, DarkModeTransform, FitMode, LinkTarget, PageLink, PageLinkRect, PixelRect,
-        accessible_dark_link_pixel, apply_dark_mode_link_contrast, apply_link_highlights,
-        blend_highlight_rectangle, context_around_label, contrast_ratio, count_search_matches,
-        dark_mode_pixel, darken_rgba, mask_quadrilateral, normalize_search_text, reference_context,
+        apply_dark_mode_link_contrast, apply_link_highlights, blend_highlight_rectangle,
+        context_around_label, contrast_ratio, count_search_matches, dark_mode_pixel, darken_rgba,
+        dominant_rectangle_color, mask_quadrilateral, normalize_search_text, reference_context,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
@@ -2438,54 +2533,53 @@ mod tests {
     }
 
     #[test]
-    fn dark_mode_lifts_low_contrast_blue_only_inside_link_annotations() {
+    fn dark_mode_recolors_blue_link_ink_against_its_local_background() {
         let style = DarkModeStyle::new([30, 32, 48], [200, 211, 245]);
         let accent = [134, 225, 252];
-        let transformed = dark_mode_pixel([0, 0, 255], DarkModeTransform::new(style));
-        assert!(contrast_ratio(transformed, style.background) < 4.5);
-
-        let adjusted = accessible_dark_link_pixel(transformed, style, accent);
-        assert_ne!(adjusted, transformed);
-        assert!(contrast_ratio(adjusted, style.background) >= 4.5);
-        assert_eq!(accessible_dark_link_pixel(accent, style, accent), accent);
-
+        let background = [22, 42, 80];
+        let edge = [65, 101, 161];
+        let ink = [106, 153, 233];
         let mut pixels = [
-            transformed[0],
-            transformed[1],
-            transformed[2],
+            background[0],
+            background[1],
+            background[2],
             255,
-            transformed[0],
-            transformed[1],
-            transformed[2],
+            background[0],
+            background[1],
+            background[2],
+            255,
+            edge[0],
+            edge[1],
+            edge[2],
             128,
-            transformed[0],
-            transformed[1],
-            transformed[2],
+            ink[0],
+            ink[1],
+            ink[2],
             64,
+            background[0],
+            background[1],
+            background[2],
+            255,
         ];
-        apply_dark_mode_link_contrast(
-            &mut pixels,
-            3,
-            1,
-            &[PageLinkRect {
-                left: 1,
-                top: 0,
-                right: 2,
-                bottom: 1,
-            }],
-            style,
-            accent,
-        );
+        let rectangle = PageLinkRect {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 1,
+        };
+
         assert_eq!(
-            &pixels[..4],
-            &[transformed[0], transformed[1], transformed[2], 255]
+            dominant_rectangle_color(&pixels, 5, 1, rectangle),
+            Some(background)
         );
-        assert_eq!(&pixels[4..7], &adjusted);
-        assert_eq!(pixels[7], 128);
-        assert_eq!(
-            &pixels[8..],
-            &[transformed[0], transformed[1], transformed[2], 64]
-        );
+        apply_dark_mode_link_contrast(&mut pixels, 5, 1, &[rectangle], style, accent);
+        assert_eq!(&pixels[..8], &[22, 42, 80, 255, 22, 42, 80, 255]);
+        assert_ne!(&pixels[8..11], &edge);
+        assert_eq!(pixels[11], 128);
+        assert_eq!(&pixels[12..15], &style.foreground);
+        assert_eq!(pixels[15], 64);
+        assert_eq!(&pixels[16..], &[22, 42, 80, 255]);
+        assert!(contrast_ratio(style.foreground, background) >= 4.5);
     }
 
     #[test]
@@ -2507,8 +2601,8 @@ mod tests {
 
         let fill = &pixels[(6 + 2) * 4..(6 + 2) * 4 + 3];
         let underline = &pixels[(3 * 6 + 2) * 4..(3 * 6 + 2) * 4 + 3];
-        assert_eq!(fill, &[34, 39, 56]);
-        assert_eq!(underline, &[92, 148, 171]);
+        assert_eq!(fill, &[30, 32, 48]);
+        assert_eq!(underline, &[69, 104, 124]);
         assert_eq!(&pixels[..4], &[30, 32, 48, 255]);
     }
 
