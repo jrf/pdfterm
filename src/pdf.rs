@@ -23,6 +23,8 @@ const LINK_INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_HIGHLIGHT_ALPHA: u16 = 88;
 const LINK_HIGHLIGHT_ALPHA: u16 = 40;
 const LINK_BORDER_ALPHA: u16 = 210;
+const SELECTED_LINK_HIGHLIGHT_ALPHA: u16 = 72;
+const SELECTED_LINK_BORDER_ALPHA: u16 = 255;
 const DARK_LINK_BORDER_ALPHA: u16 = 96;
 const DARK_LINK_BLUE_DOMINANCE: u8 = 28;
 const MINIMUM_DARK_LINK_CONTRAST: f32 = 4.5;
@@ -102,6 +104,7 @@ pub struct RenderKey {
     pub search_highlight: [u8; 3],
     pub link_mode: bool,
     pub link_highlight: [u8; 3],
+    pub selected_link_ordinal: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -802,11 +805,13 @@ fn run_worker(
                         .and_then(|highlights| highlights.pages.get(&request.key.page))
                 })
                 .flatten();
-            let links = if request.key.link_mode {
+            let links = if request.key.link_mode || request.key.selected_link_ordinal.is_some() {
                 extract_page_links(document, &page, &config, width, height)
             } else {
                 Vec::new()
             };
+            let selected_link_rectangles =
+                selected_page_link_rectangles(&links, request.key.selected_link_ordinal);
             let dark_mode_link_rectangles = if request.key.invert {
                 if request.key.link_mode {
                     links.iter().map(|link| link.rect).collect()
@@ -817,7 +822,8 @@ fn run_worker(
                 Vec::new()
             };
             let highlight_elapsed = (search_rectangles.is_some()
-                || !links.is_empty()
+                || (request.key.link_mode && !links.is_empty())
+                || !selected_link_rectangles.is_empty()
                 || !dark_mode_link_rectangles.is_empty())
             .then(|| {
                 let started = Instant::now();
@@ -842,7 +848,7 @@ fn run_worker(
                         request.key.search_highlight,
                     );
                 }
-                if !links.is_empty() {
+                if request.key.link_mode && !links.is_empty() {
                     apply_link_highlights(
                         &mut raw_rgba,
                         width,
@@ -850,6 +856,15 @@ fn run_worker(
                         &links,
                         request.key.link_highlight,
                         request.key.invert,
+                    );
+                }
+                if !selected_link_rectangles.is_empty() {
+                    apply_selected_link_highlights(
+                        &mut raw_rgba,
+                        width,
+                        height,
+                        &selected_link_rectangles,
+                        request.key.link_highlight,
                     );
                 }
                 started.elapsed()
@@ -1672,18 +1687,49 @@ fn coalesce_document_link_fragments(
     links: Vec<PageLink>,
     source_text: Option<&str>,
 ) -> Vec<PageLink> {
-    let mut combined: Vec<PageLink> = Vec::with_capacity(links.len());
-    for link in links {
-        if let Some(previous) = combined.iter_mut().rev().find(|previous| {
+    page_link_group_indices(&links)
+        .into_iter()
+        .filter_map(|group| {
+            let mut indices = group.into_iter();
+            let mut combined = links.get(indices.next()?)?.clone();
+            for index in indices {
+                let fragment = &links[index];
+                append_link_fragment(&mut combined.label, &fragment.label, source_text);
+                combined.rect = fragment.rect;
+            }
+            Some(combined)
+        })
+        .collect()
+}
+
+fn selected_page_link_rectangles(
+    links: &[PageLink],
+    selected_ordinal: Option<u32>,
+) -> Vec<PageLinkRect> {
+    let Some(selected) = selected_ordinal.and_then(|ordinal| usize::try_from(ordinal).ok()) else {
+        return Vec::new();
+    };
+    page_link_group_indices(links)
+        .get(selected)
+        .into_iter()
+        .flatten()
+        .map(|index| links[*index].rect)
+        .collect()
+}
+
+fn page_link_group_indices(links: &[PageLink]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::with_capacity(links.len());
+    for (index, link) in links.iter().enumerate() {
+        if let Some(group) = groups.iter_mut().rev().find(|group| {
+            let previous = &links[*group.last().expect("link group is not empty")];
             previous.target == link.target && link_fragments_are_adjacent(previous.rect, link.rect)
         }) {
-            append_link_fragment(&mut previous.label, &link.label, source_text);
-            previous.rect = link.rect;
+            group.push(index);
         } else {
-            combined.push(link);
+            groups.push(vec![index]);
         }
     }
-    combined
+    groups
 }
 
 fn append_link_fragment(label: &mut String, fragment: &str, source_text: Option<&str>) {
@@ -1972,6 +2018,52 @@ fn apply_link_highlights(
     }
 }
 
+fn apply_selected_link_highlights(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    rectangles: &[PageLinkRect],
+    color: [u8; 3],
+) {
+    for rectangle in rectangles {
+        let rect = PixelRect {
+            left: rectangle.left,
+            top: rectangle.top,
+            right: rectangle.right,
+            bottom: rectangle.bottom,
+        };
+        blend_rectangle(
+            rgba,
+            width,
+            height,
+            rect,
+            color,
+            SELECTED_LINK_HIGHLIGHT_ALPHA,
+        );
+        let border = 3;
+        for edge in [
+            PixelRect {
+                bottom: rect.top.saturating_add(border),
+                ..rect
+            },
+            PixelRect {
+                top: rect.bottom.saturating_sub(border),
+                ..rect
+            },
+            PixelRect {
+                right: rect.left.saturating_add(border),
+                ..rect
+            },
+            PixelRect {
+                left: rect.right.saturating_sub(border),
+                ..rect
+            },
+        ] {
+            blend_rectangle(rgba, width, height, edge, color, SELECTED_LINK_BORDER_ALPHA);
+        }
+    }
+}
+
 fn apply_dark_mode_link_contrast(
     rgba: &mut [u8],
     width: u32,
@@ -2245,9 +2337,10 @@ fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
 mod tests {
     use super::{
         DarkModeStyle, DarkModeTransform, FitMode, LinkTarget, PageLink, PageLinkRect, PixelRect,
-        apply_dark_mode_link_contrast, apply_link_highlights, blend_highlight_rectangle,
-        context_around_label, contrast_ratio, count_search_matches, dark_mode_pixel, darken_rgba,
-        dominant_rectangle_color, mask_quadrilateral, normalize_search_text, reference_context,
+        apply_dark_mode_link_contrast, apply_link_highlights, apply_selected_link_highlights,
+        blend_highlight_rectangle, context_around_label, contrast_ratio, count_search_matches,
+        dark_mode_pixel, darken_rgba, dominant_rectangle_color, mask_quadrilateral,
+        normalize_search_text, reference_context, selected_page_link_rectangles,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
@@ -2604,6 +2697,81 @@ mod tests {
         assert_eq!(fill, &[30, 32, 48]);
         assert_eq!(underline, &[69, 104, 124]);
         assert_eq!(&pixels[..4], &[30, 32, 48, 255]);
+    }
+
+    #[test]
+    fn selected_link_highlight_is_stronger_than_the_link_mode_highlight() {
+        let color = [134, 225, 252];
+        let rectangle = PageLinkRect {
+            left: 1,
+            top: 1,
+            right: 6,
+            bottom: 5,
+        };
+        let link = PageLink {
+            rect: rectangle,
+            label: "selected".into(),
+            target: LinkTarget::Uri("https://example.invalid/selected".into()),
+        };
+        let mut regular = [255, 255, 255, 255].repeat(8 * 7);
+        let mut selected = regular.clone();
+
+        apply_link_highlights(&mut regular, 8, 7, &[link], color, false);
+        apply_selected_link_highlights(&mut selected, 8, 7, &[rectangle], color);
+
+        let interior = (3 * 8 + 3) * 4;
+        assert!(selected[interior] < regular[interior]);
+        let border = (2 * 8 + 1) * 4;
+        assert_eq!(&selected[border..border + 3], &color);
+    }
+
+    #[test]
+    fn selected_link_ordinal_includes_every_wrapped_fragment() {
+        let shared_target = LinkTarget::Internal {
+            page: 7,
+            top_ratio: None,
+        };
+        let links = vec![
+            PageLink {
+                rect: PageLinkRect {
+                    left: 40,
+                    top: 10,
+                    right: 80,
+                    bottom: 20,
+                },
+                label: "wrapped".into(),
+                target: shared_target.clone(),
+            },
+            PageLink {
+                rect: PageLinkRect {
+                    left: 10,
+                    top: 22,
+                    right: 35,
+                    bottom: 32,
+                },
+                label: "link".into(),
+                target: shared_target,
+            },
+            PageLink {
+                rect: PageLinkRect {
+                    left: 10,
+                    top: 50,
+                    right: 30,
+                    bottom: 60,
+                },
+                label: "other".into(),
+                target: LinkTarget::Uri("https://example.invalid/other".into()),
+            },
+        ];
+
+        assert_eq!(
+            selected_page_link_rectangles(&links, Some(0)),
+            vec![links[0].rect, links[1].rect]
+        );
+        assert_eq!(
+            selected_page_link_rectangles(&links, Some(1)),
+            vec![links[2].rect]
+        );
     }
 
     #[test]

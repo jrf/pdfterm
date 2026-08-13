@@ -21,12 +21,12 @@ build:
 release:
     cargo build --release
 
-# Install pdfterm to ~/.local/bin
-install: release
+# Install pdfterm to Cargo's bin directory
+install:
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p ~/.local/bin
-    cp target/release/pdfterm ~/.local/bin/
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    cargo install --path . --locked --force --root "$cargo_home"
     if [[ "$(uname -s)" == Darwin ]]; then
-      codesign -s - ~/.local/bin/pdfterm
+      codesign -s - "$cargo_home/bin/pdfterm"
     fi

@@ -633,7 +633,12 @@ enum Axis {
 }
 
 impl Tab {
-    fn render_key(&self, viewport: Viewport, link_mode: bool) -> RenderKey {
+    fn render_key(
+        &self,
+        viewport: Viewport,
+        link_mode: bool,
+        selected_link_ordinal: Option<u32>,
+    ) -> RenderKey {
         RenderKey {
             document_id: self.document_id,
             page: self.page,
@@ -646,6 +651,7 @@ impl Tab {
             search_highlight: self.search_highlight,
             link_mode,
             link_highlight: self.link_highlight,
+            selected_link_ordinal,
         }
     }
 }
@@ -1445,7 +1451,7 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
             self.draw_status(output, viewport, "links are still rendering")?;
             return Ok(());
@@ -1556,7 +1562,7 @@ impl App {
         }
         self.start_link_index();
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
             self.draw_status(output, viewport, "links are still rendering")?;
             return Ok(());
@@ -1593,7 +1599,7 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         if !self.tab().cache.contains_key(&key) || self.visible_image_id.is_none() {
             return Ok(());
         }
@@ -1610,8 +1616,14 @@ impl App {
         let outline = Arc::clone(&self.tab().outline);
         let progress = LinkIndexProgress::from(&self.tab().link_index);
         let state = self.link_picker.as_mut().expect("link picker state");
+        let selection_before = state.selection_key;
         state.sync(page, &links, progress.indexing);
+        let schedule_preview =
+            selection_before != state.selection_key && state.focus == LinkPickerFocus::Links;
         let state = state.clone();
+        if schedule_preview {
+            self.schedule_link_preview();
+        }
         draw_link_picker_terminal(
             output,
             link_picker_area(viewport),
@@ -1638,7 +1650,7 @@ impl App {
         let viewport = self.viewport()?;
         let area = link_picker_area(viewport);
         let previous = self.link_picker_geometry;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let frame = self.tab().cache.get(&key).cloned();
         let image_id = self.visible_image_id;
         self.link_picker_geometry.layout = layout;
@@ -1698,7 +1710,7 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let frame = self.tab().cache.get(&key).cloned();
         let image_id = self.visible_image_id;
         if let (Some(frame), Some(image_id)) = (frame, image_id) {
@@ -1735,7 +1747,7 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let frame = self.tab().cache.get(&key).cloned();
         let image_id = self.visible_image_id;
         if let (Some(frame), Some(image_id)) = (frame, image_id) {
@@ -1784,7 +1796,7 @@ impl App {
             return Ok(());
         }
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let frame = self.tab().cache.get(&key).cloned();
         let image_id = self.visible_image_id;
         if let (Some(frame), Some(image_id)) = (frame, image_id) {
@@ -1897,6 +1909,8 @@ impl App {
             state.focus = focus;
             if focus == LinkPickerFocus::Document {
                 state.pending_preview = None;
+            } else {
+                self.schedule_link_preview();
             }
             return self.redraw_link_picker(output);
         }
@@ -2195,7 +2209,7 @@ impl App {
         output: &mut impl Write,
     ) -> Result<(), AppError> {
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         let Some(frame) = self.tab().cache.get(&key).cloned() else {
             return self.page_step(forward, output);
         };
@@ -2249,7 +2263,7 @@ impl App {
     /// without asking the worker to render again.
     fn redraw_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let viewport = self.viewport()?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         if let Some(frame) = self.tab().cache.get(&key).cloned() {
             self.draw_frame(&frame, viewport, output)?;
         }
@@ -2312,7 +2326,7 @@ impl App {
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let viewport = self.prepare_viewport(output)?;
         self.draw_tab_bar(output)?;
-        let key = self.tab().render_key(viewport, self.link_mode);
+        let key = self.render_key(viewport);
         self.desired_key = Some(key);
         self.generation = self.generation.wrapping_add(1);
         self.worker.begin_generation(self.generation);
@@ -2352,11 +2366,13 @@ impl App {
                 && cached.invert == key.invert
                 && cached.dark_mode_style == key.dark_mode_style
                 && cached.page.abs_diff(current_page) <= 1
+                && (cached.selected_link_ordinal.is_none()
+                    || cached.selected_link_ordinal == key.selected_link_ordinal)
         });
 
         if self.desired_key == Some(key) {
             let viewport = self.viewport()?;
-            let current_key = self.tab().render_key(viewport, self.link_mode);
+            let current_key = self.render_key(viewport);
             if current_key == key {
                 self.draw_frame(&frame, viewport, output)?;
                 self.prefetch_neighbors(key);
@@ -2450,8 +2466,12 @@ impl App {
         let outline = Arc::clone(&self.tab().outline);
         let progress = LinkIndexProgress::from(&self.tab().link_index);
         let search = self.tab().search.clone();
+        let mut schedule_link_preview = false;
         if let Some(link_picker) = &mut self.link_picker {
+            let selection_before = link_picker.selection_key;
             link_picker.sync(frame.key.page, &links, progress.indexing);
+            schedule_link_preview = selection_before != link_picker.selection_key
+                && link_picker.focus == LinkPickerFocus::Links;
             let link_picker = link_picker.clone();
             draw_link_picker_terminal_unsynchronized(
                 output,
@@ -2474,6 +2494,9 @@ impl App {
                 self.link_picker_geometry,
                 self.theme,
             )?;
+        }
+        if schedule_link_preview {
+            self.schedule_link_preview();
         }
         self.draw_status(output, viewport, &state)?;
         Ok(())
@@ -2546,6 +2569,7 @@ impl App {
             let neighbor = RenderKey {
                 page,
                 search_request_id: self.tab().search.highlight_request_id(page),
+                selected_link_ordinal: None,
                 ..key
             };
             let cached = self.tab().cache.contains_key(&neighbor);
@@ -2686,6 +2710,16 @@ impl App {
 
     fn viewport(&self) -> io::Result<Viewport> {
         Viewport::detect(u16::from(self.tabs.len() > 1))
+    }
+
+    fn render_key(&self, viewport: Viewport) -> RenderKey {
+        let selected_link_ordinal = self
+            .link_picker
+            .as_ref()
+            .and_then(|state| state.selection_key)
+            .and_then(|(page, ordinal)| (page == self.tab().page).then_some(ordinal));
+        self.tab()
+            .render_key(viewport, self.link_mode, selected_link_ordinal)
     }
 
     fn tab(&self) -> &Tab {

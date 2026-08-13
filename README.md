@@ -90,7 +90,7 @@ page rendering and grouped by document section and source page when the PDF has
 an outline, with source-page-only headings as a fallback. The
 split repositions Kitty's retained page image without rerendering or retransmitting it.
 In the browser, use `j`/`k`, arrows, or type an entry number to preview that
-link's source location in the PDF; rapid selection changes are debounced to
+link's source location and highlight its annotation in the PDF; rapid selection changes are debounced to
 avoid redundant rendering. Click a row to select it, or press `Enter` to follow
 the selected link. Closing the browser restores the view from before the preview. `Ctrl-f`/`Ctrl-b`
 move by a viewport and `g`/`G` select the first or last link. In a split layout,
