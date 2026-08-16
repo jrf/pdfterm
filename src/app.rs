@@ -183,6 +183,7 @@ pub fn run(
         }
         app.poll_file_change(&mut output)?;
         app.poll_link_preview(&mut output)?;
+        app.poll_search_preview(&mut output)?;
 
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
@@ -531,6 +532,15 @@ struct SearchPickerState {
     selected: usize,
     focus: LinkPickerFocus,
     awaiting_initial_result: bool,
+    selection_page: Option<u32>,
+    pending_preview: Option<PendingSearchPreview>,
+    preview_origin: Option<ViewPosition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingSearchPreview {
+    page: u32,
+    ready_at: Instant,
 }
 
 impl SearchPickerState {
@@ -540,6 +550,9 @@ impl SearchPickerState {
             selected: 0,
             focus: LinkPickerFocus::Links,
             awaiting_initial_result: true,
+            selection_page: None,
+            pending_preview: None,
+            preview_origin: None,
         }
     }
 
@@ -547,6 +560,7 @@ impl SearchPickerState {
         self.page = page;
         if matches.is_empty() {
             self.selected = 0;
+            self.selection_page = None;
             return;
         }
         if self.awaiting_initial_result {
@@ -558,6 +572,7 @@ impl SearchPickerState {
         } else {
             self.selected = self.selected.min(matches.len() - 1);
         }
+        self.selection_page = matches.get(self.selected).map(|result| result.page);
     }
 }
 
@@ -1402,6 +1417,62 @@ impl App {
         self.request_current(output)
     }
 
+    fn schedule_search_preview(&mut self) {
+        let Some(state) = &mut self.search_picker else {
+            return;
+        };
+        let Some(page) = state.selection_page else {
+            return;
+        };
+        state.pending_preview = Some(PendingSearchPreview {
+            page,
+            ready_at: Instant::now() + LINK_PREVIEW_DELAY,
+        });
+    }
+
+    fn poll_search_preview(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.pending_open.is_some() {
+            return Ok(());
+        }
+        let Some(pending) = self
+            .search_picker
+            .as_ref()
+            .and_then(|state| state.pending_preview)
+        else {
+            return Ok(());
+        };
+        if Instant::now() < pending.ready_at {
+            return Ok(());
+        }
+
+        {
+            let Some(state) = &mut self.search_picker else {
+                return Ok(());
+            };
+            state.pending_preview = None;
+            if state.selection_page != Some(pending.page) {
+                return Ok(());
+            }
+        }
+        if pending.page == self.tab().page {
+            return Ok(());
+        }
+        let origin = ViewPosition {
+            page: self.tab().page,
+            scroll_x: self.tab().scroll_x,
+            scroll_y: self.tab().scroll_y,
+        };
+        let state = self.search_picker.as_mut().expect("search picker state");
+        state.preview_origin.get_or_insert(origin);
+        state.page = pending.page;
+
+        let tab = self.tab_mut();
+        tab.page = pending.page;
+        tab.scroll_x = 0;
+        tab.scroll_y = 0;
+        self.request_current(output)
+    }
+
     fn handle_link_picker_pointer(
         &mut self,
         mouse: MouseEvent,
@@ -1792,7 +1863,18 @@ impl App {
     }
 
     fn close_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        if self.search_picker.take().is_none() {
+        let Some(state) = self.search_picker.take() else {
+            return Ok(());
+        };
+        if let Some(origin) = state.preview_origin {
+            let tab = self.tab_mut();
+            tab.page = origin.page.min(tab.page_count - 1);
+            tab.scroll_x = origin.scroll_x;
+            tab.scroll_y = origin.scroll_y;
+            tab.pending_destination = None;
+            self.clear_viewer(output)?;
+            self.reset_render_state();
+            self.request_current(output)?;
             return Ok(());
         }
         let viewport = self.viewport()?;
@@ -1832,10 +1914,13 @@ impl App {
             layout,
             key,
         ) {
-            self.search_picker
-                .as_mut()
-                .expect("search picker state")
-                .focus = focus;
+            let state = self.search_picker.as_mut().expect("search picker state");
+            state.focus = focus;
+            if focus == LinkPickerFocus::Document {
+                state.pending_preview = None;
+            } else {
+                self.schedule_search_preview();
+            }
             return self.redraw_search_picker(output);
         }
         match key.code {
@@ -1868,14 +1953,17 @@ impl App {
         if let Some(next) =
             link_picker_navigation_index(selected, matches.len(), key, visible_height)
         {
-            self.search_picker
-                .as_mut()
-                .expect("search picker state")
-                .selected = next;
+            let state = self.search_picker.as_mut().expect("search picker state");
+            state.selected = next;
+            state.selection_page = matches.get(next).map(|result| result.page);
+            self.schedule_search_preview();
             self.redraw_search_picker(output)?;
         } else if key.code == KeyCode::Enter
             && let Some(result) = matches.get(selected)
         {
+            let state = self.search_picker.as_mut().expect("search picker state");
+            state.pending_preview = None;
+            state.preview_origin = None;
             self.set_page(result.page, output)?;
         }
         Ok(())
@@ -2086,9 +2174,14 @@ impl App {
                 | KeyCode::Char('m')
                 | KeyCode::Char('i')
         ) {
-            let state = self.link_picker.as_mut().expect("link picker state");
-            state.pending_preview = None;
-            state.preview_origin = None;
+            if let Some(state) = self.link_picker.as_mut() {
+                state.pending_preview = None;
+                state.preview_origin = None;
+            }
+            if let Some(state) = self.search_picker.as_mut() {
+                state.pending_preview = None;
+                state.preview_origin = None;
+            }
         }
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
