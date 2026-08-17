@@ -97,6 +97,8 @@ pub struct RenderKey {
     pub page: u32,
     pub width: u16,
     pub height: u16,
+    /// Zoom level as a percentage of the fitted size (100 = fit exactly).
+    pub zoom: u16,
     pub fit: FitMode,
     pub invert: bool,
     pub dark_mode_style: DarkModeStyle,
@@ -762,8 +764,11 @@ fn run_worker(
             let page = document.pages().get(page_index).map_err(|error| {
                 format!("could not load page {}: {error}", request.key.page + 1)
             })?;
-            let target_width = i32::from(request.key.width);
-            let target_height = i32::from(request.key.height);
+            let zoom = i32::from(request.key.zoom.max(1));
+            let target_width = i32::from(request.key.width) * zoom / 100;
+            let target_height = i32::from(request.key.height) * zoom / 100;
+            let target_width = target_width.max(1);
+            let target_height = target_height.max(1);
             let base_config = PdfRenderConfig::new()
                 .set_reverse_byte_order(true)
                 .use_lcd_text_rendering(true)

@@ -39,6 +39,10 @@ const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LINK_PREVIEW_DELAY: Duration = Duration::from_millis(120);
 const INITIAL_DOCUMENT_ID: DocumentId = 1;
+const ZOOM_DEFAULT: u16 = 100;
+const ZOOM_MIN: u16 = 100;
+const ZOOM_MAX: u16 = 400;
+const ZOOM_STEP: u16 = 25;
 const PAGE_IMAGE_Z_INDEX: i32 = i32::MIN / 2 - 2;
 const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
@@ -300,6 +304,7 @@ struct Tab {
     page_count: u32,
     page: u32,
     fit: FitMode,
+    zoom: u16,
     invert: bool,
     dark_mode_style: DarkModeStyle,
     search_highlight: [u8; 3],
@@ -659,6 +664,7 @@ impl Tab {
             page: self.page,
             width: viewport.pixel_width,
             height: viewport.pixel_height,
+            zoom: self.zoom,
             fit: self.fit,
             invert: self.invert,
             dark_mode_style: self.dark_mode_style,
@@ -739,6 +745,7 @@ impl App {
                 page_count,
                 page,
                 fit: default_fit,
+                zoom: ZOOM_DEFAULT,
                 invert: default_invert,
                 dark_mode_style: defaults.dark_mode_style,
                 search_highlight: defaults.search_highlight,
@@ -857,6 +864,7 @@ impl App {
                     page_count: pages,
                     page: 0,
                     fit: self.default_fit,
+                    zoom: ZOOM_DEFAULT,
                     invert: self.default_invert,
                     dark_mode_style: DarkModeStyle::new(
                         self.theme.document.background,
@@ -2270,6 +2278,9 @@ impl App {
                 self.set_page(self.tab().page_count - 1, output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
+            KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(output)?,
+            KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
+            KeyCode::Char('0') => self.reset_zoom(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
@@ -2400,6 +2411,31 @@ impl App {
         self.request_current(output)
     }
 
+    fn set_zoom(&mut self, zoom: u16, output: &mut impl Write) -> Result<(), AppError> {
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if zoom == self.tab().zoom {
+            return Ok(());
+        }
+        self.tab_mut().zoom = zoom;
+        self.tab_mut().scroll_x = 0;
+        self.tab_mut().scroll_y = 0;
+        self.request_current(output)
+    }
+
+    fn zoom_in(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let zoom = stepped_zoom(self.tab().zoom, true);
+        self.set_zoom(zoom, output)
+    }
+
+    fn zoom_out(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let zoom = stepped_zoom(self.tab().zoom, false);
+        self.set_zoom(zoom, output)
+    }
+
+    fn reset_zoom(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.set_zoom(ZOOM_DEFAULT, output)
+    }
+
     fn toggle_invert(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         let inverted = !self.tab().invert;
         self.tab_mut().invert = inverted;
@@ -2455,6 +2491,7 @@ impl App {
         self.tabs[index].cache.retain(|cached, _| {
             cached.width == key.width
                 && cached.height == key.height
+                && cached.zoom == key.zoom
                 && cached.fit == key.fit
                 && cached.invert == key.invert
                 && cached.dark_mode_style == key.dark_mode_style
@@ -2616,6 +2653,12 @@ impl App {
                 mode.push(' ');
             }
             mode.push_str("dark");
+        }
+        if tab.zoom != ZOOM_DEFAULT {
+            if !mode.is_empty() {
+                mode.push(' ');
+            }
+            mode.push_str(&format!("{}%", tab.zoom));
         }
         if !mode.is_empty() {
             mode.push_str("  ");
@@ -2906,6 +2949,17 @@ fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
     } else {
         active - 1
     }
+}
+
+/// Steps the zoom percentage by one increment, snapping to the `ZOOM_STEP`
+/// grid and clamping to the supported range.
+fn stepped_zoom(current: u16, zoom_in: bool) -> u16 {
+    let next = if zoom_in {
+        current.saturating_add(ZOOM_STEP)
+    } else {
+        current.saturating_sub(ZOOM_STEP)
+    };
+    next.clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
 fn numbered_tab_index(key: KeyEvent) -> Option<usize> {
@@ -4841,6 +4895,8 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
     ];
     const VIEWER: &[(&str, &str)] = &[
         ("m", "cycle fit mode"),
+        ("+ / -", "zoom in / out"),
+        ("0", "reset zoom"),
         ("i", "toggle dark mode"),
         ("p", "toggle performance timings"),
         ("t", "table of contents"),
@@ -5514,16 +5570,17 @@ mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
-        PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState,
-        apply_picker_navigation, clear_image_canvas, clear_picker, clear_picker_filter,
-        cycled_tab_index, draw_help_menu, draw_link_picker, draw_picker, draw_search_picker,
-        draw_theme_picker, filter_document_links, filter_outline, filter_theme_indices,
-        link_at_cell, link_picker_focus_for_key, link_picker_label, link_picker_link_at_position,
-        link_picker_list_area, link_picker_navigation_index, link_picker_panes,
-        link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
+        PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState, ZOOM_DEFAULT,
+        ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, clear_image_canvas, clear_picker,
+        clear_picker_filter, cycled_tab_index, draw_help_menu, draw_link_picker, draw_picker,
+        draw_search_picker, draw_theme_picker, filter_document_links, filter_outline,
+        filter_theme_indices, link_at_cell, link_picker_focus_for_key, link_picker_label,
+        link_picker_link_at_position, link_picker_list_area, link_picker_navigation_index,
+        link_picker_panes, link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
         outline_start_index, picker_color, picker_rect, render_timing_status,
         restore_link_picker_split, search_target_page, shorten_path, show_link_picker_split,
-        stale_status_row, synchronized_output, update_link_number_selection, write_clipboard_osc52,
+        stale_status_row, stepped_zoom, synchronized_output, update_link_number_selection,
+        write_clipboard_osc52,
     };
     use crate::config::LinkPickerLayout;
     use crate::kitty::Placement;
@@ -6657,6 +6714,15 @@ mod tests {
     }
 
     #[test]
+    fn stepped_zoom_snaps_and_clamps_within_range() {
+        assert_eq!(stepped_zoom(ZOOM_DEFAULT, true), ZOOM_DEFAULT + ZOOM_STEP);
+        assert_eq!(stepped_zoom(ZOOM_DEFAULT, false), ZOOM_MIN);
+        assert_eq!(stepped_zoom(ZOOM_MIN, false), ZOOM_MIN);
+        assert_eq!(stepped_zoom(ZOOM_MAX, true), ZOOM_MAX);
+        assert_eq!(stepped_zoom(ZOOM_MAX - ZOOM_STEP, true), ZOOM_MAX);
+    }
+
+    #[test]
     fn help_menu_lists_viewer_keybindings() {
         let area = Rect::new(0, 0, 100, 40);
         let popup = picker_rect(area);
@@ -6686,6 +6752,8 @@ mod tests {
         assert!(rendered.contains("link mode + browser"));
         assert!(rendered.contains("leave mode / close tab"));
         assert!(rendered.contains("cycle / auto side layout"));
+        assert!(rendered.contains("zoom in / out"));
+        assert!(rendered.contains("reset zoom"));
         assert!(rendered.contains("toggle performance timings"));
         assert!(rendered.contains("choose theme"));
         assert!(rendered.contains("open PDF in new tab"));

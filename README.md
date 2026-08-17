@@ -6,7 +6,7 @@
 
 The current viewer fits one page to the terminal, keeps the current and adjacent pages in memory, and gives foreground renders priority over prefetch work. It reloads each open document automatically when the PDF changes while preserving that tab's current page. Run it without a path or press `f` to open a fuzzy PDF picker in a new tab; recently opened documents appear at the top and remain searchable alongside recursively discovered PDFs. Picker searches match filenames and parent directories, with filename matches ranked first. Press `/` to filter a picker; `Esc` clears an active query before closing it.
 
-You can fit pages to the terminal width or height and scroll through the overflow, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line shows one total render time by default; press `p` to expand it into rendering, dark-mode conversion, compression, and transfer timings.
+You can fit pages to the terminal width or height and scroll through the overflow, zoom in and out beyond the fitted size in discrete steps, jump around with the outline (table of contents) or a go-to-page prompt, follow annotated links, use Polaris-style dark mode for dark-on-light PDFs, and copy the current page's text to the clipboard (over SSH, via OSC 52). Dark mode uses the selected theme's document colors, preserves document hues, and leaves embedded images unchanged. The status line shows one total render time by default; press `p` to expand it into rendering, dark-mode conversion, compression, and transfer timings.
 
 ## Requirements
 
@@ -50,6 +50,8 @@ Use `--pdfium-library PATH` to override the embedded PDFium library, and `--page
 | `/` | search selectable document text |
 | `n` / `N` | next / previous page containing a search match |
 | `m` | cycle fit mode: fit-page → fit-width → fit-height |
+| `+` / `-` | zoom in / out in 25% steps (up to 400%) |
+| `0` | reset zoom to the fitted size |
 | `i` | toggle Polaris-style dark mode |
 | `p` | toggle detailed render-performance timings |
 | `t` | outline / table of contents (fuzzy filter, `Enter` to jump) |

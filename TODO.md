@@ -8,7 +8,6 @@
 ## Next
 
 - [ ] Publish release archives for macOS arm64 and Linux x86_64/aarch64. #chore
-- [ ] Add arbitrary zoom levels beyond the fit modes. #feature
 - [ ] Transmit each page once and re-place crops on scroll instead of re-transmitting. #improvement
 
 ## Later
@@ -39,3 +38,4 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 - [x] Add an interactive keybinding help menu. #feature
 - [x] Add incremental text search that does not block foreground rendering. #feature
 - [x] Follow internal links and named destinations, with a numbered link picker and back navigation. #feature
+- [x] Add discrete zoom levels beyond the fit modes. #feature
