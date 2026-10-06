@@ -1,9 +1,17 @@
 pub mod app;
 mod browser;
 pub mod config;
+pub mod editor;
 mod embedded_pdfium;
+pub(crate) mod focus;
+pub mod ipc;
 pub mod kitty;
+mod navigation;
 pub mod pdf;
+pub mod process;
 pub mod recent;
+pub mod screenshot;
+pub mod synctex;
 pub mod terminal;
 pub mod theme;
+mod typst;

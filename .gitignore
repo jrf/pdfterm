@@ -1,7 +1,11 @@
 /target/
+__pycache__/
 .DS_Store
 *.pdf
 *.dylib
 *.so
 *.dll
+/review.md
+/next_steps.md
+/invariants/
 

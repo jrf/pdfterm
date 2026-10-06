@@ -12,11 +12,55 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Install Linux integration dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y texlive-latex-base texlive-latex-recommended texlive-pictures
+        curl --fail --location https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz | tar xz
+        echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+    - name: Install macOS integration dependencies
+      if: runner.os == 'macOS'
+      run: |
+        brew install neovim
+        brew install --cask basictex
+        sudo /Library/TeX/texbin/tlmgr update --self
+        sudo /Library/TeX/texbin/tlmgr install beamer etoolbox
+        echo "/Library/TeX/texbin" >> "$GITHUB_PATH"
+    - name: Check formatting and lint
+      run: cargo fmt --check && cargo clippy --all-targets -- -D warnings
     - name: Build
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Exercise headless adapter with real processes and sockets
+      run: |
+        PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
+        PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim_sessions.lua
+    - name: Exercise terminal ownership completion
+      run: nvim --headless -u NONE -l tests/nvim_terminal.lua
+    - name: Exercise persistent Ghostty control with a fake worker
+      run: nvim --headless -u NONE -l tests/nvim_ghostty.lua
+    - name: Exercise bounded SSH launcher protocol
+      run: python3 tests/ssh_launcher.py
+
+  build-check:
+    name: build
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require all platform builds
+      env:
+        BUILD_RESULT: ${{ needs.build.result }}
+      run: test "$BUILD_RESULT" = success

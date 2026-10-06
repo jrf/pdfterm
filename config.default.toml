@@ -1,0 +1,55 @@
+# pdfterm configuration. Created on first launch; existing files are never overwritten.
+# Default location: ~/.config/pdfterm/config.toml.
+# XDG_CONFIG_HOME overrides ~/.config. Restart viewer/editor after editing.
+
+fit_mode = "page"                  # page, width, or height
+dark_mode = false                  # Invert PDF colors using the selected theme
+theme = ""                         # Empty: built-in palette; otherwise a theme TOML path
+theme_catalog = ""                 # Empty: no external catalog; otherwise a catalog TOML path
+persistent_link_picker = false     # Keep link browser open after following a link
+link_picker_split_percent = 50     # Link pane size, 20–80 percent
+link_picker_layout = "auto"         # auto, vertical, horizontal, or floating
+synctex_enabled = true              # Enable Option/Alt-click PDF-to-source jumps (LaTeX and Typst)
+# Relative names resolve inside the private config-directory/run directory (mode 0700).
+# Absolute paths require a current-user-owned mode-0700 parent. Never use shared /tmp directly.
+forward_socket = "forward.sock"    # Requires --session; empty disables viewer control even with a session
+
+[editor]
+transport = "socket"               # socket (Neovim default), command, or none (clipboard only)
+path = "editor.sock"               # Relative to private run/ directory
+# For command transport, remove path and uncomment argv; no shell expansion is performed.
+# argv = ["code", "--reuse-window", "--goto", "{file}:{line}:{column}"]
+# For clipboard-only mode, use transport = "none" and remove path.
+# {line}: 1-based; {column}: 1-based UTF-16; {column_char}: 1-based Unicode scalar
+# {byte_column}: 0-based UTF-8; {column_byte}: 1-based UTF-8; {file}: absolute path
+
+[viewer]
+continuous_scroll = true           # Display adjacent pages together; false restores page-at-a-time
+prefetch_pages = 5                 # Background-render this many pages on each side (0 disables)
+smooth_scroll = false              # Animate vertical wheel/j/k movement in continuous mode
+scroll_frame_ms = 16               # Minimum interval between animation frames, 1–1000 ms
+scroll_ease_divisor = 4            # Fraction of remaining distance per frame, 1–100 (1 = instant)
+scroll_step_percent = 12           # Small vertical movement as viewport percent, 1–100
+page_scroll_percent = 85           # Large vertical movement as viewport percent, 1–100
+set_window_title = true            # Set terminal/window title to active PDF filename
+center_forward_search = true       # Center source position; false aligns its top near viewport top
+flash_duration_ms = 1000            # Highlight lifetime after frame submission, 1–60000 ms
+flash_label_font = "monospace"     # Installed system font family (e.g. Menlo)
+flash_label_foreground = "#c0caf5"  # Jump-label text color (#RRGGBB)
+flash_label_background = "#5b21b6"  # Jump-label background (#RRGGBB); deep violet
+word_precision = true              # Refine LaTeX inverse search with nearby PDF/source words
+source_context_lines = 4           # Source radius outside Beamer frames, 0–100; frames use full block
+
+[nvim]
+compile = false                    # Run latexmk before LaTeX forward search; Typst always compiles
+attach_only = false                # true: require an existing viewer even for explicit split/open commands
+focus_on_inverse = false           # Focus the source terminal after inverse search when available
+focus_on_forward = false           # Focus the exact viewer after an acknowledged forward search when available
+executable = ""                    # Runtime override; setup({executable=...}) selects the asynchronous config loader
+
+[nvim.keys]
+# Empty keys disable mappings. Choose bindings in your local config.
+forward = ""                       # Save and forward-search existing viewer (optionally compile)
+build = ""                         # Build main document (TeX and Typst buffers)
+main_file = ""                     # Use current TeX or Typst file as main document
+compile = ""                       # Toggle LaTeX compilation before forward search

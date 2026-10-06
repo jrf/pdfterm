@@ -1,8 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -32,11 +31,12 @@ fn download_pdfium() -> Result<(), Box<dyn Error>> {
     let asset = asset_for_target(&target_os, &target_arch)?;
     let output =
         PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?).join(asset.library_name);
+    let notices = output.with_file_name("pdfium-notices.txt");
 
     println!("cargo:rustc-env=PDFIUM_LIBRARY_NAME={}", asset.library_name);
     println!("cargo:rustc-env=PDFIUM_REVISION={PDFIUM_REVISION}");
 
-    if output.is_file() {
+    if output.is_file() && notices.is_file() {
         return Ok(());
     }
 
@@ -64,7 +64,7 @@ fn download_pdfium() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
-    extract_library(&bytes, asset.library_name, &output)
+    extract_library(&bytes, asset.library_name, &output, &notices)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -106,27 +106,43 @@ fn extract_library(
     archive_bytes: &[u8],
     library_name: &str,
     output: &Path,
+    notices_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let decoder = GzDecoder::new(archive_bytes);
-    let mut archive = Archive::new(decoder);
+    let mut archive = Archive::new(GzDecoder::new(archive_bytes));
     let archive_path = Path::new("lib").join(library_name);
-
+    let mut library = None;
+    let mut notices = std::collections::BTreeMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if entry.path()?.ends_with(&archive_path) {
-            let mut file = File::create(output)?;
-            io::copy(&mut entry, &mut file)?;
-            return Ok(());
+        let path = entry.path()?.into_owned();
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if path.ends_with(&archive_path) {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            library = Some(bytes);
+        } else if path == Path::new("LICENSE") || path.starts_with("licenses") {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            notices.insert(path, bytes);
         }
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
-            "{} does not contain {}",
-            archive_path.display(),
-            library_name
-        ),
-    )
-    .into())
+    let library = library.ok_or("PDFium archive has no native library")?;
+    if !notices.contains_key(Path::new("LICENSE"))
+        || !notices.contains_key(Path::new("licenses/pdfium.txt"))
+    {
+        return Err("PDFium archive is missing license notices".into());
+    }
+    let mut text =
+        format!("PDFium chromium/{PDFIUM_REVISION}, distributed by bblanchon/pdfium-binaries\n")
+            .into_bytes();
+    for (path, notice) in notices {
+        write!(&mut text, "\n===== {} =====\n", path.display())?;
+        text.extend_from_slice(&notice);
+        text.push(b'\n');
+    }
+    std::fs::write(output, library)?;
+    std::fs::write(notices_path, text)?;
+    Ok(())
 }

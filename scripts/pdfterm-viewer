@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -lt 1 ]; then
+    printf '%s\n' 'usage: pdfterm-viewer EXECUTABLE [ARG ...]' >&2
+    exit 2
+fi
+
+if [ -z "${SSH_CONNECTION-}" ] && [ -z "${SSH_CLIENT-}" ] && [ -z "${SSH_TTY-}" ] \
+    && { [ "${TERM_PROGRAM-}" = ghostty ] || [ -n "${GHOSTTY_RESOURCES_DIR-}" ]; }; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        printf '%s\n' 'pdfterm-viewer: capture requires a foreground interactive Ghostty terminal' >&2
+        exit 1
+    fi
+    terminal_id=$(python3 -c '
+import os
+import signal
+import subprocess
+import sys
+
+try:
+    child = subprocess.Popen(
+        ["osascript", "-e", "tell application \"Ghostty\" to id of focused terminal of selected tab of front window"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+except OSError as error:
+    sys.exit(f"pdfterm-viewer: could not start Ghostty capture: {error}")
+try:
+    stdout, stderr = child.communicate(timeout=3)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    child.stdout.close()
+    child.stderr.close()
+    try:
+        child.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        sys.exit("pdfterm-viewer: Ghostty capture timed out; helper could not be reaped")
+    sys.exit("pdfterm-viewer: Ghostty capture timed out after 3 seconds")
+if child.returncode:
+    sys.stderr.buffer.write(stderr)
+    sys.exit("pdfterm-viewer: could not capture focused Ghostty terminal")
+sys.stdout.buffer.write(stdout)
+') || exit 1
+    if [ -z "$terminal_id" ]; then
+        printf '%s\n' 'pdfterm-viewer: Ghostty returned an empty terminal ID' >&2
+        exit 1
+    fi
+    PDFTERM_VIEWER_TERMINAL_ID=$terminal_id
+    export PDFTERM_VIEWER_TERMINAL_ID
+fi
+
+exec "$@"

@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""Open a remote shell or Neovim with automatic client-side PDF windows."""
+import argparse
+from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
+import hmac
+import json
+import os
+import re
+import selectors
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import secrets
+
+
+def kill_group(child):
+    try:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except PermissionError:
+            # Darwin reports EPERM for a zombie-only group. Reap our leader
+            # before retrying; a denial against a live leader remains an error.
+            if child.poll() is None:
+                raise
+            os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    finally:
+        child.wait(timeout=2)
+
+
+def run(argv, timeout=2, deadline=None, input_data=None):
+    now = time.monotonic()
+    deadline = min(now + timeout, deadline) if deadline is not None else now + timeout
+    if deadline <= now:
+        raise subprocess.TimeoutExpired(argv, 0)
+    # Finite helpers own a process group. Interactive authentication is separate.
+    stdin = subprocess.PIPE if input_data is not None else subprocess.DEVNULL
+    with subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True) as child:
+        chunks = {child.stdout: bytearray(), child.stderr: bytearray()}
+        size = 0
+        try:
+            if input_data is not None:
+                child.stdin.write(input_data)
+                child.stdin.close()
+            with selectors.DefaultSelector() as pending:
+                for stream in chunks:
+                    pending.register(stream, selectors.EVENT_READ)
+                while pending.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    for key, _ in pending.select(min(remaining, 0.05)):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            pending.unregister(key.fileobj)
+                            continue
+                        size += len(chunk)
+                        if size > 1024 * 1024:
+                            raise RuntimeError('helper output exceeds 1 MiB')
+                        chunks[key.fileobj].extend(chunk)
+            child.wait(timeout=max(0.001, deadline - time.monotonic()))
+            if child.returncode:
+                error = chunks[child.stderr].decode(errors='replace').strip()
+                raise RuntimeError(error or f'{argv[0]} exited {child.returncode}')
+            return chunks[child.stdout].decode(errors='replace').strip()
+        finally:
+            kill_group(child)
+
+
+def forwarding_bind_addresses(platform, output, port):
+    if platform == 'Linux':
+        expected = '127.0.0.1:' + str(port)
+        addresses = []
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) >= 4:
+                addresses.append(fields[3])
+        return addresses, expected
+    if platform == 'Darwin':
+        expected = '127.0.0.1.' + str(port)
+        addresses = []
+        for line in output.splitlines():
+            fields = line.split()
+            if (len(fields) >= 6 and fields[0] in ('tcp4', 'tcp6')
+                    and fields[-1] == 'LISTEN' and fields[3].endswith('.' + str(port))):
+                addresses.append(fields[3])
+        return addresses, expected
+    raise RuntimeError('cannot verify reverse-forward bind on remote platform ' + platform)
+
+
+def allocated_forward_port(output):
+    if not re.fullmatch(r'[1-9][0-9]{0,4}', output):
+        raise RuntimeError('SSH did not report a valid allocated reverse-forward port')
+    port = int(output)
+    if port > 65535:
+        raise RuntimeError('SSH did not report a valid allocated reverse-forward port')
+    return port
+
+
+def forwarding_control_args(ssh, operation, specification):
+    return ssh[:-1] + ['-O', operation, '-R', specification, ssh[-1]]
+
+def applescript(body, *arguments, deadline=None):
+    return run(['osascript', '-e', 'on run argv\ntell application "Ghostty"\n' + body
+                + '\nend tell\nend run', *arguments], deadline=deadline)
+
+
+class Terminal(ABC):
+    """Exact-handle terminal operations; the bridge owns sessions and handoff."""
+
+    def __init__(self, source):
+        self.source = source
+
+    @abstractmethod
+    def launch(self, argv, deadline=None):
+        """Return the ID of a right-hand split beside the captured source."""
+
+    @abstractmethod
+    def focus(self, identifier, deadline=None):
+        """Focus one exact surface, never whichever surface is currently active."""
+
+    @abstractmethod
+    def existing(self, identifiers, deadline=None):
+        """Return the live subset; query failures must raise."""
+
+    @abstractmethod
+    def close(self, identifier, deadline=None):
+        """Gracefully quit the reader; an already-gone surface is a no-op."""
+
+
+class KittyTerminal(Terminal):
+    def launch(self, argv, deadline=None):
+        run(['kitten', '@', 'goto-layout', '--match', 'window_id:' + self.source, 'splits'],
+            deadline=deadline)
+        return run(['kitten', '@', 'launch', '--match', 'window_id:' + self.source,
+                    '--type=window', '--location=vsplit', '--keep-focus',
+                    '--next-to', 'id:' + self.source, *argv], deadline=deadline)
+
+    def focus(self, identifier, deadline=None):
+        run(['kitten', '@', 'focus-window', '--match', 'id:' + identifier], deadline=deadline)
+
+    def existing(self, identifiers, deadline=None):
+        if not identifiers:
+            return set()
+        listing = json.loads(run(['kitten', '@', 'ls'], deadline=deadline))
+        try:
+            live = {str(window['id']) for surface in listing
+                    for tab in surface['tabs'] for window in tab['windows']}
+        except (KeyError, TypeError) as error:
+            raise RuntimeError('invalid Kitty window listing') from error
+        return set(identifiers) & live
+
+    def close(self, identifier, deadline=None):
+        if self.existing({identifier}, deadline=deadline):
+            run(['kitten', '@', 'send-text', '--match', 'id:' + identifier, '\x03'],
+                deadline=deadline)
+
+
+class UnclosedPane(RuntimeError):
+    """A failed launch whose exact new pane is still owned by the bridge."""
+
+    def __init__(self, identifier, message):
+        super().__init__(message)
+        self.identifier = identifier
+
+
+class WezTermTerminal(Terminal):
+    def __init__(self, source, socket_path):
+        if not re.fullmatch(r'[0-9]+', source) or not socket_path or '\0' in socket_path:
+            raise RuntimeError('WezTerm requires WEZTERM_PANE and WEZTERM_UNIX_SOCKET')
+        super().__init__(source)
+        self.socket_path = socket_path
+        if source not in self._panes():
+            raise RuntimeError('WezTerm source pane is not on WEZTERM_UNIX_SOCKET')
+
+    def _cli(self, *args, deadline=None):
+        # Explicit socket plus no auto-start: never switch to another GUI or mux.
+        return run(['env', 'WEZTERM_UNIX_SOCKET=' + self.socket_path, 'wezterm',
+                    'cli', '--no-auto-start', *args], deadline=deadline)
+
+    def _panes(self, deadline=None):
+        try:
+            rows = json.loads(self._cli('list', '--format', 'json', deadline=deadline))
+            if not isinstance(rows, list):
+                raise ValueError('expected an array')
+            panes = {}
+            for row in rows:
+                pane, window, tab = (row[key] for key in ('pane_id', 'window_id', 'tab_id'))
+                if any(type(value) is not int or value < 0 for value in (pane, window, tab)):
+                    raise ValueError('invalid pane/window/tab ID')
+                panes[str(pane)] = (window, tab)
+            if len(panes) != len(rows):
+                raise ValueError('duplicate pane ID')
+            return panes
+        except (ValueError, KeyError, TypeError) as error:
+            raise RuntimeError('invalid WezTerm pane listing') from error
+
+    def launch(self, argv, deadline=None):
+        panes = self._panes(deadline=deadline)
+        if self.source not in panes:
+            raise RuntimeError('WezTerm source pane is gone')
+        identifier = self._cli('split-pane', '--pane-id', self.source, '--right',
+                               '--cwd', os.getcwd(), '--', *argv, deadline=deadline)
+        if not re.fullmatch(r'[0-9]+', identifier):
+            raise RuntimeError('WezTerm split did not return a pane ID')
+        try:
+            after = self._panes(deadline=deadline)
+            if (identifier in panes or after.get(identifier) != panes[self.source]
+                    or self.source not in after):
+                raise RuntimeError('WezTerm split did not create a pane beside the source')
+            self.focus(self.source, deadline=deadline)
+        except Exception as error:
+            try:
+                self.close(identifier, deadline=time.monotonic() + 2)
+            except Exception as cleanup:
+                raise UnclosedPane(identifier, f'WezTerm launch failed: {error}; cleanup failed: {cleanup}') from error
+            raise
+        return identifier
+
+    def focus(self, identifier, deadline=None):
+        if identifier not in self._panes(deadline=deadline):
+            raise RuntimeError('WezTerm pane is gone: ' + identifier)
+        self._cli('activate-pane', '--pane-id', identifier, deadline=deadline)
+
+    def existing(self, identifiers, deadline=None):
+        if not identifiers:
+            return set()
+        return set(identifiers) & self._panes(deadline=deadline).keys()
+
+    def close(self, identifier, deadline=None):
+        if identifier == self.source:
+            raise RuntimeError('refusing to close the WezTerm source pane')
+        if self.existing({identifier}, deadline=deadline):
+            self._cli('send-text', '--no-paste', '--pane-id', identifier, '\x03',
+                      deadline=deadline)
+
+
+class GhosttyTerminal(Terminal):
+    def launch(self, argv, deadline=None):
+        identifier = applescript('''set cfg to new surface configuration
+set command of cfg to item 1 of argv
+set wait after command of cfg to false
+set sourceTerminal to terminal id (item 2 of argv)
+set viewer to split sourceTerminal direction right with configuration cfg
+return id of viewer''', shlex.join(argv), self.source, deadline=deadline)
+        if not identifier or identifier == self.source:
+            raise RuntimeError('Ghostty split returned no distinct terminal ID; created surface ownership is unknown')
+        try:
+            self.focus(self.source, deadline=deadline)
+        except Exception as error:
+            try:
+                self.close(identifier, deadline=time.monotonic() + 2)
+            except Exception as cleanup:
+                raise UnclosedPane(identifier, f'Ghostty launch failed: {error}; cleanup failed: {cleanup}') from error
+            raise
+        return identifier
+
+    def focus(self, identifier, deadline=None):
+        applescript('focus terminal id (item 1 of argv)', identifier, deadline=deadline)
+
+    def existing(self, identifiers, deadline=None):
+        if not identifiers:
+            return set()
+        result = applescript('''set liveIDs to {}
+repeat with identifier in argv
+if exists terminal id (identifier as text) then set end of liveIDs to identifier as text
+end repeat
+set AppleScript's text item delimiters to linefeed
+return liveIDs as text''', *sorted(identifiers), deadline=deadline)
+        return set(result.splitlines())
+
+    def close(self, identifier, deadline=None):
+        applescript('''repeat 15 times
+if not (exists terminal id (item 1 of argv)) then return
+send key "c" modifiers "control" to terminal id (item 1 of argv)
+delay 0.1
+end repeat
+if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier,
+                    deadline=deadline)
+
+
+def capture_terminal():
+    if os.environ.get('TERM_PROGRAM') == 'WezTerm':
+        return WezTermTerminal(os.environ.get('WEZTERM_PANE', ''),
+                               os.environ.get('WEZTERM_UNIX_SOCKET', ''))
+    if os.environ.get('KITTY_WINDOW_ID'):
+        return KittyTerminal(os.environ['KITTY_WINDOW_ID'])
+    if os.environ.get('TERM_PROGRAM') == 'ghostty' and sys.platform == 'darwin':
+        return GhosttyTerminal(applescript(
+            'return id of focused terminal of selected tab of front window'))
+    raise RuntimeError('start pdfterm-ssh in Kitty, WezTerm, or Ghostty on macOS (without tmux)')
+
+
+class Bridge:
+    def __init__(self, path, ssh, windows, token):
+        self.ssh, self.windows, self.owned = ssh, windows, set()
+        self.token = token
+        self.retired = set()  # Ownership receipts: late closes are no-ops, never terminal actions.
+        self.stop = threading.Event()
+        self.control = threading.Lock()
+        self.slots = threading.BoundedSemaphore(4)
+        self.workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix='pdfterm-launch')
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(path)
+        os.chmod(path, 0o600)
+        self.listener.listen(4)
+        self.listener.settimeout(0.1)
+        self.thread = threading.Thread(target=self.serve)
+        self.thread.start()
+
+    def dispatch(self, request, deadline):
+        if not isinstance(request, dict):
+            raise ValueError('expected an object')
+        action = request.get('action')
+        if action == 'launch':
+            argv = request.get('argv')
+            if (not isinstance(argv, list) or not 2 <= len(argv) <= 8
+                    or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)):
+                raise ValueError('invalid viewer argv')
+            live = self.windows.existing(self.owned, deadline=deadline)
+            self.retired.update(self.owned - live)
+            self.owned = live
+            if len(self.owned) >= 16:
+                raise ValueError('too many owned viewer windows')
+            env = []
+            for key, field in [('PATH', 'path'), ('XDG_CONFIG_HOME', 'config_home')]:
+                value = request.get(field)
+                if value is not None:
+                    if not isinstance(value, str) or '\0' in value:
+                        raise ValueError('invalid remote environment')
+                    env.append(key + '=' + value)
+            # Everything supplied by the remote runs THERE, never in the client shell.
+            command = shlex.join(['env', *env, *argv])
+            try:
+                identifier = self.windows.launch(
+                    self.ssh[:-1] + ['-tt', self.ssh[-1], command], deadline=deadline)
+            except UnclosedPane as error:
+                self.owned.add(error.identifier)
+                self.retired.discard(error.identifier)
+                raise
+            if not identifier:
+                raise RuntimeError('terminal launcher returned no window ID')
+            self.owned.add(identifier)
+            self.retired.discard(identifier)
+            return {'ok': True, 'id': identifier}
+        identifier = request.get('id')
+        if not isinstance(identifier, str):
+            raise ValueError('invalid window ID')
+        if action == 'focus' and identifier == 'source':
+            self.windows.focus(self.windows.source, deadline=deadline)
+        elif identifier in self.owned and action == 'focus':
+            self.windows.focus(identifier, deadline=deadline)
+        elif identifier in self.owned and action == 'close':
+            self.windows.close(identifier, deadline=deadline)
+            self.owned.remove(identifier)
+            self.retired.add(identifier)
+        elif identifier in self.retired and action == 'close':
+            pass
+        else:
+            raise ValueError('unknown action or unowned window')
+        return {'ok': True}
+
+    def serve(self):
+        while not self.stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            if not self.slots.acquire(blocking=False):
+                client.close()
+                continue
+            # Accept promptly: the budget includes waiting for terminal control.
+            future = self.workers.submit(self.serve_client, client, time.monotonic() + 5)
+            future.add_done_callback(lambda job: job.result())  # Surface unexpected worker failures.
+
+    def serve_client(self, client, deadline):
+        provisional = None
+        locked = False
+        try:
+            with client:
+                try:
+                    read_deadline = min(deadline, time.monotonic() + 1)
+                    data = bytearray()
+                    while True:
+                        client.settimeout(max(0.001, read_deadline - time.monotonic()))
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                        if len(data) > 32768 or time.monotonic() >= read_deadline:
+                            raise ValueError('launcher request exceeds size/time limit')
+                        if b'\n' in data:
+                            break
+                    request = json.loads(data)
+                    if not isinstance(request, dict):
+                        raise ValueError('expected an object')
+                    token = request.get('token')
+                    if (not isinstance(token, str) or not token.isascii()
+                            or not hmac.compare_digest(token, self.token)):
+                        raise ValueError('unauthorized launcher request')
+                    locked = self.control.acquire(timeout=max(0, deadline - time.monotonic()))
+                    if not locked or self.stop.is_set() or time.monotonic() >= deadline:
+                        raise TimeoutError('launcher queue/operation deadline exceeded')
+                    launching = isinstance(request, dict) and request.get('action') == 'launch'
+                    if launching:
+                        if not data.endswith(b'\n'):
+                            raise ValueError('launch requires a framed request and ownership receipt')
+                        # Launch peers keep their write side open for the receipt.
+                        client.setblocking(False)
+                        try:
+                            if client.recv(1, socket.MSG_PEEK) == b'':
+                                raise ConnectionError('launch client disconnected')
+                        except BlockingIOError:
+                            pass
+                    reply = self.dispatch(request, deadline)
+                    if launching:
+                        provisional = reply['id']
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('launcher queue/operation deadline exceeded')
+                    client.settimeout(min(0.5, deadline - time.monotonic()))
+                    client.sendall(json.dumps(reply).encode() + b'\n')
+                    if provisional:
+                        client.settimeout(max(0.001, deadline - time.monotonic()))
+                        if client.recv(1) != b'\x06':
+                            raise ConnectionError('launch ownership was not acknowledged')
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('launch ownership deadline exceeded')
+                        client.settimeout(max(0.001, deadline - time.monotonic()))
+                        client.sendall(json.dumps({**reply, 'confirmed': True}).encode() + b'\n')
+                        provisional = None
+                except (ValueError, RecursionError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    try:
+                        client.settimeout(0.1)
+                        client.sendall(json.dumps({'ok': False, 'error': str(error)[:2000]}).encode() + b'\n')
+                    except OSError:
+                        print(f'pdfterm-ssh: launcher request: {error}', file=sys.stderr)
+        finally:
+            if provisional:
+                try:
+                    # Rollback has a separate bounded cleanup budget. Keep bridge
+                    # ownership if cleanup fails, so shell exit can try again.
+                    self.windows.close(provisional, deadline=time.monotonic() + 2)
+                    self.owned.remove(provisional)
+                    self.retired.add(provisional)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: unclaimed viewer cleanup: {error}', file=sys.stderr)
+            if locked:
+                self.control.release()
+            self.slots.release()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+        self.workers.shutdown(wait=True)
+        self.listener.close()
+        failures = []
+        for identifier in list(self.owned):
+            try:
+                self.windows.close(identifier)
+                self.owned.remove(identifier)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError('; '.join(failures))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Configure ports, users and proxies in ~/.ssh/config. The remote needs nvim and pdfterm with its adapter installed.')
+    parser.add_argument('-F', '--ssh-config', help='alternate OpenSSH configuration file')
+    parser.add_argument('host', help='SSH host or configured alias')
+    parser.add_argument('files', nargs=argparse.REMAINDER,
+                        help='arguments passed to remote nvim; omitted: interactive login shell')
+    args = parser.parse_args()
+    if args.host.startswith('-') or '\0' in args.host:
+        parser.error('invalid SSH host')
+    if not sys.stdin.isatty():
+        parser.error('interactive authentication requires a terminal')
+    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY') or os.environ.get('TMUX'):
+        parser.error('run this wrapper on the terminal client, outside SSH and tmux')
+    windows = capture_terminal()
+    with tempfile.TemporaryDirectory(prefix='pdfterm-', dir='/tmp') as directory:
+        # One private SSH master shares authentication with viewer connections.
+        ssh = ['ssh', '-o', 'ConnectTimeout=10',
+               '-o', 'ControlPath=' + directory + '/master']
+        forward_spec = None
+        forward_active = False
+        if args.ssh_config:
+            ssh.extend(['-F', os.path.abspath(args.ssh_config)])
+        ssh.append(args.host)
+        remote_directory = None
+        remote_token = None
+        forward_port = None
+        bridge = None
+        child = None
+        master = None
+        try:
+            # Keep authentication on the controlling terminal, but put the master
+            # and its proxies in an owned group that lives until this scope exits.
+            # Do not daemonize: a forked master would escape descendant cleanup.
+            foreground = os.tcgetpgrp(sys.stdin.fileno())
+            master = subprocess.Popen(
+                ssh[:-1] + ['-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
+                            '-o', 'ForkAfterAuthentication=no', '-nN', args.host],
+                process_group=0)
+            previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(sys.stdin.fileno(), master.pid)
+                os.killpg(master.pid, signal.SIGCONT)
+                deadline = time.monotonic() + 30
+                while not os.path.exists(directory + '/master'):
+                    if master.poll() is not None:
+                        raise RuntimeError(f'SSH authentication exited {master.returncode}')
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(master.args, 30)
+                    time.sleep(0.02)
+                run(ssh[:-1] + ['-O', 'check', args.host])
+            finally:
+                os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                signal.signal(signal.SIGTTOU, previous_ttou)
+            ssh = ssh[:-1] + ['-o', 'ControlMaster=no', '-o', 'BatchMode=yes', args.host]
+            candidate = run([*ssh, 'mktemp -d /tmp/pdfterm-XXXXXXXX'], timeout=30)
+            if not re.fullmatch(r'/tmp/pdfterm-[A-Za-z0-9]+', candidate):
+                raise RuntimeError('SSH bootstrap returned an invalid private directory')
+            remote_directory = candidate
+            remote_token = remote_directory + '/launch.token'
+            token = secrets.token_hex(32)
+            secure_token = ('umask 077 && chmod 700 ' + shlex.quote(remote_directory)
+                            + ' && cat > ' + shlex.quote(remote_token)
+                            + ' && chmod 600 ' + shlex.quote(remote_token))
+            run([*ssh, secure_token], timeout=30, input_data=token.encode())
+            local_socket = directory + '/launch.sock'
+            bridge = Bridge(local_socket, ssh, windows, token)
+            forward_spec = '127.0.0.1:0:' + local_socket
+            forward = run(forwarding_control_args(ssh, 'forward', forward_spec), timeout=15)
+            forward_active = True
+            forward_port = allocated_forward_port(forward)
+            remote_platform = run([*ssh, 'uname -s'], timeout=5)
+            if remote_platform == 'Linux':
+                inspect = shlex.join(
+                    ['ss', '-H', '-n', '-l', '-t', 'sport = :' + str(forward_port)]
+                )
+                required = 'ss'
+            elif remote_platform == 'Darwin':
+                inspect = shlex.join(['/usr/sbin/netstat', '-an', '-p', 'tcp'])
+                required = '/usr/sbin/netstat'
+            else:
+                raise RuntimeError(
+                    'cannot verify reverse-forward bind on remote platform ' + remote_platform
+                )
+            try:
+                bindings = run([*ssh, inspect], timeout=5)
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError(
+                    'cannot verify SSH reverse-forward bind address; remote '
+                    + required + ' is required: ' + str(error)
+                ) from error
+            addresses, loopback = forwarding_bind_addresses(
+                remote_platform, bindings, forward_port
+            )
+            if addresses != [loopback]:
+                raise RuntimeError(
+                    'SSH reverse forward is not bound exclusively to 127.0.0.1; '
+                    'refusing insecure session'
+                )
+            remote_socket = 'tcp://127.0.0.1:' + str(forward_port)
+            environment = ['PDFTERM_LAUNCH_SOCKET=' + remote_socket,
+                           'PDFTERM_LAUNCH_TOKEN_FILE=' + remote_token]
+            if args.files:
+                command = shlex.join(['env', *environment, 'nvim', *args.files])
+                command = 'exec "$SHELL" -lc ' + shlex.quote(command)
+            else:
+                command = ('export ' + ' '.join(shlex.quote(value) for value in environment)
+                           + '; exec "$SHELL" -l')
+            # The master reads the multiplexed session's terminal descriptors.
+            # Keep both SSH processes foreground, or input stops it with SIGTTIN.
+            editor_ssh = ssh[:-1] + ['-tt', args.host]
+            previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(sys.stdin.fileno(), master.pid)
+                child = subprocess.Popen([*editor_ssh, command], process_group=master.pid)
+                return child.wait()
+            finally:
+                os.tcsetpgrp(sys.stdin.fileno(), foreground)
+                signal.signal(signal.SIGTTOU, previous_ttou)
+        finally:
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            if forward_active:
+                try:
+                    run(forwarding_control_args(ssh, 'cancel', forward_spec), timeout=15)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: reverse-forward cleanup: {error}', file=sys.stderr)
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except (OSError, RuntimeError) as error:
+                    print(f'pdfterm-ssh: cleanup: {error}', file=sys.stderr)
+            if remote_directory is not None and remote_token is not None:
+                try:
+                    run([*ssh, shlex.join(['rm', '-f', remote_token])
+                         + ' && ' + shlex.join(['rmdir', remote_directory])], timeout=15)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    print(f'pdfterm-ssh: remote cleanup: {error}', file=sys.stderr)
+            if master is not None:
+                kill_group(master)
+
+
+if __name__ == '__main__':
+    for stop_signal in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop_signal, lambda signum, _: sys.exit(128 + signum))
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        sys.exit('pdfterm-ssh: ' + str(error))
+    except KeyboardInterrupt:
+        sys.exit(130)

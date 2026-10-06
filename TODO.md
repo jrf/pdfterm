@@ -4,6 +4,7 @@
 
 - [ ] Add Kitty graphics passthrough for tmux. #feature
 - [ ] Measure render, compression, and transfer latency on direct SSH sessions. #experiment
+- [ ] Fix pre-existing `picker_labels_recent_files_with_parent_directory`: the directory label is not rendered anywhere in the popup rect (scanning the whole rect also fails), so either draw it or correct the expectation. #test
 
 ## Next
 
@@ -19,6 +20,7 @@
 Pure-Rust PDF rendering: Hayro states that its renderer has not received performance work yet, which conflicts with the latency requirement.
 
 ## Done
+- [x] Add an editor-neutral SyncTeX inverse-search handoff: Alt/Option-click resolves the source location and sends explicitly encoded columns through a configured socket or command. #feature
 
 - [x] Add a fuzzy PDF picker for startup and in-viewer file changes. #feature
 - [x] Reload changed PDFs without interrupting navigation or displaying partial writes. #feature
@@ -39,3 +41,4 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 - [x] Add incremental text search that does not block foreground rendering. #feature
 - [x] Follow internal links and named destinations, with a numbered link picker and back navigation. #feature
 - [x] Add discrete zoom levels beyond the fit modes. #feature
+- [x] Add revision-bound forward-search JSON: select or open the PDF tab, position and highlight its target, then acknowledge after the rendered frame is submitted to the terminal. #feature

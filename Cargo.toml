@@ -2,6 +2,8 @@
 name = "pdfterm"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/DavidLapous/pdfterm"
 description = "A low-latency PDF viewer for Kitty terminals"
 license = "MIT"
 
@@ -10,13 +12,21 @@ base64 = "0.23.0"
 clap = { version = "4.6.5", features = ["derive"] }
 crossterm = "0.29.0"
 crossbeam-channel = "0.5.15"
+libc = "0.2"
+getrandom = "0.4.3"
 flate2 = "1.1.9"
 nucleo-matcher = "0.3.1"
+latex2mathml = "0.2.3"
 pdfium-render = { version = "0.9.3", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_29"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0.17"
-toml = "0.8.23"
+png = "0.18.0"
+fontdb = "0.24.0"
+fontdue = "0.9.4"
+toml = "1.1.6"
+unicode-normalization = "0.1.24"
 
 [build-dependencies]
 flate2 = "1.1.9"

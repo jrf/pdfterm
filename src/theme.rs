@@ -617,8 +617,11 @@ fn parse_color(field: &str, value: &str) -> Result<Color, ThemeError> {
     Ok(rgb(red, green, blue))
 }
 
-fn parse_rgb(field: &str, value: &str) -> Result<[u8; 3], ThemeError> {
-    let Some(hex) = value.strip_prefix('#').filter(|hex| hex.len() == 6) else {
+pub(crate) fn parse_rgb(field: &str, value: &str) -> Result<[u8; 3], ThemeError> {
+    let Some(hex) = value
+        .strip_prefix('#')
+        .filter(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    else {
         return Err(ThemeError::InvalidColor {
             field: field.to_string(),
             value: value.to_string(),

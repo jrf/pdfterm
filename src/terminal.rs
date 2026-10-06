@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::style::{ResetColor, SetBackgroundColor, SetForegroundColor, force_color_output};
 use crossterm::terminal::{
@@ -48,10 +48,8 @@ impl Viewport {
         Ok(Self {
             columns: size.columns.max(1),
             rows: content_rows,
-            pixel_width: size
-                .width
-                .max(size.columns.saturating_mul(cell_width))
-                .max(1),
+            // Exclude window padding/remainders: native images occupy the cell grid.
+            pixel_width: size.columns.max(1).saturating_mul(cell_width).max(1),
             pixel_height: content_rows.saturating_mul(cell_height).max(1),
             top,
             status_row,
@@ -112,7 +110,43 @@ impl Viewport {
             crop,
             scroll_x,
             scroll_y,
+            native_cell: None,
+            offset_y: 0,
         }
+    }
+
+    /// A continuous page crop at native pixel size, including a partial top cell.
+    pub fn place_continuous(
+        self,
+        image_width: u32,
+        image_height: u32,
+        scroll_x: u32,
+        source_y: u32,
+        top: u32,
+    ) -> Option<ImagePlacement> {
+        let cell_width = (u32::from(self.pixel_width) / u32::from(self.columns)).max(1);
+        let cell_height = (u32::from(self.pixel_height) / u32::from(self.rows)).max(1);
+        let height = image_height
+            .saturating_sub(source_y)
+            .min((u32::from(self.rows) * cell_height).saturating_sub(top));
+        if height == 0 {
+            return None;
+        }
+        let mut placement = self.place(image_width, image_height, scroll_x, 0);
+        // Window pixel sizes may include a remainder outside the cell grid.
+        let width = image_width.min(u32::from(self.columns) * cell_width);
+        placement.scroll_x = scroll_x.min(image_width.saturating_sub(width));
+        placement.offset_y = top % cell_height;
+        placement.rows = (placement.offset_y + height).div_ceil(cell_height) as u16;
+        placement.scroll_y = source_y;
+        placement.native_cell = Some((cell_width, cell_height));
+        placement.crop = Some(kitty::Crop {
+            x: placement.scroll_x,
+            y: source_y,
+            width,
+            height,
+        });
+        Some(placement)
     }
 }
 
@@ -125,6 +159,60 @@ pub struct ImagePlacement {
     pub crop: Option<kitty::Crop>,
     pub scroll_x: u32,
     pub scroll_y: u32,
+    /// Native pixel placement uses these cell dimensions for pointer mapping.
+    pub native_cell: Option<(u32, u32)>,
+    pub offset_y: u32,
+}
+
+impl ImagePlacement {
+    /// Visible source pixels under a terminal cell; `row` is relative to image top.
+    pub fn source_cell(
+        self,
+        column: u16,
+        row: u16,
+        image_width: u32,
+        image_height: u32,
+    ) -> Option<kitty::Crop> {
+        let column = column.checked_sub(self.left)?;
+        if column >= self.columns || row >= self.rows {
+            return None;
+        }
+        let crop = self.crop.unwrap_or(kitty::Crop {
+            x: 0,
+            y: 0,
+            width: image_width,
+            height: image_height,
+        });
+        let (x0, x1, y0, y1) = if let Some((width, height)) = self.native_cell {
+            (
+                u32::from(column) * width,
+                (u32::from(column) + 1) * width,
+                (u32::from(row) * height).saturating_sub(self.offset_y),
+                ((u32::from(row) + 1) * height).saturating_sub(self.offset_y),
+            )
+        } else {
+            let boundary = |cell: u32, cells: u16, pixels: u32| {
+                (u64::from(cell) * u64::from(pixels) / u64::from(cells)) as u32
+            };
+            (
+                boundary(u32::from(column), self.columns, crop.width),
+                boundary(u32::from(column) + 1, self.columns, crop.width),
+                boundary(u32::from(row), self.rows, crop.height),
+                boundary(u32::from(row) + 1, self.rows, crop.height),
+            )
+        };
+        let x1 = x1.min(crop.width);
+        let y1 = y1.min(crop.height);
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        Some(kitty::Crop {
+            x: crop.x + x0,
+            y: crop.y + y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
 }
 
 pub struct TerminalGuard;
@@ -136,6 +224,7 @@ impl TerminalGuard {
         if let Err(error) = execute!(
             output,
             EnterAlternateScreen,
+            EnableMouseCapture,
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg),
             DisableLineWrap,
@@ -211,5 +300,39 @@ mod tests {
                 height: 800,
             })
         );
+    }
+
+    #[test]
+    fn continuous_crops_keep_single_pixel_motion_and_partial_cell_hits() {
+        let viewport = sample_viewport();
+        let before = viewport.place_continuous(1000, 1600, 0, 19, 0).unwrap();
+        let after = viewport.place_continuous(1000, 1600, 0, 20, 0).unwrap();
+        assert_eq!(before.crop.unwrap().y, 19);
+        assert_eq!(after.crop.unwrap().y, 20);
+        assert_eq!(before.crop.unwrap().height, after.crop.unwrap().height);
+        assert_eq!(before.source_cell(0, 0, 1000, 1600).unwrap().y, 19);
+
+        // A short page starts 7 pixels into a cell, with a partial bottom row.
+        let page = viewport.place_continuous(995, 26, 0, 0, 7).unwrap();
+        let top = page.source_cell(0, 0, 995, 26).unwrap();
+        let bottom = page.source_cell(0, 1, 995, 26).unwrap();
+        assert_eq!((top.y, top.height), (0, 13));
+        assert_eq!((bottom.y, bottom.height), (13, 13));
+        assert_eq!(page.source_cell(99, 1, 995, 26).unwrap().width, 5);
+        assert!(page.source_cell(0, 2, 995, 26).is_none());
+        assert!(viewport.place_continuous(1000, 26, 0, 27, 0).is_none());
+
+        // The last viewport row clips the page, not its placement scale.
+        let clipped = viewport.place_continuous(1000, 1600, 0, 0, 793).unwrap();
+        assert_eq!(clipped.crop.unwrap().height, 7);
+        assert_eq!(clipped.source_cell(0, 0, 1000, 1600).unwrap().height, 7);
+
+        let padded = Viewport {
+            pixel_width: 1007,
+            ..viewport
+        };
+        let edge = padded.place_continuous(1007, 1600, 7, 0, 0).unwrap();
+        assert_eq!(edge.crop.unwrap().width, 1000);
+        assert_eq!(edge.source_cell(99, 0, 1007, 1600).unwrap().x, 997);
     }
 }

@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
@@ -447,15 +449,24 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 
 fn collect_pdf_files(root: &Path) -> Vec<(String, PathBuf)> {
     let git_files = Command::new("git")
-        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(root)
         .output();
     match git_files {
         Ok(output) if output.status.success() => {
-            let mut files: Vec<_> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|relative| is_pdf(Path::new(relative)))
-                .map(|relative| (relative.to_string(), root.join(relative)))
+            let mut files: Vec<_> = output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|relative| !relative.is_empty())
+                .map(|relative| Path::new(OsStr::from_bytes(relative)))
+                .filter(|relative| is_pdf(relative))
+                .map(|relative| (relative.to_string_lossy().into_owned(), root.join(relative)))
                 .collect();
             files.sort_by(|left, right| left.0.cmp(&right.0));
             return files;
@@ -617,6 +628,59 @@ mod tests {
         let matches: Vec<_> = browser.filtered_entries().collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, report);
+    }
+
+    #[test]
+    fn git_recursive_filter_preserves_quoted_and_non_utf8_paths() {
+        use std::ffi::OsString;
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(["config", "core.quotePath", "true"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let docs = directory.path().join("docs");
+        fs::create_dir(&docs).unwrap();
+        let docs = docs.canonicalize().unwrap();
+        let cases = [
+            ("résumé", OsString::from("résumé.pdf")),
+            ("quoted", OsString::from("quoted\"name.pdf")),
+            ("newline", OsString::from("newline\nname.pdf")),
+            // macOS filesystems reject non-UTF-8 filenames.
+            #[cfg(target_os = "linux")]
+            ("raw", OsString::from_vec(b"raw-\xff.pdf".to_vec())),
+        ];
+        for (_, name) in &cases {
+            fs::write(docs.join(name), b"synthetic").unwrap();
+        }
+        let mut browser = BrowserState::new(directory.path().to_owned());
+        browser.preload_recursive();
+        wait_for_recursive_scan(&mut browser);
+        for (filter, name) in cases {
+            browser.filter = filter.to_owned();
+            browser.rebuild_filter();
+            let matches: Vec<_> = browser
+                .filtered_entries()
+                .map(|entry| &entry.path)
+                .collect();
+            assert_eq!(matches, vec![&docs.join(name)], "{filter}");
+        }
     }
 
     #[test]
