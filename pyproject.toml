@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py", "ssh_launcher.py"]
+norecursedirs = ["target", "ext", ".git", ".beads"]

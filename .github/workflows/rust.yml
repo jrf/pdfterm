@@ -26,7 +26,7 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y texlive-latex-base texlive-latex-recommended texlive-pictures
+        sudo apt-get install -y latexmk texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-pictures texlive-science
         curl --fail --location https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz | tar xz
         echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
     - name: Install macOS integration dependencies
@@ -35,7 +35,7 @@ jobs:
         brew install neovim
         brew install --cask basictex
         sudo /Library/TeX/texbin/tlmgr update --self
-        sudo /Library/TeX/texbin/tlmgr install beamer etoolbox
+        sudo /Library/TeX/texbin/tlmgr install beamer cleveref etoolbox latexmk stmaryrd
         echo "/Library/TeX/texbin" >> "$GITHUB_PATH"
     - name: Check formatting and lint
       run: cargo fmt --check && cargo clippy --all-targets -- -D warnings
@@ -47,6 +47,9 @@ jobs:
       run: |
         PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim.lua
         PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim_sessions.lua
+        PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim_log.lua
+        nvim --headless -u NONE -l tests/nvim_source.lua
+        nvim --headless -u NONE -l tests/nvim_socket.lua
     - name: Exercise terminal ownership completion
       run: nvim --headless -u NONE -l tests/nvim_terminal.lua
     - name: Exercise persistent Ghostty control with a fake worker

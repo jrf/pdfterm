@@ -20,17 +20,60 @@ pub(super) struct Tab {
     pub(super) dark_mode_style: DarkModeStyle,
     pub(super) search_highlight: [u8; 3],
     pub(super) link_highlight: [u8; 3],
-    pub(super) scroll_x: u32,
+    // Content alignment may put the first visible page outside its own crop
+    // range while a wider following page retains the viewport's horizontal pan.
+    pub(super) scroll_x: i64,
     pub(super) scroll_y: u32,
+    pub(super) center_content: bool,
     pub(super) outline: Arc<Vec<OutlineItem>>,
     pub(super) cache: HashMap<RenderKey, Arc<Frame>>,
     pub(super) search: SearchState,
-    pub(super) link_history: Vec<ViewPosition>,
+    pub(super) link_history: JumpList,
     pub(super) pending_destination: Option<LinkDestination>,
     pub(super) link_index: LinkIndexState,
 }
 
 impl Tab {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        document_id: DocumentId,
+        path: PathBuf,
+        revision: PdfRevision,
+        watcher: FileWatcher,
+        page_count: u32,
+        page: u32,
+        fit: FitMode,
+        invert: bool,
+        dark_mode_style: DarkModeStyle,
+        search_highlight: [u8; 3],
+        link_highlight: [u8; 3],
+        outline: Vec<OutlineItem>,
+    ) -> Self {
+        Self {
+            document_id,
+            path,
+            revision,
+            watcher,
+            page_count,
+            page,
+            fit,
+            zoom: ZOOM_DEFAULT,
+            invert,
+            dark_mode_style,
+            search_highlight,
+            link_highlight,
+            scroll_x: 0,
+            scroll_y: 0,
+            center_content: true,
+            outline: Arc::new(outline),
+            cache: HashMap::new(),
+            search: SearchState::default(),
+            link_history: JumpList::default(),
+            pending_destination: None,
+            link_index: LinkIndexState::new(page_count),
+        }
+    }
+
     pub(super) fn render_key(
         &self,
         viewport: Viewport,
@@ -53,6 +96,22 @@ impl Tab {
             selected_link_ordinal,
         }
     }
+
+    pub(super) fn view_position(&self) -> ViewPosition {
+        ViewPosition {
+            page: self.page,
+            scroll_x: self.scroll_x,
+            scroll_y: self.scroll_y,
+            center_content: self.center_content,
+        }
+    }
+
+    pub(super) fn set_view_position(&mut self, position: ViewPosition) {
+        self.page = position.page.min(self.page_count.saturating_sub(1));
+        self.scroll_x = position.scroll_x;
+        self.scroll_y = position.scroll_y;
+        self.center_content = position.center_content;
+    }
 }
 
 // Watch both files: a companion published after its PDF must also trigger reload.
@@ -60,17 +119,24 @@ pub(super) type FileFingerprint = crate::synctex::DocumentRevision;
 
 pub(super) struct FileWatcher {
     pub(super) accepted: FileFingerprint,
+    pub(super) failed: Option<FileFingerprint>,
     pub(super) candidate: Option<(FileFingerprint, Instant)>,
     pub(super) next_poll: Instant,
 }
 
 impl FileWatcher {
+    #[cfg(test)]
     pub(super) fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            accepted: FileFingerprint::read(path)?,
+        Ok(Self::from_revision(FileFingerprint::read(path)?))
+    }
+
+    pub(super) fn from_revision(accepted: FileFingerprint) -> Self {
+        Self {
+            accepted,
+            failed: None,
             candidate: None,
             next_poll: Instant::now() + FILE_POLL_INTERVAL,
-        })
+        }
     }
 
     pub(super) fn poll(&mut self, path: &Path) -> Option<FileFingerprint> {
@@ -95,7 +161,7 @@ impl FileWatcher {
         fingerprint: FileFingerprint,
         now: Instant,
     ) -> Option<FileFingerprint> {
-        if fingerprint == self.accepted {
+        if fingerprint == self.accepted || self.failed == Some(fingerprint) {
             self.candidate = None;
             return None;
         }
@@ -116,6 +182,7 @@ impl FileWatcher {
 
     pub(super) fn accept(&mut self, fingerprint: FileFingerprint) {
         self.accepted = fingerprint;
+        self.failed = None;
         if self
             .candidate
             .is_some_and(|(candidate, _)| candidate == fingerprint)
@@ -124,8 +191,10 @@ impl FileWatcher {
         }
     }
 
-    pub(super) fn defer(&mut self, duration: Duration) {
-        self.next_poll = Instant::now() + duration;
+    pub(super) fn mark_failed(&mut self, fingerprint: FileFingerprint) {
+        self.failed = Some(fingerprint);
+        self.candidate = None;
+        self.next_poll = Instant::now() + RELOAD_RETRY_DELAY;
     }
 }
 
@@ -148,6 +217,14 @@ pub(super) enum PendingOpen {
     },
 }
 
+impl PendingOpen {
+    fn document_id(&self) -> DocumentId {
+        match self {
+            Self::Reload { document_id, .. } | Self::Selection { document_id, .. } => *document_id,
+        }
+    }
+}
+
 impl App {
     pub(super) fn poll_file_change(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         if self.session.pending_open.is_some() {
@@ -162,13 +239,24 @@ impl App {
             return Ok(());
         };
 
-        self.navigation.inverse.take();
+        self.begin_reload(document_id, path, fingerprint, output)
+    }
+
+    pub(super) fn begin_reload(
+        &mut self,
+        document_id: DocumentId,
+        path: PathBuf,
+        fingerprint: FileFingerprint,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
         self.clear_document_flash(document_id);
         if self.tab().document_id == document_id {
-            self.generation = self.generation.wrapping_add(1);
-            self.worker.begin_generation(self.generation);
+            self.navigation.inverse.take();
+            self.bump_generation(true);
             self.reset_render_state();
             self.pending_scale = None;
+        } else {
+            self.pending.retain(|key, _| key.document_id != document_id);
         }
         self.worker
             .open(document_id, path)
@@ -189,87 +277,74 @@ impl App {
         document_id: DocumentId,
         pages: u32,
         outline: Vec<OutlineItem>,
-        revision: PdfRevision,
+        revision: FileFingerprint,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let Some(pending) = self.session.pending_open.take() else {
+        let Some(pending) = self
+            .session
+            .pending_open
+            .take_if(|pending| pending.document_id() == document_id)
+        else {
             return Ok(());
         };
         match pending {
-            PendingOpen::Reload {
-                document_id: expected,
-                fingerprint,
-            } if expected == document_id => {
+            PendingOpen::Reload { fingerprint, .. } => {
                 let Some(index) = self.tab_index(document_id) else {
                     return Ok(());
                 };
                 self.clear_document_flash(document_id);
                 let tab = &mut self.session.tabs[index];
                 tab.watcher.accept(fingerprint);
-                tab.revision = revision;
+                tab.revision = revision.pdf;
                 tab.page_count = pages;
                 tab.page = tab.page.min(pages - 1);
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 tab.search = SearchState::default();
-                tab.link_history.clear();
+                tab.link_history.clamp_pages(pages);
                 tab.pending_destination = None;
                 tab.link_index = LinkIndexState::new(pages);
                 if index == self.session.active_tab {
-                    self.search_picker = None;
+                    self.reset_active_tab_pickers();
                     self.reset_render_state();
                     self.ensure_link_index();
                     self.request_current(output)?;
                 }
             }
-            PendingOpen::Selection {
-                document_id: expected,
-                path,
-                view,
-            } if expected == document_id => {
+            PendingOpen::Selection { path, view, .. } => {
+                self.restore_active_picker_preview();
                 crate::recent::record(&path);
-                let watcher = FileWatcher::new(&path)?;
-                self.session.tabs.push(Tab {
+                let watcher = FileWatcher::from_revision(revision);
+                self.session.tabs.push(Tab::new(
                     document_id,
                     path,
-                    revision,
+                    revision.pdf,
                     watcher,
-                    page_count: pages,
-                    page: 0,
-                    fit: self.default_fit,
-                    zoom: ZOOM_DEFAULT,
-                    invert: self.default_invert,
-                    dark_mode_style: DarkModeStyle::new(
+                    pages,
+                    0,
+                    self.default_fit,
+                    self.default_invert,
+                    DarkModeStyle::new(
                         self.theme.document.background,
                         self.theme.document.foreground,
                     ),
-                    search_highlight: terminal_color_rgb(self.theme.yellow),
-                    link_highlight: terminal_color_rgb(self.theme.cyan),
-                    scroll_x: 0,
-                    scroll_y: 0,
-                    outline: Arc::new(outline),
-                    cache: HashMap::new(),
-                    search: SearchState::default(),
-                    link_history: Vec::new(),
-                    pending_destination: None,
-                    link_index: LinkIndexState::new(pages),
-                });
+                    terminal_color_rgb(self.theme.yellow),
+                    terminal_color_rgb(self.theme.cyan),
+                    outline,
+                ));
                 if let Some(view) = view {
                     let tab = self.session.tabs.last_mut().expect("new tab");
-                    tab.page = view.position.page.min(pages - 1);
-                    tab.scroll_x = view.position.scroll_x;
-                    tab.scroll_y = view.position.scroll_y;
+                    tab.set_view_position(view.position);
                     tab.fit = view.fit;
                     tab.zoom = view.zoom;
                     tab.invert = view.invert;
                 }
                 self.session.active_tab = self.session.tabs.len() - 1;
-                self.clear_viewer(output)?;
+                self.reset_active_tab_pickers();
                 self.reset_render_state();
                 self.ensure_link_index();
                 self.request_current(output)?;
             }
-            _ => {}
         }
         Ok(())
     }
@@ -280,25 +355,36 @@ impl App {
         error: &str,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        self.finish_forward(Some(format!("document open failed: {error}")));
-        let state = match self.session.pending_open.take() {
-            Some(PendingOpen::Reload {
-                document_id: expected,
-                ..
-            }) if expected == document_id => {
-                if let Some(index) = self.tab_index(document_id) {
-                    self.session.tabs[index].watcher.defer(RELOAD_RETRY_DELAY);
-                }
-                format!("reload failed: {error}; retrying")
-            }
-            Some(PendingOpen::Selection {
-                document_id: expected,
-                ..
-            }) if expected == document_id => format!("open failed: {error}"),
-            _ => return Ok(()),
+        let Some(pending) = self
+            .session
+            .pending_open
+            .take_if(|pending| pending.document_id() == document_id)
+        else {
+            return Ok(());
         };
-        self.request_current(output)?;
-        self.draw_status(output, self.viewport()?, &state)?;
+        let (failed_path, state) = match pending {
+            PendingOpen::Reload { fingerprint, .. } => {
+                let Some(index) = self.tab_index(document_id) else {
+                    return Ok(());
+                };
+                self.session.tabs[index].watcher.mark_failed(fingerprint);
+                let path = self.session.tabs[index].path.clone();
+                let state =
+                    (index == self.session.active_tab).then(|| format!("reload failed: {error}"));
+                (path, state)
+            }
+            PendingOpen::Selection { path, .. } => (path, Some(format!("open failed: {error}"))),
+        };
+        if self.navigation.forward.as_ref().is_some_and(|fwd| {
+            fwd.request.pdf == failed_path
+                || fs::canonicalize(&fwd.request.pdf).ok().as_deref() == Some(failed_path.as_path())
+        }) {
+            self.finish_forward(Some(format!("document open failed: {error}")));
+        }
+        if let Some(state) = state {
+            self.request_current(output)?;
+            self.draw_status(output, self.viewport()?, &state)?;
+        }
         Ok(())
     }
 
@@ -316,11 +402,7 @@ impl App {
         }
         let tab = self.tab();
         let view = TabView {
-            position: ViewPosition {
-                page: tab.page,
-                scroll_x: tab.scroll_x,
-                scroll_y: tab.scroll_y,
-            },
+            position: tab.view_position(),
             fit: tab.fit,
             zoom: tab.zoom,
             invert: tab.invert,
@@ -373,9 +455,10 @@ impl App {
         {
             return Ok(());
         }
+        self.restore_active_picker_preview();
         self.navigation.inverse.take();
         self.session.active_tab = index;
-        self.clear_viewer(output)?;
+        self.reset_active_tab_pickers();
         self.reset_render_state();
         self.ensure_link_index();
         self.request_current(output)
@@ -390,12 +473,14 @@ impl App {
             return Ok(true);
         }
         let removed = self.session.tabs.remove(self.session.active_tab);
+        self.clear_document_flash(removed.document_id);
         self.worker.close(removed.document_id);
         if self.session.active_tab == self.session.tabs.len() {
             self.session.active_tab -= 1;
         }
-        self.clear_viewer(output)?;
+        self.reset_active_tab_pickers();
         self.reset_render_state();
+        self.ensure_link_index();
         self.request_current(output)?;
         Ok(false)
     }

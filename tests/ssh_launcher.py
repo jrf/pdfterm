@@ -7,6 +7,7 @@ from pathlib import Path
 import runpy
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -15,6 +16,8 @@ import time
 import threading
 import selectors
 import unittest
+import stat
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 launcher = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'))
@@ -138,7 +141,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertTrue(reply.get('confirmed'), reply)
             return reply
 
-    def nvim(self, code):
+    def nvim(self, code, socket_path=None):
         script = Path(self.directory.name) / 'client.lua'
         root = str(Path(launcher['__file__']).resolve().parent.parent)
         script.write_text('vim.opt.runtimepath:prepend(' + json.dumps(root) + ')\n' + code)
@@ -146,12 +149,49 @@ class LauncherTests(unittest.TestCase):
             ['nvim', '--headless', '-u', 'NONE', '-l', str(script)],
             env={
                 **os.environ,
-                'PDFTERM_LAUNCH_SOCKET': f'tcp://127.0.0.1:{self.forward_listener.getsockname()[1]}',
+                'PDFTERM_LAUNCH_SOCKET': socket_path or f'tcp://127.0.0.1:{self.forward_listener.getsockname()[1]}',
                 'PDFTERM_LAUNCH_TOKEN_FILE': str(self.token_path),
             },
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, '', result.stderr)
+
+    def test_real_lua_client_launches_focuses_and_closes_through_stdio_relay(self):
+        helper = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-relay.py'
+        remote_socket = self.directory.name + '/remote.sock'
+        with subprocess.Popen([sys.executable, str(helper), 'listen', remote_socket],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as remote:
+            self.assertEqual(remote.stdout.readline(), b'READY\n')
+            with subprocess.Popen([sys.executable, str(helper), 'connect', self.path],
+                                  stdin=remote.stdout, stdout=remote.stdin) as local:
+                remote.stdin.close()
+                remote.stdout.close()
+                try:
+                    self.nvim("""
+local terminal = require('pdfterm.terminal')
+local source = {kind='ssh', id='source'}
+local owned
+terminal.launch_split(source, 'pdfterm', 'paper.pdf', function(result, split)
+  assert(result.code == 0, result.stderr)
+  owned = assert(split)
+end):wait()
+assert(owned)
+local focused
+terminal.focus(owned, function(result)
+  assert(result.code == 0, result.stderr)
+  focused = true
+end):wait()
+assert(focused)
+terminal.close(owned)
+vim.cmd('qa!')
+""", socket_path=remote_socket)
+                finally:
+                    local.terminate()
+                    local.wait(timeout=3)
+                    remote.wait(timeout=3)
+        self.assertEqual(self.windows.serial, 1)
+        self.assertFalse(self.windows.live)
+        self.assertFalse(self.bridge.owned)
 
     def test_slow_launch_transfers_ownership_to_real_lua_client(self):
         existing, launch = self.windows.existing, self.windows.launch
@@ -330,6 +370,7 @@ error('editor did not exit during launch')
                         self.assertEqual(arguments, ('ghostty-source',))
                         raise RuntimeError('Ghostty source refocus failed')
                     if body.startswith('repeat 15 times'):
+                        self.assertIn('close terminal id (item 1 of argv)', body)
                         self.assertEqual(arguments, ('ghostty-child',), 'only the exact child may be closed')
                         if cleanup['fail']:
                             raise RuntimeError('Ghostty child cleanup unavailable')
@@ -468,6 +509,20 @@ vim.cmd('qa!')
 """)
         self.assertEqual(self.windows.focused, ['editor'])
 
+    def test_launch_keeps_argv_bounded_and_owned(self):
+        argv = ['viewer', 'paper.pdf', '--synctex-best-guess',
+                '--session', 'session', '--focus-token', 'f' * 32]
+        rejected = self.request({'action': 'launch', 'argv': [*argv, 'unexpected']})
+        self.assertFalse(rejected['ok'])
+        self.assertFalse(self.windows.live)
+        viewer = self.request({'action': 'launch', 'argv': argv})
+        self.assertTrue(viewer['ok'], viewer)
+        self.assertEqual(self.bridge.owned, {viewer['id']})
+        self.assertEqual(self.windows.live, {viewer['id']})
+        self.assertTrue(self.request({'action': 'close', 'id': viewer['id']})['ok'])
+        self.assertFalse(self.bridge.owned)
+        self.assertFalse(self.windows.live)
+
     def test_malformed_requests_do_not_kill_listener_or_control_unowned_windows(self):
         for payload in (b'{', [], {'action': 'close', 'id': []}, {'action': 'close', 'id': 'editor'},
                         {'action': 'launch', 'argv': ['viewer', None]}, b' ' * 32769):
@@ -504,14 +559,9 @@ vim.cmd('qa!')
             'Linux', 'LISTEN 0 128 0.0.0.0:4567 0.0.0.0:*', 4567
         )
         self.assertNotEqual(wildcard, [expected])
-        darwin, expected = parse(
-            'Darwin', 'tcp4 0 0 127.0.0.1.4567 *.* LISTEN', 4567
-        )
-        self.assertEqual(darwin, [expected])
-        wildcard, expected = parse(
-            'Darwin', 'tcp4 0 0 *.4567 *.* LISTEN', 4567
-        )
-        self.assertNotEqual(wildcard, [expected])
+        # macOS remotes use an SSH stdio relay instead of a TCP reverse forward.
+        with self.assertRaises(RuntimeError):
+            parse('Darwin', 'tcp4 0 0 127.0.0.1.4567 *.* LISTEN', 4567)
 
     def test_dynamic_forward_parses_openssh_stdout(self):
         parse = launcher['allocated_forward_port']
@@ -614,6 +664,7 @@ vim.cmd('qa!')
         with patch.dict(os.environ, SSH_CONNECTION='', SSH_TTY='', TMUX=''), \
                 patch.object(sys, 'argv', ['pdfterm-ssh', 'test.invalid']), \
                 patch.object(sys.stdin, 'isatty', return_value=True), \
+                patch.object(sys.stdin, 'fileno', return_value=0), \
                 patch.object(os, 'tcgetpgrp', return_value=0), \
                 patch.dict(launcher['main'].__globals__, capture_terminal=lambda: self.windows), \
                 patch.object(subprocess, 'Popen', side_effect=CaptureMaster) as start:
@@ -625,6 +676,88 @@ vim.cmd('qa!')
         policy = dict(line.split(maxsplit=1) for line in result.stdout.splitlines())
         self.assertIn(policy['controlmaster'], ('true', 'yes'))
         self.assertEqual(policy['stdinnull'], 'yes')
+
+    def test_hangup_and_revoked_tty_during_cleanup_still_close_bridge(self):
+        closed = []
+
+        class FakeChild:
+            pid = 4242
+
+            @staticmethod
+            def poll():
+                return None
+
+            @staticmethod
+            def wait(timeout=None):
+                return 0
+
+            @staticmethod
+            def terminate():
+                os.kill(os.getpid(), signal.SIGHUP)
+
+        class FakeBridge:
+            def __init__(self, *_):
+                pass
+
+            @staticmethod
+            def close():
+                closed.append(True)
+
+        def fake_tcsetpgrp(_fd, pgrp):
+            if pgrp == 1111:
+                raise OSError(5, 'Input/output error')
+
+        previous = signal.getsignal(signal.SIGHUP)
+        try:
+            signal.signal(signal.SIGHUP, launcher['handle_stop_signal'])
+            with patch.dict(os.environ, SSH_CONNECTION='', SSH_TTY='', TMUX=''), \
+                    patch.object(sys, 'argv', ['pdfterm-ssh', 'test.invalid']), \
+                    patch.object(sys.stdin, 'isatty', return_value=True), \
+                    patch.object(sys.stdin, 'fileno', return_value=0), \
+                    patch.object(os, 'tcgetpgrp', return_value=1111), \
+                    patch.object(os, 'tcsetpgrp', side_effect=fake_tcsetpgrp), \
+                    patch.object(os, 'killpg'), \
+                    patch.object(os.path, 'exists', return_value=True), \
+                    patch.dict(
+                        launcher['main'].__globals__,
+                        capture_terminal=lambda: self.windows,
+                        popen_in_pgrp=lambda *_args: FakeChild(),
+                        run=lambda cmd, **_kw: '/tmp/pdfterm-test1234' if 'mktemp' in cmd[-1] else ('Darwin' if 'uname' in cmd[-1] else ''),
+                        Bridge=FakeBridge,
+                        StdioForward=lambda *_args: FakeBridge(),
+                        kill_group=lambda _master: None,
+                    ):
+                self.assertEqual(launcher['main'](), 0)
+            self.assertEqual(closed, [True, True])
+        finally:
+            signal.signal(signal.SIGHUP, previous)
+
+
+class HelperPathTests(unittest.TestCase):
+    script = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'
+
+    def test_symlinked_launcher_resolves_helpers_next_to_real_script(self):
+        with tempfile.TemporaryDirectory(prefix='pdfterm-link-') as directory:
+            link = Path(directory) / 'pdfterm-ssh'
+            link.symlink_to(self.script)
+            linked = runpy.run_path(str(link))
+            close_script = linked['GHOSTTY_CLOSE_SCRIPT']
+            self.assertEqual(close_script, self.script.with_name('ghostty-close.applescript'))
+            self.assertTrue(close_script.is_file())
+            ghostty = linked['GhosttyTerminal']('ghostty-source')
+            self.assertEqual(ghostty.close_script, close_script.read_text(encoding='utf-8'))
+
+    def test_missing_close_script_fails_before_any_split(self):
+        with tempfile.TemporaryDirectory(prefix='pdfterm-copy-') as directory:
+            copy = Path(directory) / 'pdfterm-ssh'
+            shutil.copyfile(self.script, copy)
+            isolated = runpy.run_path(str(copy))
+            calls = []
+            terminal = isolated['GhosttyTerminal']
+            with patch.dict(terminal.launch.__globals__, applescript=lambda *args, **kwargs: calls.append(args)):
+                with self.assertRaises(FileNotFoundError):
+                    terminal('ghostty-source').launch(['viewer', 'paper.pdf'])
+            self.assertEqual(calls, [], 'no Ghostty split may be created without a close script')
 
 
 class ShellHookTests(unittest.TestCase):
@@ -672,6 +805,200 @@ class ShellHookTests(unittest.TestCase):
                                env=env, check=True, timeout=5)
                 last = json.loads((root / 'calls').read_text().splitlines()[-1])
                 self.assertEqual(Path(last[0]).name, 'ssh')
+
+
+class StdioRelayTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix='pdfterm-relay-', dir='/tmp')
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        root.chmod(0o700)
+        self.remote = str(root / 'remote.sock')
+        target = str(root / 'target.sock')
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(target)
+        self.listener.listen(4)
+        self.listener.settimeout(0.1)
+        self.stopping = threading.Event()
+        self.addCleanup(self.stop_echo)
+        threading.Thread(target=self.echo_server, daemon=True).start()
+        helper = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-relay.py'
+        self.remote_process = subprocess.Popen(
+            [sys.executable, str(helper), 'listen', self.remote],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_processes)
+        with selectors.DefaultSelector() as pending:
+            pending.register(self.remote_process.stdout, selectors.EVENT_READ)
+            self.assertTrue(pending.select(3), 'relay did not start')
+        self.assertEqual(self.remote_process.stdout.readline(), b'READY\n')
+        self.local_process = subprocess.Popen(
+            [sys.executable, str(helper), 'connect', target],
+            stdin=self.remote_process.stdout, stdout=self.remote_process.stdin,
+            stderr=subprocess.PIPE)
+        self.remote_process.stdin.close()
+        self.remote_process.stdout.close()
+
+    def stop_processes(self):
+        if hasattr(self, 'local_process'):
+            self.local_process.terminate()
+            self.local_process.wait(timeout=3)
+            self.local_process.stderr.close()
+        self.remote_process.wait(timeout=3)
+        self.remote_process.stdin.close()
+        self.remote_process.stdout.close()
+        self.remote_process.stderr.close()
+
+    def stop_echo(self):
+        self.stopping.set()
+        self.listener.close()
+
+    def echo_server(self):
+        while not self.stopping.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self.echo, args=(client,), daemon=True).start()
+
+    @staticmethod
+    def echo(client):
+        with client:
+            while data := client.recv(65536):
+                client.sendall(data)
+
+    def exchange(self, payload, receipt=False):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(3)
+            client.connect(self.remote)
+            if receipt:
+                client.sendall(payload)
+                self.assertEqual(client.recv(len(payload)), payload)
+                client.sendall(b'\x06')
+                self.assertEqual(client.recv(1), b'\x06')
+            else:
+                def send():
+                    client.sendall(payload)
+                    client.shutdown(socket.SHUT_WR)
+                sender = threading.Thread(target=send)
+                sender.start()
+                response = bytearray()
+                while data := client.recv(65536):
+                    response.extend(data)
+                self.assertEqual(response, payload)
+                sender.join(timeout=3)
+                self.assertFalse(sender.is_alive())
+
+    def test_large_binary_payload_and_half_close(self):
+        self.exchange(bytes(range(256)) * 1000)
+
+    def test_ownership_receipt_can_follow_reply_on_same_connection(self):
+        for _ in range(20):
+            self.exchange(b'launch request\n', receipt=True)
+
+    def test_concurrent_clients_do_not_mix_frames(self):
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            list(workers.map(self.exchange, [bytes([n % 256]) * 20000 for n in range(20)]))
+
+    def test_socket_is_private_current_user_owned_and_removed_on_disconnect(self):
+        identity = os.stat(self.remote)
+        self.assertTrue(stat.S_ISSOCK(identity.st_mode))
+        self.assertEqual(stat.S_IMODE(identity.st_mode), 0o600)
+        self.assertEqual(identity.st_uid, os.getuid())
+        self.local_process.terminate()
+        self.local_process.wait(timeout=3)
+        self.remote_process.wait(timeout=3)
+        self.assertEqual(self.remote_process.returncode, 0)
+        self.assertFalse(Path(self.remote).exists())
+
+    def test_write_all_completes_partial_writes(self):
+        import io
+        import struct
+        mod = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-relay.py'))
+        out = bytearray()
+        class ShortOut:
+            def write(self, buf):
+                chunk = bytes(buf[:3])
+                out.extend(chunk)
+                return len(chunk)
+            def flush(self):
+                pass
+        incoming = io.BytesIO(struct.pack('!II', 7, 0xffffffff))
+        mod['relay']('connect', str(Path(self.directory.name) / 'missing-zibble.sock'), incoming, ShortOut())
+        self.assertEqual(bytes(out), struct.pack('!II', 7, 0xfffffffd))
+
+    def test_stdio_forward_tolerates_csh_and_noisy_login_banner(self):
+        launcher = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'))
+        StdioForward = launcher['StdioForward']
+        remote_sh = launcher['remote_sh']
+        remote_session_command = launcher['remote_session_command']
+        bin_dir = Path(self.directory.name) / 'bin'
+        bin_dir.mkdir(mode=0o700)
+        (bin_dir / 'python3').symlink_to(sys.executable)
+        fake_nvim = bin_dir / 'nvim'
+        fake_nvim.write_text(
+            f'#!{sys.executable}\n'
+            'import json, os, sys\n'
+            'print("NVIM_OUT=" + json.dumps([os.environ.get("PDFTERM_LAUNCH_SOCKET"), sys.argv[1:]]))\n'
+        )
+        fake_nvim.chmod(0o700)
+        fake_ssh = bin_dir / 'fake-ssh'
+        fake_ssh.write_text(
+            f'#!{sys.executable}\n'
+            'import os, sys\n'
+            'sys.stdout.write("zibble-motd\\n")\n'
+            'sys.stdout.flush()\n'
+            'env = dict(os.environ, HOME=os.environ["TEST_HOME"], PATH=os.environ["TEST_PATH"], SHELL=os.environ["TEST_SHELL"])\n'
+            'os.execve(env["SHELL"], [env["SHELL"], "-c", sys.argv[-1]], env)\n'
+        )
+        fake_ssh.chmod(0o700)
+        for shell in ('/bin/sh', '/bin/bash', '/bin/zsh', '/bin/csh', '/bin/tcsh'):
+            if not Path(shell).is_file():
+                continue
+            sock_dir = Path(self.directory.name) / Path(shell).name
+            sock_dir.mkdir(mode=0o755)
+            remote_sock = str(sock_dir / 'remote.sock')
+            token_path = str(sock_dir / 'launch.token')
+            test_path = f'{bin_dir}:/usr/bin:/bin'
+            with patch.dict(
+                os.environ,
+                TEST_HOME=self.directory.name,
+                TEST_SHELL=shell,
+                TEST_PATH=test_path,
+            ):
+                secure_cmd = remote_sh(
+                    'umask 077 && chmod 700 "$1" && cat > "$2" && chmod 600 "$2"',
+                    str(sock_dir),
+                    token_path,
+                )
+                subprocess.run([str(fake_ssh), secure_cmd], input=b'quux-token', check=True, stdout=subprocess.DEVNULL)
+                self.assertEqual(stat.S_IMODE(os.stat(sock_dir).st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(os.stat(token_path).st_mode), 0o600)
+                self.assertEqual(Path(token_path).read_bytes(), b'quux-token')
+
+                bridge = StdioForward([str(fake_ssh)], remote_sock, str(Path(self.directory.name) / 'target.sock'))
+                try:
+                    self.assertTrue(Path(remote_sock).exists())
+                finally:
+                    bridge.close()
+
+                sess_cmd = remote_session_command(
+                    [f'PATH={test_path}', 'PDFTERM_LAUNCH_SOCKET=' + remote_sock],
+                    ['zibble file.tex'],
+                )
+                out = subprocess.check_output([str(fake_ssh), sess_cmd], text=True)
+                marker_line = [line for line in out.splitlines() if line.startswith('NVIM_OUT=')][-1]
+                self.assertEqual(json.loads(marker_line.split('=', 1)[1]), [remote_sock, ['zibble file.tex']])
+
+                clean_cmd = remote_sh(
+                    'dir="$1"; shift; rm -f "$@" && rmdir "$dir"',
+                    str(sock_dir),
+                    token_path,
+                    remote_sock,
+                )
+                subprocess.run([str(fake_ssh), clean_cmd], check=True, stdout=subprocess.DEVNULL)
+                self.assertFalse(sock_dir.exists())
 
 
 if __name__ == '__main__':

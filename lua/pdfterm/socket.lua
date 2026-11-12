@@ -178,37 +178,63 @@ function M.diagnose(path, callback)
   end)
 end
 
+local function absolute_path(path)
+  return type(path) == 'string' and path:sub(1, 1) == '/' and not path:find('%z')
+end
+
+local function document_context(location)
+  local warning = location.warning
+  return warning == nil or warning == vim.NIL
+    or type(warning) == 'string' and #warning <= 4096 and not warning:find('%z')
+end
+
 function M.listen(path, on_location)
   local parent = assert(vim.uv.fs_lstat(vim.fs.dirname(path)))
   assert(
     parent.type == 'directory' and parent.uid == vim.uv.getuid() and bit.band(parent.mode, 63) == 0,
     'pdfterm: socket parent must be a current-user-owned mode-0700 directory'
   )
+  assert(absolute_path(path) and #path <= 103, 'pdfterm: socket path must be absolute and at most 103 bytes')
+  local directory = vim.fs.dirname(path)
+  local random = assert(vim.uv.random(8)):gsub('.', function(byte)
+    return string.format('%02x', byte:byte())
+  end)
+  local endpoint = directory .. '/' .. random:sub(1, 102 - #directory)
+  -- A 101-byte parent leaves one hex digit, which may equal a 1-byte public name.
+  if endpoint == path then
+    endpoint = directory .. '/' .. (endpoint:sub(-1) == '0' and '1' or '0')
+  end
+  assert(endpoint ~= path, 'pdfterm: private socket name collides with public path')
   local server = assert(vim.uv.new_pipe(false))
-  local ok, bind_error = server:bind(path)
+  -- libuv unlinks its bound name on close; never bind the replaceable public name.
+  local ok, bind_error = server:bind(endpoint)
   if not ok then
     server:close()
-    error('pdfterm: cannot bind ' .. path .. ': ' .. tostring(bind_error))
+    error('pdfterm: cannot bind private socket: ' .. tostring(bind_error))
   end
-  local identity, stat_error = vim.uv.fs_lstat(path)
+  local identity, stat_error = vim.uv.fs_lstat(endpoint)
   if not identity then
     server:close()
     error('pdfterm: cannot identify socket: ' .. tostring(stat_error))
   end
-  local clients, count = {}, 0
+  local clients, count, closed = {}, 0, false
   local function close()
+    if closed then return end
+    closed = true
     for finish in pairs(clients) do
       finish('editor stopped')
+    end
+    local current = vim.uv.fs_lstat(path)
+    local removed, remove_error = true, nil
+    if current and current.dev == identity.dev and current.ino == identity.ino then
+      removed, remove_error = vim.uv.fs_unlink(path)
     end
     if not server:is_closing() then
       server:close()
     end
-    local current = vim.uv.fs_lstat(path)
-    if current and current.dev == identity.dev and current.ino == identity.ino then
-      assert(vim.uv.fs_unlink(path))
-    end
+    assert(removed, remove_error)
   end
-  local secured, chmod_error = vim.uv.fs_chmod(path, 384)
+  local secured, chmod_error = vim.uv.fs_chmod(endpoint, 384)
   if not secured then
     close()
     error('pdfterm: cannot secure socket: ' .. tostring(chmod_error))
@@ -221,58 +247,70 @@ function M.listen(path, on_location)
       return
     end
     local client = assert(vim.uv.new_pipe(false))
-    server:accept(client)
-    if count >= 16 then
+    if not server:accept(client) or count >= 16 then
       client:close()
       return
     end
     count = count + 1
     local timer = assert(vim.uv.new_timer())
-    local chunks, size = {}, 0
-    local finish
-    finish = function(message, deliver)
-      if client:is_closing() then
-        return
-      end
+    local chunks, size, done = {}, 0, false
+    local function finish(message)
+      if done then return end
+      done = true
       clients[finish] = nil
       count = count - 1
       timer:stop()
       timer:close()
-      client:close()
-      vim.schedule(function()
-        if message then
+      if not client:is_closing() then client:close() end
+      if message and not (closed and message == 'editor stopped') then
+        vim.schedule(function()
           vim.notify('pdfterm inverse search: ' .. message, vim.log.levels.ERROR)
-        elseif deliver and size > 0 then
-          local decoded, location = pcall(vim.json.decode, table.concat(chunks))
-          if
-            not decoded
-            or type(location) ~= 'table'
-            or type(location.file) ~= 'string'
-            or location.file:sub(1, 1) ~= '/'
-            or location.file:find('%z')
-            or type(location.line) ~= 'number'
-            or location.line < 1
-            or location.line % 1 ~= 0
-            or type(location.byte_column) ~= 'number'
-            or location.byte_column < 0
-            or location.byte_column % 1 ~= 0
-          then
-            vim.notify('pdfterm: invalid inverse-search JSON location', vim.log.levels.ERROR)
-          else
-            on_location(location)
-          end
-        end
-      end)
+        end)
+      end
     end
     clients[finish] = true
     timer:start(1000, 0, function()
       finish('request timed out')
     end)
     client:read_start(function(read_error, chunk)
+      if done then return end
       if read_error then
         finish(read_error)
       elseif not chunk then
-        finish(nil, true)
+        -- Complete input must survive a busy main loop without a read timeout.
+        timer:stop()
+        client:read_stop()
+        vim.schedule(function()
+          if done or closed then return end
+          if size == 0 then finish(); return end
+          local decoded, location = pcall(vim.json.decode, table.concat(chunks))
+          if not decoded or type(location) ~= 'table' then
+            finish('invalid inverse-search JSON request')
+            return
+          end
+          if location.action ~= nil then
+            finish('unsupported editor action')
+            return
+          end
+          finish()
+          if
+            not absolute_path(location.file)
+            or type(location.line) ~= 'number'
+            or location.line < 1
+            or location.line % 1 ~= 0
+            or type(location.byte_column) ~= 'number'
+            or location.byte_column < 0
+            or location.byte_column % 1 ~= 0
+            or not document_context(location)
+          then
+            vim.notify('pdfterm: invalid inverse-search JSON location', vim.log.levels.ERROR)
+          else
+            local call_ok, call_error = pcall(on_location, location)
+            if not call_ok then
+              vim.notify('pdfterm: ' .. tostring(call_error), vim.log.levels.ERROR)
+            end
+          end
+        end)
       else
         size = size + #chunk
         if size > 16384 then
@@ -286,6 +324,11 @@ function M.listen(path, on_location)
   if not listening then
     close()
     error('pdfterm: cannot listen: ' .. tostring(listen_failure))
+  end
+  local published, publish_error = vim.uv.fs_link(endpoint, path)
+  if not published then
+    close()
+    error('pdfterm: cannot publish socket ' .. path .. ': ' .. tostring(publish_error))
   end
   return close
 end

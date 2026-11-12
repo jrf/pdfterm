@@ -7,6 +7,13 @@ local function launch_token()
   if not path or path == '' then
     return nil, 'pdfterm: missing PDFTERM_LAUNCH_TOKEN_FILE'
   end
+  local stat = vim.uv.fs_lstat(path)
+  if not stat or stat.type ~= 'file' then
+    return nil, 'pdfterm: cannot read launch token file'
+  end
+  if stat.uid ~= vim.uv.getuid() or bit.band(stat.mode, 63) ~= 0 then
+    return nil, 'pdfterm: launch token file must be private (mode 0600)'
+  end
   local ok, lines = pcall(vim.fn.readfile, path)
   if not ok then
     return nil, 'pdfterm: cannot read launch token file: ' .. tostring(lines)

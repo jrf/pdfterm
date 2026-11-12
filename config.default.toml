@@ -1,8 +1,8 @@
 # pdfterm configuration. Created on first launch; existing files are never overwritten.
 # Default location: ~/.config/pdfterm/config.toml.
-# XDG_CONFIG_HOME overrides ~/.config. Restart viewer/editor after editing.
+# XDG_CONFIG_HOME overrides ~/.config. Press R in viewer to reload (or restart).
 
-fit_mode = "page"                  # page, width, or height
+fit_mode = "page"                  # page, width, height, or content
 dark_mode = false                  # Invert PDF colors using the selected theme
 theme = ""                         # Empty: built-in palette; otherwise a theme TOML path
 theme_catalog = ""                 # Empty: no external catalog; otherwise a catalog TOML path
@@ -29,7 +29,7 @@ prefetch_pages = 5                 # Background-render this many pages on each s
 smooth_scroll = false              # Animate vertical wheel/j/k movement in continuous mode
 scroll_frame_ms = 16               # Minimum interval between animation frames, 1–1000 ms
 scroll_ease_divisor = 4            # Fraction of remaining distance per frame, 1–100 (1 = instant)
-scroll_step_percent = 12           # Small vertical movement as viewport percent, 1–100
+scroll_step_percent = 5            # Small vertical movement as viewport percent, 1–100
 page_scroll_percent = 85           # Large vertical movement as viewport percent, 1–100
 set_window_title = true            # Set terminal/window title to active PDF filename
 center_forward_search = true       # Center source position; false aligns its top near viewport top
@@ -46,6 +46,7 @@ attach_only = false                # true: require an existing viewer even for e
 focus_on_inverse = false           # Focus the source terminal after inverse search when available
 focus_on_forward = false           # Focus the exact viewer after an acknowledged forward search when available
 executable = ""                    # Runtime override; setup({executable=...}) selects the asynchronous config loader
+log_file = ""                      # File path to log SyncTeX navigation checks, warnings, and errors
 
 [nvim.keys]
 # Empty keys disable mappings. Choose bindings in your local config.

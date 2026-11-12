@@ -60,11 +60,88 @@ local ok, failure = xpcall(function()
   -- including a multibyte character, rather than the preceding newline.
   local line_start = resolve(p, p.main, 6, 0)
   assert(line_start.page == 2, vim.inspect(line_start))
-  local third = resolve(p, directory .. '/chapter.typ', 2, 0)
+  assert(typst.is_coherent(p))
+  local warm_done
+  local warm_cancel = typst.resolve(p, directory .. '/chapter.typ', 2, 0, function(v) warm_done = v end)
+  assert(vim.uv.fs_stat(line_start.inverse_search) ~= nil)
+  if not vim.wait(60000, function() return warm_done ~= nil end, 10) then
+    warm_cancel()
+    error('Warm Typst resolution timed out')
+  end
+  assert(warm_done.code == 0, warm_done.stderr)
+  local third = vim.json.decode(warm_done.stdout)
+  endpoints[#endpoints + 1] = assert(third.inverse_search)
+  assert(vim.uv.fs_stat(line_start.inverse_search) == nil)
+  assert(vim.uv.fs_stat(third.inverse_search) ~= nil)
   assert(third.page == 3, vim.inspect(third))
   assert(third.pdf == p.pdf and third.v >= 30, vim.inspect(third))
 
+  -- Cold forward with a missing PDF and missing output parent directory compiles
+  -- directly, warm blank/comment timeout or cancel preserves the service and
+  -- inverse socket, and typst.build refreshes through the retained service.
+  vim.fn.mkdir(directory .. '/cold')
+  vim.fn.writefile({ '// Unrendered comment.', 'Cold anchor.' }, directory .. '/cold/main.typ')
+  local cold = project.describe({
+    main = 'cold/main.typ', cwd = directory, pdf = 'cold-out/sub/output.pdf',
+    build = { 'typst', 'compile', directory .. '/cold/main.typ', directory .. '/cold-out/sub/output.pdf' },
+  })
+  assert(vim.uv.fs_stat(cold.pdf) == nil)
+  local cold_mapped = resolve(cold, cold.main, 2, 0)
+  assert(cold_mapped.page == 1 and vim.uv.fs_stat(cold.pdf) ~= nil, vim.inspect(cold_mapped))
+  assert(typst.is_coherent(cold))
+  local cold_sock = cold_mapped.inverse_search
+  local blank_res
+  typst.resolve(cold, cold.main, 1, 0, function(v) blank_res = v end)
+  assert(vim.wait(10000, function() return blank_res ~= nil end, 10), 'blank-line forward did not time out')
+  assert(blank_res.code == 1 and blank_res.stderr:find('timed out', 1, true), vim.inspect(blank_res))
+  assert(typst.is_coherent(cold) and vim.uv.fs_lstat(cold_sock) ~= nil)
+  local warm_cancelled = false
+  local cancel_warm = typst.resolve(cold, cold.main, 2, 0, function() warm_cancelled = true end)
+  cancel_warm()
+  assert(not warm_cancelled and typst.is_coherent(cold) and vim.uv.fs_lstat(cold_sock) ~= nil)
+  local before_service_build = assert(vim.uv.fs_stat(cold.pdf))
+  vim.fn.writefile({ '// Unrendered comment.', '#pagebreak()', 'Cold anchor.' }, cold.main)
+  local build_notes, saved_notify = {}, vim.notify
+  vim.notify = function(msg, _, opts) build_notes[#build_notes + 1] = { msg = msg, opts = opts or {} } end
+  local ok_notify, err_notify = xpcall(function()
+    local build_id = project.next()
+    assert(typst.build(cold, build_id) == true)
+    project.next() -- Superseding intent must still clear sticky Compiling… toast.
+    assert(vim.wait(30000, function()
+      local st = vim.uv.fs_stat(cold.pdf)
+      return st ~= nil and st.ino ~= before_service_build.ino and typst.is_coherent(cold)
+    end, 10), 'retained typst.build did not publish updated PDF')
+    assert(#build_notes >= 2 and build_notes[1].msg == 'Compiling…' and build_notes[1].opts.timeout == false
+      and build_notes[#build_notes].msg == 'Compilation OK' and build_notes[#build_notes].opts.timeout == 5000
+      and build_notes[#build_notes].opts.id == build_notes[1].opts.id, vim.inspect(build_notes))
+  end, debug.traceback)
+  vim.notify = saved_notify
+  assert(ok_notify, err_notify)
+  assert(vim.uv.fs_lstat(cold_sock) ~= nil)
+  local rebuilt_mapped = resolve(cold, cold.main, 3, 0)
+  assert(rebuilt_mapped.page == 2, vim.inspect(rebuilt_mapped))
+
+  -- Releasing a PDF while a cold resolve is still compiling stops Tinymist before publication.
+  local release_res
+  typst.resolve({
+    main = cold.main, cwd = directory, pdf = directory .. '/released-cold.pdf',
+    build = { 'typst', 'compile', cold.main, directory .. '/released-cold.pdf' },
+  }, cold.main, 3, 0, function(v) release_res = v end)
+  typst.release(directory .. '/released-cold.pdf')
+  assert(vim.wait(5000, function() return release_res ~= nil end, 10), 'cold release did not finish')
+  assert(release_res.code == 1 and vim.uv.fs_stat(directory .. '/released-cold.pdf') == nil)
+
   assert(vim.uv.fs_symlink(directory, alias))
+  local alias_cold = {
+    main = alias .. '/cold/main.typ', cwd = alias, pdf = alias .. '/nested-out/sub/output.pdf',
+    build = { 'typst', 'compile', alias .. '/cold/main.typ', alias .. '/nested-out/sub/output.pdf' },
+  }
+  local alias_mapped = resolve(alias_cold, alias_cold.main, 3, 0)
+  assert(alias_mapped.page == 2 and typst.is_coherent(alias_cold))
+  assert(typst.is_coherent({
+    main = directory .. '/cold/main.typ', cwd = directory, pdf = directory .. '/nested-out/sub/output.pdf',
+    build = { 'typst', 'compile', directory .. '/cold/main.typ', directory .. '/nested-out/sub/output.pdf' },
+  }), 'symlinked missing output directories split the retained service key')
   local linked = project.describe({
     main = alias .. '/main.typ', cwd = alias, pdf = alias .. '/custom output.pdf',
     build = { 'typst', 'compile', '--root', alias, directory .. '/main.typ', p.pdf },

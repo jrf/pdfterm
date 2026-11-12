@@ -1,5 +1,6 @@
+use std::error::Error;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -14,9 +15,17 @@ struct Cli {
     #[arg(long)]
     pdfium_library: Option<PathBuf>,
 
-    /// One-based page number to show first.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    page: u32,
+    /// One-based page number to show first (or forward-search page hint).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    page: Option<u32>,
+
+    /// One-based page hint for --forward-search or --synctex-view.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    page_hint: Option<u32>,
+
+    /// Directory containing SyncTeX files when separate from the PDF directory.
+    #[arg(short = 'd', long = "build-directory")]
+    build_directory: Option<PathBuf>,
 
     /// Print the shared configuration as JSON (also creates the default file).
     #[arg(long)]
@@ -33,6 +42,14 @@ struct Cli {
     /// Resolve a source position and print the editor-neutral forward JSON request.
     #[arg(long)]
     synctex_view: Option<PathBuf>,
+
+    /// Permit explicitly warned compiler-anchor navigation.
+    #[arg(long, hide = true)]
+    synctex_best_guess: bool,
+
+    /// Resolve only a compiler line anchor, without a literal word hint.
+    #[arg(long, hide = true)]
+    synctex_anchor: bool,
 
     /// One-based source line for --forward-search or --synctex-view.
     #[arg(long, default_value_t = 1)]
@@ -60,6 +77,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    pdfterm::synctex::set_build_directory(cli.build_directory.clone());
     if cli.third_party_licenses {
         return match std::io::Write::write_all(
             &mut std::io::stdout().lock(),
@@ -85,6 +103,7 @@ fn main() -> ExitCode {
                 &config.viewer,
                 io::stdin().lock(),
                 io::stdout().lock(),
+                cli.synctex_best_guess,
             )
         })();
         return match result {
@@ -94,6 +113,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    if !cli.print_config
+        && let Some(source) = cli.synctex_view.as_deref()
+    {
+        // Printing the JSON request needs no viewer, so skip loading config.
+        return run_cli_forward(&cli, source, |request| {
+            println!("{}", serde_json::to_string(request)?);
+            Ok(())
+        });
     }
     let mut config = match pdfterm::config::Config::load() {
         Ok(config) => config,
@@ -119,7 +147,7 @@ fn main() -> ExitCode {
         }
     }
     if let Some(path) = cli.screenshot.as_deref() {
-        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let result = (|| -> Result<(), Box<dyn Error>> {
             let socket = config
                 .forward_socket()
                 .ok_or("forward_socket is disabled")?;
@@ -137,45 +165,22 @@ fn main() -> ExitCode {
             }
         };
     }
-    if let Some(source) = cli.forward_search.as_ref().or(cli.synctex_view.as_ref()) {
-        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let pdf = cli
-                .path
-                .as_ref()
-                .ok_or("a PDF path is required for forward search")?;
-            let request = pdfterm::synctex::resolve_forward_with_library(
-                pdf,
-                source,
-                cli.line,
-                cli.column,
-                cli.pdfium_library.as_deref(),
-            )?;
-            if cli.synctex_view.is_some() {
-                println!("{}", serde_json::to_string(&request)?);
-            } else {
-                pdfterm::ipc::forward(
-                    config
-                        .forward_socket()
-                        .ok_or("forward_socket is disabled")?,
-                    &request,
-                )?;
-            }
+    if let Some(source) = cli.forward_search.as_deref() {
+        return run_cli_forward(&cli, source, |request| {
+            let socket = config
+                .forward_socket()
+                .ok_or("forward_socket is disabled")?;
+            pdfterm::ipc::forward(socket, request)?;
             Ok(())
-        })();
-        return match result {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("pdfterm: {error}");
-                ExitCode::FAILURE
-            }
-        };
+        });
     }
     match pdfterm::app::run(
         cli.path,
         cli.pdfium_library,
-        cli.page - 1,
+        cli.page.unwrap_or(1) - 1,
         &config,
         cli.focus_token,
+        cli.synctex_best_guess,
     ) {
         Ok(()) | Err(pdfterm::app::AppError::Quit) => ExitCode::SUCCESS,
         Err(error) => {
@@ -183,4 +188,53 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolves the CLI source position for `--synctex-view` / `--forward-search`
+/// and hands the request to `deliver`. Unavailable explicit anchors exit with 3
+/// so editor adapters can tell them apart from hard failures.
+fn run_cli_forward(
+    cli: &Cli,
+    source: &Path,
+    deliver: impl FnOnce(&pdfterm::synctex::ForwardRequest) -> Result<(), Box<dyn Error>>,
+) -> ExitCode {
+    let result = resolve_cli_forward(cli, source).and_then(|request| deliver(&request));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("pdfterm: {error}");
+            if (cli.synctex_best_guess || cli.synctex_anchor)
+                && error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(pdfterm::synctex::is_forward_unavailable)
+            {
+                ExitCode::from(3)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn resolve_cli_forward(
+    cli: &Cli,
+    source: &Path,
+) -> Result<pdfterm::synctex::ForwardRequest, Box<dyn Error>> {
+    let pdf = cli
+        .path
+        .as_deref()
+        .ok_or("a PDF path is required for forward search")?;
+    Ok(pdfterm::synctex::resolve_forward_with_library(
+        pdf,
+        source,
+        cli.line,
+        cli.column,
+        cli.pdfium_library.as_deref(),
+        pdfterm::synctex::ForwardSource {
+            best_guess: cli.synctex_best_guess,
+            anchor_only: cli.synctex_anchor,
+            page_hint: cli.page_hint.or(cli.page),
+            build_directory: cli.build_directory.as_deref(),
+        },
+    )?)
 }

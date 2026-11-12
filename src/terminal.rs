@@ -1,7 +1,10 @@
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::style::{ResetColor, SetBackgroundColor, SetForegroundColor, force_color_output};
 use crossterm::terminal::{
@@ -56,6 +59,18 @@ impl Viewport {
         })
     }
 
+    pub const fn cell_size(self) -> (u32, u32) {
+        let cols = if self.columns == 0 {
+            1
+        } else {
+            self.columns as u32
+        };
+        let rows = if self.rows == 0 { 1 } else { self.rows as u32 };
+        let cw = self.pixel_width as u32 / cols;
+        let ch = self.pixel_height as u32 / rows;
+        (if cw == 0 { 1 } else { cw }, if ch == 0 { 1 } else { ch })
+    }
+
     /// The largest scroll offsets that keep the image edge aligned with the
     /// viewport, in image pixels. Zero on an axis means the image fits.
     pub fn max_scroll(self, image_width: u32, image_height: u32) -> (u32, u32) {
@@ -75,8 +90,7 @@ impl Viewport {
         scroll_x: u32,
         scroll_y: u32,
     ) -> ImagePlacement {
-        let cell_width = (u32::from(self.pixel_width) / u32::from(self.columns)).max(1);
-        let cell_height = (u32::from(self.pixel_height) / u32::from(self.rows)).max(1);
+        let (cell_width, cell_height) = self.cell_size();
         let (max_scroll_x, max_scroll_y) = self.max_scroll(image_width, image_height);
         let scroll_x = scroll_x.min(max_scroll_x);
         let scroll_y = scroll_y.min(max_scroll_y);
@@ -124,8 +138,7 @@ impl Viewport {
         source_y: u32,
         top: u32,
     ) -> Option<ImagePlacement> {
-        let cell_width = (u32::from(self.pixel_width) / u32::from(self.columns)).max(1);
-        let cell_height = (u32::from(self.pixel_height) / u32::from(self.rows)).max(1);
+        let (cell_width, cell_height) = self.cell_size();
         let height = image_height
             .saturating_sub(source_y)
             .min((u32::from(self.rows) * cell_height).saturating_sub(top));
@@ -225,6 +238,7 @@ impl TerminalGuard {
             output,
             EnterAlternateScreen,
             EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.fg),
             DisableLineWrap,
@@ -245,6 +259,7 @@ impl Drop for TerminalGuard {
         let _ = kitty::delete_all(&mut output);
         let _ = execute!(
             output,
+            PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             ResetColor,
             Show,

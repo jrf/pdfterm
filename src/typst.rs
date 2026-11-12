@@ -4,12 +4,7 @@ use crate::{
     synctex::{InversePoint, InverseResolution, PdfRevision, SourceLocation},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    io::{self, Read},
-    os::unix::fs::{FileTypeExt, MetadataExt},
-    path::Path,
-    time::Duration,
-};
+use std::{io, path::Path};
 
 pub(crate) fn resolve_inverse(
     endpoint: &str,
@@ -18,63 +13,15 @@ pub(crate) fn resolve_inverse(
     operation: &Operation,
 ) -> io::Result<InverseResolution> {
     operation.check()?;
-    let path = Path::new(endpoint);
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("Typst source-map socket has no parent"))?;
     // The adapter owns a private, local resolver. Do not contact a replaced
     // symlink, another user's socket, or a publicly accessible endpoint.
-    let directory = std::fs::symlink_metadata(parent)?;
-    let socket = std::fs::symlink_metadata(path)?;
-    let uid = unsafe { libc::geteuid() };
-    if !directory.is_dir()
-        || directory.uid() != uid
-        || directory.mode() & 0o077 != 0
-        || !socket.file_type().is_socket()
-        || socket.uid() != uid
-        || socket.mode() & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Typst source-map endpoint must be a private current-user-owned socket",
-        ));
-    }
-    let mut stream = crate::ipc::connect(endpoint, operation)?;
+    crate::ipc::check_private_socket(Path::new(endpoint))?;
     #[derive(Serialize)]
     struct Request {
         revision: PdfRevision,
         page: u32,
         x: f32,
         y: f32,
-    }
-    let request = serde_json::to_vec(&Request {
-        revision,
-        page: point.page,
-        x: point.x,
-        y: point.y_from_top,
-    })?;
-    crate::ipc::send(&mut stream, &request, operation)?;
-    let mut response = Vec::new();
-    let mut buffer = [0; 4097];
-    loop {
-        operation.check()?;
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                if response.len() + count > 4096 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Typst source-map reply exceeds 4096 bytes",
-                    ));
-                }
-                response.extend_from_slice(&buffer[..count]);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -83,7 +30,13 @@ pub(crate) fn resolve_inverse(
         location: Option<SourceLocation>,
         error: Option<String>,
     }
-    let reply: Reply = serde_json::from_slice(&response)?;
+    let request = serde_json::to_vec(&Request {
+        revision,
+        page: point.page,
+        x: point.x,
+        y: point.y_from_top,
+    })?;
+    let reply: Reply = crate::ipc::exchange(endpoint, &request, "Typst source-map", operation)?;
     if !reply.ok {
         return Err(io::Error::other(
             reply
@@ -118,6 +71,7 @@ pub(crate) fn resolve_inverse(
 mod tests {
     use super::*;
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    use std::time::Duration;
 
     fn point() -> InversePoint {
         InversePoint {

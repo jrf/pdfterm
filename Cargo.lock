@@ -754,15 +754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -838,12 +829,6 @@ dependencies = [
  "portable-atomic",
  "thiserror",
 ]
-
-[[package]]
-name = "latex2mathml"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "678cf5bdb3ba63a264e6e0c9eee36538ca1d2da0afa4dd801c1f96309e710765"
 
 [[package]]
 name = "libc"
@@ -1075,9 +1060,9 @@ dependencies = [
 
 [[package]]
 name = "pdfium-render"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8948a803616a9e936b15a6637af2cd48c5fb8ae0fcdeb3c32eac3a540e255a19"
+checksum = "296b1146652b486ea6eea0d316e85ab6837ff69e8d2b1568e6fa7bc38bd4c00e"
 dependencies = [
  "bitflags",
  "bytemuck",
@@ -1085,7 +1070,7 @@ dependencies = [
  "chrono",
  "console_error_panic_hook",
  "console_log",
- "itertools 0.15.0",
+ "itertools",
  "js-sys",
  "libloading",
  "log",
@@ -1110,7 +1095,6 @@ dependencies = [
  "fontdb",
  "fontdue",
  "getrandom 0.4.3",
- "latex2mathml",
  "libc",
  "nucleo-matcher",
  "pdfium-render",
@@ -1119,6 +1103,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synctex-parser",
  "tar",
  "tempfile",
  "thiserror",
@@ -1216,7 +1201,7 @@ dependencies = [
  "bitflags",
  "compact_str",
  "hashbrown 0.17.1",
- "itertools 0.14.0",
+ "itertools",
  "kasuari",
  "lru",
  "palette",
@@ -1250,7 +1235,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indoc",
  "instability",
- "itertools 0.14.0",
+ "itertools",
  "line-clipping",
  "ratatui-core",
  "serde",
@@ -1655,6 +1640,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "synctex-parser"
+version = "0.1.2"
+source = "git+https://github.com/DavidLapous/synctex-parser?rev=0271f6a08afa1c24669307d3dedde45a05b0d482#0271f6a08afa1c24669307d3dedde45a05b0d482"
+dependencies = [
+ "flate2",
+ "libc",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "tar"
 version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1806,7 +1803,7 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
- "itertools 0.14.0",
+ "itertools",
  "unicode-segmentation",
  "unicode-width",
 ]

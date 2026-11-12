@@ -6,6 +6,7 @@
 
 The current page is kept when the file reloads. Omit the path, or press `f`, to open another PDF in a new tab.
 
+
 ## Requirements
 
 - Rust 1.88 or newer to build
@@ -19,8 +20,6 @@ Run directly in the terminal; tmux graphics passthrough is not supported.
 ```console
 cargo install --locked --git https://github.com/jrf/pdfterm.git
 ```
-
-PDFium revision 7881 is checksummed and embedded. From a checkout, `cargo build --release`.
 
 ## Run
 
@@ -41,7 +40,7 @@ Press `?` for the full list in the viewer.
 | `:` | Go to a page |
 | `/` | Search text, or filter the open list |
 | `n` / `N` | Next / previous page with a match |
-| `m` | Cycle fit: page, width, height |
+| `m` | Cycle fit: page, width, height, content |
 | `+` / `-` | Zoom by 25% (up to 400%) |
 | `0` | Reset zoom |
 | `i` | Polaris-style dark mode |
@@ -61,6 +60,10 @@ Press `?` for the full list in the viewer.
 
 `$XDG_CONFIG_HOME/pdfterm/config.toml`, or `~/.config/pdfterm/config.toml`. First launch creates defaults; invalid configuration stops startup. See [config.default.toml](config.default.toml) for settings.
 
+`fit_mode = "content"` fits and centers the bounds of text and graphics instead of the paper margins, using 96% of the available width and height to leave a little breathing room. Empty pages fall back to page fit with the same sizing allowance; full-page backgrounds remain part of the content. Existing page-edge placement and scrolling limits still apply. Content-fit bitmaps are limited to 16 megapixels and 32,768 pixels per side, so very sparse pages may stop enlarging before filling the viewport. Zoom and source navigation work in every fit mode.
+
+Content fit centers on entry, including when `R` reloads a different configured fit mode into content fit. Subsequent redraws preserve panning; back/forward history and canceled navigation previews restore the saved view.
+
 ## Neovim
 
 The bundled plugin works with [Lazy.nvim](https://github.com/folke/lazy.nvim); install the viewer separately:
@@ -70,20 +73,23 @@ The bundled plugin works with [Lazy.nvim](https://github.com/folke/lazy.nvim); i
   "jrf/pdfterm",
   main = "pdfterm",
   lazy = false,
-  opts = { executable = "pdfterm", open_pdf = true },
+  opts = { executable = "pdfterm", open_pdf = true, log_file = "~/.local/state/nvim/pdfterm.log" },
 }
 ```
 
-`:PdfTermOpen` opens a PDF. `:PdfTermForwardSplit` opens/navigates the viewer beside Neovim; `:PdfTermForward` navigates an existing viewer.
+`:PdfTermOpen` opens a PDF. `:PdfTermForwardSplit` opens/navigates the viewer beside Neovim; `:PdfTermForward` navigates an existing viewer. `:PdfTermLog` opens the configured log file in a split. SyncTeX position checks, ambiguities, and navigation errors are recorded with timestamps and source/PDF coordinates.
 
-Kitty splits require `allow_remote_control yes`; detached Neovim also needs a private `listen_on` socket. Ghostty control is macOS-only. WezTerm requires `wezterm` on `PATH`. For manual pairing, use `:PdfTermViewerCommand`.
+Configured log-directory, open, write, and close failures report an explicit Neovim error without recursively logging it or aborting navigation.
 
-## SyncTeX
+Kitty splits require `allow_remote_control yes`; detached Neovim also needs a private `listen_on` socket. Ghostty control is macOS-only. WezTerm requires `wezterm` on `PATH`. For manual pairing, `:PdfTermViewerCommand` prints the Neovim-attached launch command and copies it to the clipboard.
 
-LaTeX navigation requires `synctex` on `PATH` and a matching `.synctex.gz` sidecar:
+For automatic local viewer splits over SSH, run `scripts/pdfterm-ssh HOST` from the client terminal. The remote needs Neovim, pdfterm, and its Neovim adapter. macOS remotes also need Python 3: their control connection uses a private, current-user-owned Unix socket relayed over SSH, without `netstat` or privileged port inspection. Linux remotes use a verified loopback reverse forward and require `ss`.
+
+## SyncTeX (`synctex-parser`)
+
+LaTeX navigation uses the built-in pure-Rust `synctex-parser` engine (no external `synctex` binary required on `PATH`) with a matching PDF/`.synctex(.gz)` build:
 
 ```console
 latexmk -pdf -synctex=1 main.tex
 ```
 
-Forward search uses the source cursor; `Alt`/`Option` + click or `x` navigates from PDF text back to its source. Neither direction changes terminal focus by default.

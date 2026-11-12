@@ -5,6 +5,8 @@ Run with --terminal kitty --to unix:/path/to/kitty.sock, --terminal ghostty,
 or --terminal wezterm [--to /path/to/owned/gui.sock]. Without --to the WezTerm
 probe starts its own isolated GUI instance.
 Requires Neovim and a GUI session; never substitutes mocked terminal effects.
+The Ghostty editor-exit check also requires pdflatex and a built viewer
+(`PDFTERM_EXECUTABLE`, or target/release/pdfterm).
 """
 import argparse
 from contextlib import ExitStack
@@ -212,6 +214,42 @@ elseif action == 'focus' then
   terminal.focus(source,finish)
 elseif action == 'close' then
   terminal.close(source); finish({code=0})
+elseif action == 'editor-exit' then
+  local platform, socket = require('pdfterm.platform'), require('pdfterm.socket')
+  local applescript, request = platform.applescript, socket.request
+  local navigated, forward_path = false, nil
+  platform.applescript = function(script, argv, callback)
+    if callback and script:find('split sourceTerminal direction right', 1, true) then
+      return applescript(script, argv, vim.schedule_wrap(function(reply)
+        if reply.code == 0 then
+          vim.fn.writefile({ vim.trim(reply.stdout) }, vim.env.XDG_CONFIG_HOME .. '/exit-viewer')
+        end
+        callback(reply)
+      end))
+    end
+    return applescript(script, argv, callback)
+  end
+  socket.request = function(path, payload, callback, ...)
+    return request(path, payload, function(error, ...)
+      callback(error, ...)
+      if not error then navigated = true end
+      forward_path = path
+    end, ...)
+  end
+  require('pdfterm').setup({ executable = arg[3], session = 'native-exit-' .. vim.fn.getpid() })
+  require('pdfterm').open(arg[4])
+  assert(vim.wait(10000, function() return navigated end, 10), 'viewer did not acknowledge navigation')
+  if arg[5] == 'already-exited' then
+    local quit = false
+    socket.request(forward_path, vim.json.encode({ type = 'quit' }), function(error)
+      assert(not error, error)
+      quit = true
+    end)
+    assert(vim.wait(3000, function() return quit and not vim.uv.fs_stat(forward_path) end, 10),
+      'viewer did not release its socket before editor exit')
+  end
+  io.write('{"code":0}\\n')
+  vim.cmd('qa!')
 else error('unknown native test action') end
 assert(vim.wait(10000, function() return done end, 10), 'native terminal callback timed out')
 if vim.env.PDFTERM_EXPECT_KITTY_TTY_FAILURE == '1' then
@@ -230,7 +268,7 @@ io.write(vim.json.encode(result), '\\n')
             result = subprocess.run(['nvim', '--headless', '-u', 'NONE', '-i', 'NONE',
                                      '-l', str(lua), action, identifier, *argv],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                timeout=15 if action == 'ghostty-refocus-failure' else 10,
+                timeout=20 if action == 'editor-exit' else 15 if action == 'ghostty-refocus-failure' else 10,
                 start_new_session=True, env=environment)
             assert result.returncode == 0, result.stderr or result.stdout
             assert not result.stderr, result.stderr
@@ -389,8 +427,10 @@ io.write(vim.json.encode(result), '\\n')
                     viewer = identity['pane']
                 ready = directory / 'ready.json'
                 wait(ready.exists)
+                expected_argv = (['--synctex-best-guess', '--session', token]
+                                 if route == 'local' else ['--session', token])
                 assert json.loads(ready.read_text()) == {
-                    'argv': ['--session', token], 'config': temporary,
+                    'argv': expected_argv, 'config': temporary,
                     'path': os.environ['PATH']}
                 ready.unlink()
                 surfaces = snapshot(args.terminal)
@@ -422,6 +462,31 @@ io.write(vim.json.encode(result), '\\n')
                 assert backend.existing({viewer}) == set()
                 focus_proof = 'pane activation' if args.terminal == 'wezterm' else 'focus'
                 print(f'{args.terminal}/{route}: right split, argv/env, {focus_proof}, liveness, cleanup passed')
+                if args.terminal == 'ghostty' and route == 'local':
+                    binary = os.environ.get('PDFTERM_EXECUTABLE', str(ROOT / 'target/release/pdfterm'))
+                    compiled = subprocess.run(
+                        ['pdflatex', '-interaction=nonstopmode', '-halt-on-error',
+                         '-output-directory=' + temporary, str(ROOT / 'tests/fixtures/navigation.tex')],
+                        capture_output=True, text=True, timeout=15)
+                    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+                    # A second live reader must survive the editor's owned-viewer cleanup.
+                    independent = backend.launch(['/bin/sleep', '60'])
+                    offered = directory / 'exit-viewer'
+                    try:
+                        for mode in ('running', 'already-exited'):
+                            local('focus', local_source)
+                            local('editor-exit', local_source, binary, str(directory / 'navigation.pdf'), mode)
+                            exited_viewer = offered.read_text().strip()
+                            wait(lambda: exited_viewer not in snapshot('ghostty'))
+                            remaining = snapshot('ghostty')
+                            assert source in remaining and independent in remaining, remaining
+                            print(f'ghostty/local: editor exit removes {mode} viewer pane; source and independent reader survive')
+                    finally:
+                        try:
+                            if offered.exists():
+                                backend.close(offered.read_text().strip())
+                        finally:
+                            backend.close(independent)
             finally:
                 try:
                     if viewer is not None and backend is not None:

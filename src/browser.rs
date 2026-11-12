@@ -1,12 +1,20 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+const MAX_RECURSIVE_DEPTH: usize = 32;
+const MAX_RECURSIVE_PDFS: usize = 10_000;
+const MAX_RECURSIVE_VISITED: usize = 50_000;
 
 #[derive(Debug)]
 pub struct BrowserEntry {
@@ -33,6 +41,41 @@ impl BrowserEntrySource {
     }
 }
 
+/// Fuzzy-matching scratch state reused across draws. `Matcher` owns a large
+/// scratch buffer, so allocating it per highlighted row is wasteful; the
+/// per-term patterns are reparsed only when the filter text changes.
+struct FuzzyCache {
+    matcher: Matcher,
+    buffer: Vec<char>,
+    filter: String,
+    term_patterns: Vec<Pattern>,
+    indices: Vec<u32>,
+}
+
+impl FuzzyCache {
+    fn new() -> Self {
+        Self {
+            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            buffer: Vec::new(),
+            filter: String::new(),
+            term_patterns: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    fn sync_terms(&mut self, filter: &str) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter.clear();
+        self.filter.push_str(filter);
+        self.term_patterns = filter
+            .split_whitespace()
+            .map(|term| Pattern::parse(term, CaseMatching::Ignore, Normalization::Smart))
+            .collect();
+    }
+}
+
 pub struct BrowserState {
     pub current_dir: PathBuf,
     pub entries: Vec<BrowserEntry>,
@@ -45,10 +88,17 @@ pub struct BrowserState {
     recursive_entries: Vec<BrowserEntry>,
     recursive_loaded: bool,
     recursive_rx: Option<Receiver<Vec<BrowserEntry>>>,
+    recursive_cancel: Arc<AtomicBool>,
+    fuzzy: RefCell<FuzzyCache>,
 }
 
 impl BrowserState {
+    #[cfg(test)]
     pub fn new(dir: PathBuf) -> Self {
+        Self::with_recents(dir, Vec::new())
+    }
+
+    pub fn with_recents(dir: PathBuf, recents: Vec<PathBuf>) -> Self {
         let mut state = Self {
             current_dir: dir.clone(),
             entries: Vec::new(),
@@ -57,10 +107,12 @@ impl BrowserState {
             filter: String::new(),
             filtered_indices: Vec::new(),
             root_dir: dir,
-            recents: Vec::new(),
+            recents,
             recursive_entries: Vec::new(),
             recursive_loaded: false,
             recursive_rx: None,
+            recursive_cancel: Arc::new(AtomicBool::new(false)),
+            fuzzy: RefCell::new(FuzzyCache::new()),
         };
         state.load_dir();
         state
@@ -68,12 +120,14 @@ impl BrowserState {
 
     /// Supplies the recently opened documents, which are listed first in the
     /// starting directory and remain available to recursive filtering.
+    #[cfg(test)]
     pub fn set_recents(&mut self, recents: Vec<PathBuf>) {
         self.recents = recents;
         self.load_dir();
     }
 
     pub fn load_dir(&mut self) {
+        self.recursive_cancel.store(true, Ordering::Relaxed);
         self.entries.clear();
         self.filter.clear();
         self.recursive_loaded = false;
@@ -89,6 +143,8 @@ impl BrowserState {
         }
 
         let Ok(read_dir) = std::fs::read_dir(&self.current_dir) else {
+            self.selected = 0;
+            self.scroll_offset = 0;
             self.rebuild_filter();
             return;
         };
@@ -171,39 +227,93 @@ impl BrowserState {
         if self.recursive_loaded || self.recursive_rx.is_some() {
             return;
         }
+        self.recursive_cancel.store(true, Ordering::Relaxed);
+        self.recursive_cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::clone(&self.recursive_cancel);
         let directory = self.current_dir.clone();
+        let root_dir = self.root_dir.clone();
         let recents = self.recents.clone();
         let (sender, receiver) = mpsc::channel();
         self.recursive_rx = Some(receiver);
         thread::spawn(move || {
-            let root = find_git_root(&directory).unwrap_or_else(|| directory.clone());
-            let mut entries: Vec<_> = collect_pdf_files(&root)
-                .into_iter()
-                .map(|(name, path)| BrowserEntry {
-                    name,
-                    is_recent: recents.contains(&path),
-                    path,
-                    is_dir: false,
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let canonical_root_dir =
+                std::fs::canonicalize(&root_dir).unwrap_or_else(|_| root_dir.clone());
+            let canonical_dir = if directory == root_dir {
+                canonical_root_dir.clone()
+            } else {
+                std::fs::canonicalize(&directory).unwrap_or_else(|_| directory.clone())
+            };
+            let root = find_git_root(&directory)
+                .filter(|git_root| {
+                    git_root.starts_with(&root_dir) || git_root.starts_with(&canonical_root_dir)
                 })
+                .unwrap_or_else(|| directory.clone());
+            let canonical_scan_root = if root == directory {
+                canonical_dir.clone()
+            } else {
+                std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone())
+            };
+            let mut canonical_recents = Vec::new();
+            for path in recents.into_iter().take(crate::recent::MAX_RECENTS) {
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
+                let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                canonical_recents.push((path, canonical));
+            }
+            let recent_set: HashSet<&Path> = canonical_recents
+                .iter()
+                .map(|(_, canonical)| canonical.as_path())
                 .collect();
+            let mut seen = HashSet::new();
+            let mut entries = Vec::new();
             if let Ok(read_dir) = std::fs::read_dir(&directory) {
-                for entry in read_dir.flatten().filter(|entry| is_pdf(&entry.path())) {
-                    if !entries.iter().any(|existing| existing.path == entry.path()) {
+                for entry in read_dir
+                    .flatten()
+                    .take_while(|_| !cancelled.load(Ordering::Relaxed))
+                    .filter(|entry| {
+                        !entry.file_name().to_string_lossy().starts_with('.')
+                            && entry.file_type().is_ok_and(|ft| !ft.is_dir())
+                            && is_pdf(&entry.path())
+                    })
+                    .take(MAX_RECURSIVE_PDFS)
+                {
+                    let file_name = entry.file_name();
+                    let key = canonical_dir.join(&file_name);
+                    let is_recent = recent_set.contains(key.as_path());
+                    if seen.insert(key) {
                         entries.push(BrowserEntry {
-                            name: entry.file_name().to_string_lossy().into_owned(),
+                            name: file_name.to_string_lossy().into_owned(),
                             path: entry.path(),
                             is_dir: false,
-                            is_recent: false,
+                            is_recent,
                         });
                     }
                 }
             }
-            for path in recents {
-                if !path.is_file() || !is_pdf(&path) {
-                    continue;
+            for (name, path) in collect_pdf_files(&root, &cancelled) {
+                let key = path
+                    .strip_prefix(&root)
+                    .map(|rel| canonical_scan_root.join(rel))
+                    .unwrap_or_else(|_| path.clone());
+                let is_recent = recent_set.contains(key.as_path());
+                if seen.insert(key) {
+                    entries.push(BrowserEntry {
+                        name,
+                        path,
+                        is_dir: false,
+                        is_recent,
+                    });
                 }
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.path == path) {
-                    entry.is_recent = true;
+            }
+            for (path, key) in canonical_recents {
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !path.is_file() || !is_pdf(&path) || !seen.insert(key) {
                     continue;
                 }
                 let name = path
@@ -218,7 +328,9 @@ impl BrowserState {
                 });
             }
             entries.sort_by(|left, right| left.name.cmp(&right.name));
-            let _ = sender.send(entries);
+            if !cancelled.load(Ordering::Relaxed) {
+                let _ = sender.send(entries);
+            }
         });
     }
 
@@ -252,28 +364,42 @@ impl BrowserState {
 
         let pattern = Pattern::parse(&self.filter, CaseMatching::Ignore, Normalization::Smart);
         let query = self.filter.trim().to_lowercase();
+        let current_dir = self.current_dir.clone();
+        let canonical_dir = std::fs::canonicalize(&current_dir).ok();
         let filtered_indices = {
             let source = self.active_source();
-            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-            let mut buffer = Vec::new();
+            let mut fuzzy = self.fuzzy.borrow_mut();
+            let FuzzyCache {
+                matcher, buffer, ..
+            } = &mut *fuzzy;
             let mut scored: Vec<_> = source
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
+                    if entry.name == "../" {
+                        return None;
+                    }
                     let basename = entry
                         .path
                         .file_name()
                         .map(|name| name.to_string_lossy())
                         .unwrap_or_else(|| entry.name.as_str().into());
                     let basename_score =
-                        pattern.score(Utf32Str::new(basename.as_ref(), &mut buffer), &mut matcher);
-                    let path = entry.path.to_string_lossy();
-                    let path_score = if entry.name == "../" {
-                        None
-                    } else {
-                        pattern.score(Utf32Str::new(&path, &mut buffer), &mut matcher)
-                    };
-                    let score = basename_score.or(path_score)?;
+                        pattern.score(Utf32Str::new(basename.as_ref(), buffer), matcher);
+                    let score = basename_score.or_else(|| {
+                        let relative_path = entry
+                            .path
+                            .strip_prefix(&current_dir)
+                            .ok()
+                            .or_else(|| {
+                                canonical_dir
+                                    .as_deref()
+                                    .and_then(|dir| entry.path.strip_prefix(dir).ok())
+                            })
+                            .unwrap_or(&entry.path)
+                            .to_string_lossy();
+                        pattern.score(Utf32Str::new(&relative_path, buffer), matcher)
+                    })?;
                     let basename_lower = basename.to_lowercase();
                     let match_tier = if basename_lower == query {
                         3
@@ -319,19 +445,25 @@ impl BrowserState {
         if self.filter.is_empty() {
             return Vec::new();
         }
-        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-        let mut buffer = Vec::new();
-        let mut indices = Vec::new();
-        for term in self.filter.split_whitespace() {
-            let pattern = Pattern::parse(term, CaseMatching::Ignore, Normalization::Smart);
-            let haystack = Utf32Str::new(value, &mut buffer);
-            let _ = pattern.indices(haystack, &mut matcher, &mut indices);
+        let mut fuzzy = self.fuzzy.borrow_mut();
+        fuzzy.sync_terms(&self.filter);
+        let FuzzyCache {
+            matcher,
+            buffer,
+            term_patterns,
+            indices,
+            ..
+        } = &mut *fuzzy;
+        indices.clear();
+        for pattern in term_patterns.iter() {
+            let haystack = Utf32Str::new(value, buffer);
+            let _ = pattern.indices(haystack, matcher, indices);
         }
         indices.sort_unstable();
         indices.dedup();
         indices
-            .into_iter()
-            .filter_map(|index| usize::try_from(index).ok())
+            .iter()
+            .filter_map(|&index| usize::try_from(index).ok())
             .collect()
     }
 
@@ -349,32 +481,8 @@ impl BrowserState {
         }
     }
 
-    pub fn select_down(&mut self) {
-        if !self.filtered_indices.is_empty() {
-            self.selected = (self.selected + 1).min(self.filtered_indices.len() - 1);
-        }
-    }
-
-    pub fn select_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
-
     pub fn select_first(&mut self) {
         self.selected = 0;
-    }
-
-    pub fn select_last(&mut self) {
-        self.selected = self.filtered_indices.len().saturating_sub(1);
-    }
-
-    pub fn page_down(&mut self, page_size: usize) {
-        if !self.filtered_indices.is_empty() {
-            self.selected = (self.selected + page_size).min(self.filtered_indices.len() - 1);
-        }
-    }
-
-    pub fn page_up(&mut self, page_size: usize) {
-        self.selected = self.selected.saturating_sub(page_size);
     }
 
     pub fn adjust_scroll(&mut self, visible_height: usize) {
@@ -435,6 +543,12 @@ impl BrowserState {
     }
 }
 
+impl Drop for BrowserState {
+    fn drop(&mut self) {
+        self.recursive_cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 fn find_git_root(start: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -447,7 +561,10 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string()))
 }
 
-fn collect_pdf_files(root: &Path) -> Vec<(String, PathBuf)> {
+fn collect_pdf_files(root: &Path, cancelled: &AtomicBool) -> Vec<(String, PathBuf)> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let git_files = Command::new("git")
         .args([
             "ls-files",
@@ -455,6 +572,8 @@ fn collect_pdf_files(root: &Path) -> Vec<(String, PathBuf)> {
             "--cached",
             "--others",
             "--exclude-standard",
+            "--",
+            "*.[pP][dD][fF]",
         ])
         .current_dir(root)
         .output();
@@ -463,9 +582,12 @@ fn collect_pdf_files(root: &Path) -> Vec<(String, PathBuf)> {
             let mut files: Vec<_> = output
                 .stdout
                 .split(|byte| *byte == 0)
+                .take_while(|_| !cancelled.load(Ordering::Relaxed))
                 .filter(|relative| !relative.is_empty())
                 .map(|relative| Path::new(OsStr::from_bytes(relative)))
                 .filter(|relative| is_pdf(relative))
+                .filter(|relative| relative.components().count() <= MAX_RECURSIVE_DEPTH + 1)
+                .take(MAX_RECURSIVE_PDFS)
                 .map(|relative| (relative.to_string_lossy().into_owned(), root.join(relative)))
                 .collect();
             files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -475,32 +597,81 @@ fn collect_pdf_files(root: &Path) -> Vec<(String, PathBuf)> {
     }
 
     let mut files = Vec::new();
-    collect_pdf_files_recursive(root, root, &mut files);
+    collect_pdf_files_recursive(root, root, &mut files, 0, cancelled, &mut 0);
     files
 }
 
-fn collect_pdf_files_recursive(directory: &Path, root: &Path, files: &mut Vec<(String, PathBuf)>) {
-    let Ok(read_dir) = std::fs::read_dir(directory) else {
-        return;
-    };
-    let mut entries: Vec<_> = read_dir.flatten().collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
-            continue;
+fn collect_pdf_files_recursive(
+    directory: &Path,
+    root: &Path,
+    files: &mut Vec<(String, PathBuf)>,
+    depth: usize,
+    cancelled: &AtomicBool,
+    visited: &mut usize,
+) {
+    let mut queue = std::collections::VecDeque::from([(directory.to_path_buf(), depth)]);
+    let mut subdirs = Vec::new();
+    while let Some((dir, current_depth)) = queue.pop_front() {
+        if *visited >= MAX_RECURSIVE_VISITED
+            || files.len() >= MAX_RECURSIVE_PDFS
+            || cancelled.load(Ordering::Relaxed)
+        {
+            return;
         }
-        let Ok(file_type) = entry.file_type() else {
+        let Some(mut entries) = bounded_dir_entries(&dir, cancelled, *visited) else {
             continue;
         };
-        if file_type.is_dir() {
-            collect_pdf_files_recursive(&entry.path(), root, files);
-        } else if is_pdf(&entry.path()) {
+        // `read_dir` order is filesystem-specific; sort so subdirectory
+        // traversal and `MAX_RECURSIVE_PDFS` truncation are deterministic.
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        subdirs.clear();
+        for entry in entries {
+            if *visited >= MAX_RECURSIVE_VISITED
+                || files.len() >= MAX_RECURSIVE_PDFS
+                || cancelled.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            *visited += 1;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            files.push((relative.to_string_lossy().into_owned(), path));
+            if file_type.is_dir() {
+                if current_depth < MAX_RECURSIVE_DEPTH {
+                    subdirs.push(path);
+                }
+            } else if is_pdf(&path) {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                files.push((relative.to_string_lossy().into_owned(), path));
+            }
+        }
+        // Entries were visited in name order, so `subdirs` is already sorted.
+        for subdir in subdirs.drain(..) {
+            queue.push_back((subdir, current_depth + 1));
         }
     }
+}
+
+/// Entries of `dir`, at most the remaining visit budget, stopping early when
+/// cancelled, so a huge directory is never collected whole.
+fn bounded_dir_entries(
+    dir: &Path,
+    cancelled: &AtomicBool,
+    visited: usize,
+) -> Option<Vec<std::fs::DirEntry>> {
+    let read_dir = std::fs::read_dir(dir).ok()?;
+    Some(
+        read_dir
+            .take_while(|_| !cancelled.load(Ordering::Relaxed))
+            .flatten()
+            .take(MAX_RECURSIVE_VISITED.saturating_sub(visited))
+            .collect(),
+    )
 }
 
 fn is_pdf(path: &Path) -> bool {
@@ -510,8 +681,14 @@ fn is_pdf(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::BrowserState;
+    use super::{
+        BrowserState, MAX_RECURSIVE_DEPTH, MAX_RECURSIVE_PDFS, MAX_RECURSIVE_VISITED,
+        bounded_dir_entries, collect_pdf_files_recursive,
+    };
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -521,6 +698,131 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(browser.recursive_loaded, "recursive scan timed out");
+    }
+
+    #[test]
+    fn recursive_scan_obeys_depth_entry_and_cancellation_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut nested = root.to_path_buf();
+        for _ in 0..MAX_RECURSIVE_DEPTH {
+            nested.push("d");
+            fs::create_dir(&nested).unwrap();
+        }
+        let boundary = nested.join("edge.pdf");
+        fs::write(&boundary, b"synthetic").unwrap();
+        let deeper = nested.join("d");
+        fs::create_dir(&deeper).unwrap();
+        fs::write(deeper.join("deep.pdf"), b"synthetic").unwrap();
+
+        let cancelled = AtomicBool::new(false);
+        let mut files = Vec::new();
+        collect_pdf_files_recursive(root, root, &mut files, 0, &cancelled, &mut 0);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, boundary);
+
+        fs::write(root.join("a.pdf"), b"synthetic").unwrap();
+        fs::write(root.join("b.pdf"), b"synthetic").unwrap();
+        files = vec![(String::new(), root.join("seed.pdf")); MAX_RECURSIVE_PDFS - 1];
+        collect_pdf_files_recursive(root, root, &mut files, 0, &cancelled, &mut 0);
+        assert_eq!(files.len(), MAX_RECURSIVE_PDFS);
+
+        cancelled.store(true, Ordering::Relaxed);
+        files.clear();
+        collect_pdf_files_recursive(root, root, &mut files, 0, &cancelled, &mut 0);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn recursive_scan_counts_non_pdf_entries_across_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir(root.join("d")).unwrap();
+        fs::write(root.join("d/leaf.pdf"), b"synthetic").unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut files = Vec::new();
+        let mut visited = MAX_RECURSIVE_VISITED - 1;
+        collect_pdf_files_recursive(root, root, &mut files, 0, &cancelled, &mut visited);
+        assert_eq!(visited, MAX_RECURSIVE_VISITED);
+        assert!(
+            files.is_empty(),
+            "scan exceeded its budget while descending"
+        );
+
+        visited = MAX_RECURSIVE_VISITED - 2;
+        collect_pdf_files_recursive(root, root, &mut files, 0, &cancelled, &mut visited);
+        assert_eq!(visited, MAX_RECURSIVE_VISITED);
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn recursive_scan_reads_only_the_remaining_visit_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for index in 0..64 {
+            fs::write(root.join(format!("wug{index:02}.pdf")), b"synthetic").unwrap();
+        }
+        let cancelled = AtomicBool::new(false);
+        let budget = MAX_RECURSIVE_VISITED - 1;
+        assert_eq!(
+            bounded_dir_entries(root, &cancelled, budget).unwrap().len(),
+            1
+        );
+        assert!(
+            bounded_dir_entries(root, &cancelled, MAX_RECURSIVE_VISITED)
+                .unwrap()
+                .is_empty()
+        );
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(bounded_dir_entries(root, &cancelled, 0).unwrap().is_empty());
+        cancelled.store(false, Ordering::Relaxed);
+
+        let mut files = Vec::new();
+        let mut visited = budget;
+        collect_pdf_files_recursive(root, root, &mut files, 0, &cancelled, &mut visited);
+        assert_eq!(visited, MAX_RECURSIVE_VISITED);
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn recursive_worker_sorts_deduplicates_and_browser_cancels_on_reload_and_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        let path = directory.path().join("x.pdf");
+        for name in ["z.pdf", "x.pdf", "a.pdf"] {
+            fs::write(directory.path().join(name), b"synthetic").unwrap();
+        }
+        browser.set_recents(vec![path.clone(), path.clone()]);
+        browser.preload_recursive();
+        let entries = browser
+            .recursive_rx
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.pdf", "x.pdf", "z.pdf"]
+        );
+        assert!(entries[1].is_recent);
+        let (sender, receiver) = mpsc::channel();
+        browser.recursive_rx = Some(receiver);
+        sender.send(entries).unwrap();
+        assert!(browser.poll_recursive());
+        assert_eq!(browser.recursive_entries.len(), 3);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        browser.recursive_cancel = Arc::clone(&cancelled);
+        browser.load_dir();
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(browser.recursive_rx.is_none());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        browser.recursive_cancel = Arc::clone(&cancelled);
+        drop(browser);
+        assert!(cancelled.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -669,9 +971,13 @@ mod tests {
         for (_, name) in &cases {
             fs::write(docs.join(name), b"synthetic").unwrap();
         }
+        fs::write(directory.path().join("top.pdf"), b"synthetic").unwrap();
         let mut browser = BrowserState::new(directory.path().to_owned());
         browser.preload_recursive();
         wait_for_recursive_scan(&mut browser);
+        browser.filter = "top".into();
+        browser.rebuild_filter();
+        assert_eq!(browser.filtered_entries().count(), 1);
         for (filter, name) in cases {
             browser.filter = filter.to_owned();
             browser.rebuild_filter();

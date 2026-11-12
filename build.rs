@@ -10,7 +10,7 @@ use tar::Archive;
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
-const PDFIUM_REVISION: &str = "7881";
+const PDFIUM_REVISION: &str = "8125";
 
 struct Asset {
     name: &'static str,
@@ -36,7 +36,11 @@ fn download_pdfium() -> Result<(), Box<dyn Error>> {
     println!("cargo:rustc-env=PDFIUM_LIBRARY_NAME={}", asset.library_name);
     println!("cargo:rustc-env=PDFIUM_REVISION={PDFIUM_REVISION}");
 
-    if output.is_file() && notices.is_file() {
+    let expected_header = format!("PDFium chromium/{PDFIUM_REVISION},");
+    if output.is_file()
+        && std::fs::read_to_string(&notices)
+            .is_ok_and(|content| content.starts_with(&expected_header))
+    {
         return Ok(());
     }
 
@@ -79,17 +83,17 @@ fn asset_for_target(target_os: &str, target_arch: &str) -> Result<Asset, Box<dyn
     let asset = match (target_os, target_arch) {
         ("macos", "aarch64") => Asset {
             name: "pdfium-mac-arm64",
-            checksum: "52e94ca5aa8847934330daf3f8150c190682c5ca93831468794f8b90d4392e40",
+            checksum: "4939bd935ac83ddc09a3a4f038bc43a19cea1660316a3667f26cb07a070e139d",
             library_name: "libpdfium.dylib",
         },
         ("linux", "x86_64") => Asset {
             name: "pdfium-linux-x64",
-            checksum: "1470e21b8b4a3b4ad7f85684e2da11d94f3b69a86d81dee11b9b6709d927ac1d",
+            checksum: "e1c3ce6e270cb5e0c20816b379ad9f2c1309972697c505f508de92bf5e7d6659",
             library_name: "libpdfium.so",
         },
         ("linux", "aarch64") => Asset {
             name: "pdfium-linux-arm64",
-            checksum: "ee7f7b7d5468958336a818c1cd580bdd20972846b7377b13f9a923d92d1d4674",
+            checksum: "8b8818f2ec57d1b213d952ca6d7f0ffeca9d0110487d0e20ad83ba918bc92efa",
             library_name: "libpdfium.so",
         },
         _ => {
