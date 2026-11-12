@@ -35,6 +35,27 @@ pub fn compress_rgba(rgba: &[u8]) -> io::Result<Vec<u8>> {
     compressor.finish()
 }
 
+pub fn compress_rgba_as_rgb(rgba: &[u8], width: u32, height: u32) -> io::Result<Vec<u8>> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected != Some(rgba.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RGBA raster length does not match dimensions",
+        ));
+    }
+    let mut compressor = ZlibEncoder::new(Vec::with_capacity(rgba.len() / 16), Compression::fast());
+    let mut rgb = [0u8; 6144];
+    for block in rgba.chunks(8192) {
+        for (dst, src) in rgb.chunks_exact_mut(3).zip(block.chunks_exact(4)) {
+            dst.copy_from_slice(&src[..3]);
+        }
+        compressor.write_all(&rgb[..(block.len() / 4) * 3])?;
+    }
+    compressor.finish()
+}
+
 fn write_cell_extent(output: &mut impl Write, placement: Placement) -> io::Result<()> {
     // Omission means native pixel size. Some terminals interpret explicit zeros
     // as a placement occupying zero cells.
@@ -44,9 +65,37 @@ fn write_cell_extent(output: &mut impl Write, placement: Placement) -> io::Resul
     Ok(())
 }
 
+fn write_crop(output: &mut impl Write, crop: Option<Crop>) -> io::Result<()> {
+    if let Some(c) = crop {
+        write!(output, ",x={},y={},w={},h={}", c.x, c.y, c.width, c.height)?;
+    }
+    Ok(())
+}
+
+pub fn transmit_compressed_rgb(
+    output: &mut impl Write,
+    compressed_rgb: &[u8],
+    width: u32,
+    height: u32,
+    placement: Placement,
+) -> io::Result<()> {
+    transmit_compressed(output, 24, compressed_rgb, width, height, placement)
+}
+
 pub fn transmit_compressed_rgba(
     output: &mut impl Write,
     compressed_rgba: &[u8],
+    width: u32,
+    height: u32,
+    placement: Placement,
+) -> io::Result<()> {
+    transmit_compressed(output, 32, compressed_rgba, width, height, placement)
+}
+
+fn transmit_compressed(
+    output: &mut impl Write,
+    format_bits: u8,
+    compressed: &[u8],
     width: u32,
     height: u32,
     placement: Placement,
@@ -57,50 +106,38 @@ pub fn transmit_compressed_rgba(
             "image dimensions must be non-zero",
         ));
     }
-
-    let crop = match placement.crop {
-        Some(crop) => format!(
-            ",x={},y={},w={},h={}",
-            crop.x, crop.y, crop.width, crop.height
-        ),
-        None => String::new(),
-    };
     const RAW_CHUNK_SIZE: usize = (PAYLOAD_CHUNK_SIZE / 4) * 3;
-    let chunk_count = compressed_rgba.len().div_ceil(RAW_CHUNK_SIZE).max(1);
+    let chunk_count = compressed.len().div_ceil(RAW_CHUNK_SIZE).max(1);
     let mut encoded = [0u8; PAYLOAD_CHUNK_SIZE];
 
     for index in 0..chunk_count {
         let start = index * RAW_CHUNK_SIZE;
-        let end = (start + RAW_CHUNK_SIZE).min(compressed_rgba.len());
-        let chunk = &compressed_rgba[start..end];
+        let end = (start + RAW_CHUNK_SIZE).min(compressed.len());
         let encoded_len = STANDARD
-            .encode_slice(chunk, &mut encoded)
+            .encode_slice(&compressed[start..end], &mut encoded)
             .expect("chunk fits in base64 buffer");
         let more = u8::from(index + 1 < chunk_count);
         if index == 0 {
             write!(
                 output,
-                "\x1b_Ga=T,f=32,s={width},v={height},i={},p=1,o=z",
+                "\x1b_Ga=T,f={format_bits},s={width},v={height},i={},p=1,o=z",
                 placement.image_id
             )?;
             write_cell_extent(output, placement)?;
-            write!(
-                output,
-                ",Y={},z={}{crop},C=1,q=2,m={more};",
-                placement.offset_y, placement.z_index
-            )?;
+            write!(output, ",Y={},z={}", placement.offset_y, placement.z_index)?;
+            write_crop(output, placement.crop)?;
+            write!(output, ",C=1,q=2,m={more};")?;
         } else {
             write!(output, "\x1b_Gq=2,m={more};")?;
         }
         output.write_all(&encoded[..encoded_len])?;
         output.write_all(b"\x1b\\")?;
     }
-    output.flush()
+    Ok(())
 }
 
 pub fn delete_image(output: &mut impl Write, image_id: u32) -> io::Result<()> {
-    write!(output, "\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")?;
-    output.flush()
+    write!(output, "\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
 }
 
 pub fn place_image(output: &mut impl Write, placement: Placement) -> io::Result<()> {
@@ -110,27 +147,15 @@ pub fn place_image(output: &mut impl Write, placement: Placement) -> io::Result<
             "image placement dimensions must both be zero or both be non-zero",
         ));
     }
-
-    let crop = match placement.crop {
-        Some(crop) => format!(
-            ",x={},y={},w={},h={}",
-            crop.x, crop.y, crop.width, crop.height
-        ),
-        None => String::new(),
-    };
     write!(output, "\x1b_Ga=p,i={},p=1", placement.image_id)?;
     write_cell_extent(output, placement)?;
-    write!(
-        output,
-        ",Y={},z={}{crop},C=1,q=2\x1b\\",
-        placement.offset_y, placement.z_index
-    )?;
-    output.flush()
+    write!(output, ",Y={},z={}", placement.offset_y, placement.z_index)?;
+    write_crop(output, placement.crop)?;
+    output.write_all(b",C=1,q=2\x1b\\")
 }
 
 pub fn delete_all(output: &mut impl Write) -> io::Result<()> {
-    output.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")?;
-    output.flush()
+    output.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")
 }
 
 #[cfg(test)]
@@ -285,6 +310,25 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "\x1b_Ga=p,i=12,p=1,c=40,r=20,Y=0,z=-3,x=4,y=8,w=400,h=600,C=1,q=2\x1b\\"
+        );
+    }
+
+    #[test]
+    fn transmits_rgb_frames_with_f24_and_rejects_zero_dimensions() {
+        let placement = Placement {
+            image_id: 1,
+            columns: 2,
+            rows: 1,
+            offset_y: 0,
+            z_index: -3,
+            crop: None,
+        };
+        let mut out = Vec::new();
+        let compressed = compress_rgba(&[7; 12]).unwrap();
+        super::transmit_compressed_rgb(&mut out, &compressed, 2, 2, placement).unwrap();
+        assert!(out.starts_with(b"\x1b_Ga=T,f=24,s=2,v=2,i=1,p=1,o=z,"));
+        assert!(
+            super::transmit_compressed_rgb(&mut Vec::new(), &compressed, 0, 2, placement).is_err()
         );
     }
 }

@@ -1,5 +1,6 @@
 use crate::screenshot::{Badge as ScreenshotBadge, Page as ScreenshotPage, Rect as ScreenshotRect};
-use std::cell::Cell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
@@ -31,8 +32,7 @@ use crate::browser::{BrowserEntry, BrowserEntrySource, BrowserState};
 use crate::config::{Config, LinkPickerLayout, ViewerSettings};
 use crate::kitty::{self, Placement};
 use crate::navigation::{
-    Coordinator, ForwardStage, InverseStage, InverseTask, PendingFlash, PendingForward,
-    PendingInverse, SourceState,
+    Coordinator, ForwardStage, InverseTask, PendingFlash, PendingForward, PendingInverse,
 };
 use crate::pdf::{
     DarkModeStyle, DocumentId, DocumentLink, FitMode, Frame, LinkTarget, OutlineItem, PageLink,
@@ -114,7 +114,10 @@ pub enum AppError {
 }
 
 fn read_event() -> Result<Event, AppError> {
-    let event = event::read()?;
+    let event = match event::read()? {
+        Event::Key(key) => Event::Key(normalize_shifted_key(key)),
+        other => other,
+    };
     if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press
         && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
     {
@@ -140,14 +143,11 @@ pub fn run(
     start_page: u32,
     config: &Config,
     focus_token: Option<String>,
-    source_snapshot: Option<PathBuf>,
     synctex_best_guess: bool,
 ) -> Result<(), AppError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::NotInteractive);
     }
-
-    let mut output = io::BufWriter::new(io::stdout().lock());
 
     let focus_token = match focus_token {
         Some(token) => token,
@@ -155,7 +155,8 @@ pub fn run(
     };
     let defaults = AppDefaults::from_config(config, Some(focus_token));
     let theme = defaults.theme;
-    let _terminal = TerminalGuard::enter(&mut output, theme)?;
+    let _terminal_guard = TerminalGuard::enter(&mut io::stdout().lock(), theme)?;
+    let mut output = io::BufWriter::new(io::stdout().lock());
     let path = match path {
         Some(path) => path.canonicalize()?,
         None => match pick_pdf(std::env::current_dir()?, &mut output, theme, || Ok(false))? {
@@ -176,28 +177,14 @@ pub fn run(
         (outline, revision.pdf),
         defaults,
     );
-    if let Some(snapshot) = source_snapshot {
-        let source = crate::source_snapshot::SourceSnapshot::load(&snapshot, &app.tab().path)?;
-        app.navigation.source_snapshots.insert(
-            app.tab().path.clone(),
-            SourceState {
-                revision: source.revision,
-                snapshot: Some(source.path),
-                best_guess: synctex_best_guess,
-            },
-        );
-    } else if synctex_best_guess {
-        let revision = app.tab().watcher.accepted;
-        app.navigation.source_snapshots.insert(
-            app.tab().path.clone(),
-            SourceState {
-                revision,
-                snapshot: None,
-                best_guess: true,
-            },
-        );
+    if synctex_best_guess {
+        app.navigation.best_guess.insert(app.tab().path.clone());
     }
     app.request_current(&mut output)?;
+    if let Some(warning) = app.startup_warning.clone() {
+        let viewport = app.viewport()?;
+        app.draw_status(&mut output, viewport, &warning)?;
+    }
 
     loop {
         while let Ok(message) = app.worker.try_recv() {
@@ -227,6 +214,11 @@ pub fn run(
                     &mut output,
                 )?,
                 WorkerMessage::Frame(frame) => app.receive_frame(frame, &mut output)?,
+                WorkerMessage::RenderError {
+                    key,
+                    generation,
+                    error,
+                } => app.receive_render_error(key, generation, &error, &mut output)?,
                 WorkerMessage::Error(error) => {
                     app.finish_forward(Some(format!("render failed: {error}")));
                     return Err(AppError::Renderer(error));
@@ -320,7 +312,8 @@ pub fn run(
         app.poll_smooth_scroll(&mut output)?;
 
         if event::poll(app.input_wait())? {
-            match read_event()? {
+            let event = read_event()?;
+            match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.pending_scale = None;
                     app.cancel_forward("forward search cancelled by keyboard input")?;
@@ -366,8 +359,10 @@ struct App {
     worker: RenderWorker,
     session: Session,
     generation: u64,
+    view_generation: u64,
+    last_render_view: Option<RenderKey>,
     desired_key: Option<RenderKey>,
-    pending: HashSet<RenderKey>,
+    pending: HashMap<RenderKey, bool>,
     visible_page: Option<VisiblePage>,
     submitted_key: Option<RenderKey>,
     visible_pages: Vec<VisiblePage>,
@@ -411,11 +406,12 @@ struct App {
     label_input: String,
     themes: Vec<(String, Palette)>,
     label_query: Option<String>,
+    label_loading: bool,
     label_request_id: u64,
     label_matches: Vec<LabeledMatch>,
     label_overlay_id: Option<u32>,
-    label_overlay: Option<Vec<u8>>,
     theme_index: usize,
+    startup_warning: Option<String>,
 }
 
 struct FocusTask {
@@ -444,6 +440,7 @@ struct AppDefaults {
     link_highlight: [u8; 3],
     themes: Vec<(String, Palette)>,
     theme_index: usize,
+    theme_warning: Option<String>,
     persistent_link_picker: bool,
     link_picker_geometry: LinkPickerGeometry,
     synctex_enabled: bool,
@@ -456,15 +453,8 @@ struct AppDefaults {
 
 impl AppDefaults {
     fn from_config(config: &Config, focus_token: Option<String>) -> Self {
-        let themes = crate::theme::available_themes(config.theme_catalog(), config.theme());
-        let configured_theme = crate::theme::load_or_default(config.theme());
-        let theme_index = themes
-            .iter()
-            .position(|(_, theme)| *theme == configured_theme)
-            .unwrap_or(0);
-        let theme = themes
-            .get(theme_index)
-            .map_or(configured_theme, |(_, theme)| *theme);
+        let resolved = crate::theme::resolve(config.theme_catalog(), config.theme());
+        let theme = resolved.active;
         Self {
             fit: config.fit_mode(),
             invert: config.dark_mode(),
@@ -486,8 +476,9 @@ impl AppDefaults {
             focus_token,
             viewer: config.viewer.clone(),
             theme,
-            themes,
-            theme_index,
+            themes: resolved.themes,
+            theme_index: resolved.index,
+            theme_warning: resolved.warning,
         }
     }
 }
@@ -498,6 +489,27 @@ struct ViewPosition {
     scroll_x: i64,
     scroll_y: u32,
     center_content: bool,
+}
+
+impl ViewPosition {
+    const fn top(page: u32) -> Self {
+        Self {
+            page,
+            scroll_x: 0,
+            scroll_y: 0,
+            center_content: true,
+        }
+    }
+}
+
+pub(super) fn normalize_shifted_key(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(character) = key.code
+        && key.modifiers == KeyModifiers::SHIFT
+        && character.is_ascii_lowercase()
+    {
+        key.code = KeyCode::Char(character.to_ascii_uppercase());
+    }
+    key
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -602,6 +614,7 @@ impl JumpList {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LinkDestination {
+    content_pan_x: Option<i64>,
     page: u32,
     top_ratio: Option<f32>,
     left_ratio: Option<f32>,
@@ -619,6 +632,23 @@ struct LinkPickerState {
     awaiting_current_page: bool,
     pending_preview: Option<PendingLinkPreview>,
     preview_origin: Option<ViewPosition>,
+    rows: RefCell<Option<LinkPickerRowsCache>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinkPickerRowsCache {
+    document_id: DocumentId,
+    revision: u64,
+    links: (usize, usize),
+    outline: (usize, usize),
+    filter: String,
+    rows: Arc<LinkPickerRows>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LinkPickerRows {
+    filtered: Vec<usize>,
+    display: Vec<LinkPickerDisplayRow>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -666,11 +696,26 @@ struct LinkIndexProgress {
 struct LinkPickerDocument<'a> {
     links: &'a [DocumentLink],
     outline: &'a [OutlineItem],
+    document_id: DocumentId,
+    revision: u64,
 }
 
 impl<'a> LinkPickerDocument<'a> {
     const fn new(links: &'a [DocumentLink], outline: &'a [OutlineItem]) -> Self {
-        Self { links, outline }
+        Self {
+            links,
+            outline,
+            document_id: 0,
+            revision: 0,
+        }
+    }
+
+    fn from_tab(tab: &'a Tab) -> Self {
+        Self {
+            document_id: tab.document_id,
+            revision: tab.link_index.request_id,
+            ..Self::new(&tab.link_index.links, &tab.outline)
+        }
     }
 }
 
@@ -719,7 +764,37 @@ impl LinkPickerState {
             awaiting_current_page: true,
             pending_preview: None,
             preview_origin: None,
+            rows: RefCell::new(None),
         }
+    }
+
+    fn rows(&self, document: LinkPickerDocument<'_>) -> Arc<LinkPickerRows> {
+        // Index updates append links; replacing an index changes its request ID.
+        // Outlines are immutable and replaced together with document resets.
+        let links = (document.links.as_ptr() as usize, document.links.len());
+        let outline = (document.outline.as_ptr() as usize, document.outline.len());
+        let mut cache = self.rows.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.document_id == document.document_id
+            && cached.revision == document.revision
+            && cached.links == links
+            && cached.outline == outline
+            && cached.filter == self.filter
+        {
+            return Arc::clone(&cached.rows);
+        }
+        let filtered = filter_document_links(document.links, &self.filter);
+        let display = link_picker_display_rows(document.links, &filtered, document.outline);
+        let rows = Arc::new(LinkPickerRows { filtered, display });
+        *cache = Some(LinkPickerRowsCache {
+            document_id: document.document_id,
+            revision: document.revision,
+            links,
+            outline,
+            filter: self.filter.clone(),
+            rows: Arc::clone(&rows),
+        });
+        rows
     }
 
     fn reset_for_document(&mut self, page: u32) {
@@ -730,6 +805,7 @@ impl LinkPickerState {
         self.awaiting_current_page = true;
         self.pending_preview = None;
         self.preview_origin = None;
+        *self.rows.get_mut() = None;
     }
 
     fn sync(&mut self, page: u32, links: &[DocumentLink], indexing: bool) {
@@ -789,6 +865,17 @@ struct PerformanceSnapshot {
 }
 
 impl PerformanceSnapshot {
+    fn from_frame(frame: &Frame, transfer_elapsed: Duration) -> Self {
+        Self {
+            render_ms: frame.render_elapsed.as_millis(),
+            dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
+            highlight_ms: frame.highlight_elapsed.map(|elapsed| elapsed.as_millis()),
+            compression_ms: frame.compression_elapsed.as_millis(),
+            transfer_ms: transfer_elapsed.as_millis(),
+            link_count: frame.links.len(),
+        }
+    }
+
     fn status(self, detailed: bool, link_mode: bool) -> String {
         let mut status = render_timing_status(
             self.render_ms,
@@ -824,14 +911,17 @@ struct SearchPickerState {
     focus: LinkPickerFocus,
     awaiting_initial_result: bool,
     selection_page: Option<u32>,
-    pending_preview: Option<PendingSearchPreview>,
+    pending_preview: Option<(u32, Instant)>,
     preview_origin: Option<ViewPosition>,
+    rows: RefCell<Option<SearchPickerRowsCache>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingSearchPreview {
-    page: u32,
-    ready_at: Instant,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchPickerRowsCache {
+    request_id: u64,
+    matches_len: usize,
+    outline: (usize, usize),
+    rows: Vec<SearchPickerDisplayRow>,
 }
 
 impl SearchPickerState {
@@ -844,7 +934,51 @@ impl SearchPickerState {
             selection_page: None,
             pending_preview: None,
             preview_origin: None,
+            rows: RefCell::new(None),
         }
+    }
+
+    pub(super) fn display_rows(
+        &self,
+        search: &SearchState,
+        outline: &[OutlineItem],
+    ) -> std::cell::Ref<'_, [SearchPickerDisplayRow]> {
+        let outline_key = (outline.as_ptr() as usize, outline.len());
+        {
+            let mut cache = self.rows.borrow_mut();
+            let rebuild = cache.as_ref().is_none_or(|cached| {
+                cached.request_id != search.request_id
+                    || cached.outline != outline_key
+                    || cached.matches_len > search.matches.len()
+            });
+            if rebuild {
+                let mut rows = Vec::new();
+                append_search_picker_display_rows(&mut rows, &search.matches, 0, outline);
+                *cache = Some(SearchPickerRowsCache {
+                    request_id: search.request_id,
+                    matches_len: search.matches.len(),
+                    outline: outline_key,
+                    rows,
+                });
+            } else if let Some(cached) = cache.as_mut()
+                && cached.matches_len < search.matches.len()
+            {
+                append_search_picker_display_rows(
+                    &mut cached.rows,
+                    &search.matches,
+                    cached.matches_len,
+                    outline,
+                );
+                cached.matches_len = search.matches.len();
+            }
+        }
+        std::cell::Ref::map(self.rows.borrow(), |cached| {
+            cached
+                .as_ref()
+                .expect("search picker rows cached")
+                .rows
+                .as_slice()
+        })
     }
 
     fn sync(&mut self, page: u32, matches: &[SearchPageMatch]) {
@@ -868,6 +1002,14 @@ impl SearchPickerState {
 }
 
 impl SearchState {
+    fn active_highlight_id(&self) -> u64 {
+        if !self.searching && !self.matches.is_empty() {
+            self.request_id
+        } else {
+            0
+        }
+    }
+
     fn highlight_request_id(&self, page: u32) -> u64 {
         if !self.searching && self.matches.iter().any(|result| result.page == page) {
             self.request_id
@@ -939,6 +1081,26 @@ struct VisiblePage {
     top: u16,
     image_id: u32,
 }
+
+fn write_page_image(
+    output: &mut impl Write,
+    frame: &Frame,
+    placement: Placement,
+    retained: bool,
+) -> io::Result<()> {
+    if retained {
+        kitty::place_image(output, placement)
+    } else {
+        kitty::transmit_compressed_rgb(
+            output,
+            &frame.compressed_rgba,
+            frame.width,
+            frame.height,
+            placement,
+        )
+    }
+}
+
 struct LabeledMatch {
     visible: VisibleMatch,
     label: String,
@@ -1028,8 +1190,10 @@ impl App {
                 next_document_id: INITIAL_DOCUMENT_ID + 1,
             },
             generation: 0,
+            view_generation: 0,
+            last_render_view: None,
             desired_key: None,
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             visible_page: None,
             submitted_key: None,
             visible_pages: Vec::new(),
@@ -1072,12 +1236,13 @@ impl App {
             label_input: String::new(),
             theme_index: defaults.theme_index,
             label_query: None,
+            label_loading: false,
             label_request_id: 1,
             label_matches: Vec::new(),
             label_overlay_id: None,
             flash_font: None,
-            label_overlay: None,
             viewer: defaults.viewer,
+            startup_warning: defaults.theme_warning,
         }
     }
 
@@ -1093,19 +1258,26 @@ impl App {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         match pick_pdf(directory, output, self.theme, || self.forward_waiting())? {
-            Some(path) => {
-                let path = path.canonicalize()?;
-                if let Some(index) = self.tab_index_for_path(&path) {
-                    if index == self.session.active_tab {
-                        self.reset_render_state();
-                        self.request_current(output)?;
+            Some(path) => match path.canonicalize() {
+                Ok(path) => {
+                    if let Some(index) = self.tab_index_for_path(&path) {
+                        if index == self.session.active_tab {
+                            self.reset_render_state();
+                            self.request_current(output)?;
+                        } else {
+                            self.select_tab(index, output)?;
+                        }
                     } else {
-                        self.select_tab(index, output)?;
+                        self.begin_open(path, output)?;
                     }
-                } else {
-                    self.begin_open(path, output)?;
                 }
-            }
+                Err(error) => {
+                    self.reset_render_state();
+                    self.request_current(output)?;
+                    let viewport = self.viewport()?;
+                    self.draw_status(output, viewport, &format!("open failed: {error}"))?;
+                }
+            },
             None => self.request_current(output)?,
         }
         Ok(())
@@ -1129,10 +1301,7 @@ impl App {
             let page = page.min(self.tab().page_count - 1);
             let tab = self.tab_mut();
             tab.search.initial_navigation_pending = false;
-            tab.page = page;
-            tab.scroll_x = 0;
-            tab.scroll_y = 0;
-            tab.center_content = true;
+            tab.set_view_position(ViewPosition::top(page));
         }
         self.reset_render_state();
         self.request_current(output)
@@ -1149,7 +1318,7 @@ impl App {
         if let Some(index) = selection {
             self.apply_theme(index);
         }
-        self.clear_viewer(output)?;
+        clear_picker(output, self.theme)?;
         self.reset_render_state();
         self.request_current(output)
     }
@@ -1160,7 +1329,6 @@ impl App {
         }
         self.clear_viewer(output)?;
         show_help(output, self.theme, || self.forward_waiting())?;
-        self.clear_viewer(output)?;
         self.reset_render_state();
         self.request_current(output)
     }
@@ -1171,6 +1339,13 @@ impl App {
         };
         let theme = *theme;
         self.theme_index = index;
+        self.set_palette(theme);
+    }
+
+    fn set_palette(&mut self, theme: Palette) {
+        if self.theme == theme {
+            return;
+        }
         self.theme = theme;
         let style = DarkModeStyle::new(theme.document.background, theme.document.foreground);
         let search_highlight = terminal_color_rgb(theme.yellow);
@@ -1214,15 +1389,12 @@ impl App {
     }
 
     fn handle_goto_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<(), AppError> {
-        match key.code {
+        match normalize_shifted_key(key).code {
             KeyCode::Esc => {
                 self.goto_input = None;
                 self.redraw_current(output)?;
             }
             KeyCode::Enter | KeyCode::Char('G') => self.finish_goto(output)?,
-            KeyCode::Char('g') if key.modifiers == KeyModifiers::SHIFT => {
-                self.finish_goto(output)?
-            }
             KeyCode::Char('g') if key.modifiers == KeyModifiers::NONE => {
                 if self
                     .goto_input
@@ -1261,14 +1433,16 @@ impl App {
         Ok(())
     }
 
-    fn draw_goto(&mut self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+    fn draw_input_prompt(
+        &mut self,
+        output: &mut impl Write,
+        viewport: Viewport,
+        prompt: &str,
+        input: &str,
+        hint: &str,
+    ) -> io::Result<()> {
         self.status_line.clear();
         let theme = self.theme;
-        let input = self.goto_input.as_deref().unwrap_or_default();
-        let hint = format!(
-            "  (1-{}, enter/G/gg to jump, esc to cancel)",
-            self.tab().page_count
-        );
         execute!(
             output,
             MoveTo(0, viewport.status_row),
@@ -1276,7 +1450,7 @@ impl App {
             Clear(ClearType::CurrentLine),
             Print(" "),
             SetForegroundColor(theme.yellow),
-            Print("go to page: "),
+            Print(prompt),
             SetForegroundColor(theme.fg),
             Print(input),
             SetForegroundColor(theme.comment),
@@ -1286,6 +1460,24 @@ impl App {
         )?;
         output.flush()
     }
+
+    fn draw_goto(&mut self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
+        let input = self.goto_input.clone().unwrap_or_default();
+        let hint = format!(
+            "  (1-{}, enter/G/gg to jump, esc to cancel)",
+            self.tab().page_count
+        );
+        self.draw_input_prompt(output, viewport, "go to page: ", &input, &hint)
+    }
+
+    fn reset_label_matches(&mut self, output: &mut impl Write) -> io::Result<()> {
+        self.worker.cancel_visible();
+        self.label_loading = false;
+        self.label_input.clear();
+        self.label_matches.clear();
+        self.clear_label_overlay(output)
+    }
+
     fn begin_label_mode(&mut self, output: &mut impl Write) -> Result<(), AppError> {
         if self.flash_font.is_none() {
             match crate::screenshot::FlashFont::load(&self.viewer.flash_label_font) {
@@ -1296,11 +1488,8 @@ impl App {
                 }
             }
         }
-        self.worker.cancel_visible();
-        self.clear_label_overlay(output)?;
+        self.reset_label_matches(output)?;
         self.label_query = Some(String::new());
-        self.label_input.clear();
-        self.label_matches.clear();
         self.label_request_id = self.label_request_id.wrapping_add(1).max(1);
         self.draw_label_status(output)
     }
@@ -1312,11 +1501,8 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
-                self.worker.cancel_visible();
                 self.label_query = None;
-                self.label_input.clear();
-                self.label_matches.clear();
-                self.clear_label_overlay(output)?;
+                self.reset_label_matches(output)?;
                 self.redraw_current(output)?;
             }
             KeyCode::Backspace if !self.label_input.is_empty() => {
@@ -1327,9 +1513,6 @@ impl App {
                 if let Some(query) = self.label_query.as_mut() {
                     query.pop();
                 }
-                self.label_matches.clear();
-                self.clear_label_overlay(output)?;
-                self.label_request_id = self.label_request_id.wrapping_add(1).max(1);
                 self.refresh_visible_matches(output)?;
                 self.draw_label_status(output)?;
             }
@@ -1354,12 +1537,9 @@ impl App {
                     .iter()
                     .find(|item| item.label == candidate)
                 {
-                    self.worker.cancel_visible();
                     let target = (target.visible.key, target.visible.hit);
                     self.label_query = None;
-                    self.label_input.clear();
-                    self.label_matches.clear();
-                    self.clear_label_overlay(output)?;
+                    self.reset_label_matches(output)?;
                     self.begin_inverse_at(target.0, target.1, self.viewport()?, output)?;
                 } else if self
                     .label_matches
@@ -1369,13 +1549,10 @@ impl App {
                     self.label_input = candidate;
                     self.draw_label_status(output)?;
                 } else {
-                    self.label_input.clear();
                     if let Some(query) = self.label_query.as_mut().filter(|query| query.len() < 256)
                     {
                         query.push(character);
                     }
-                    self.label_matches.clear();
-                    self.clear_label_overlay(output)?;
                     self.refresh_visible_matches(output)?;
                     self.draw_label_status(output)?;
                 }
@@ -1405,10 +1582,7 @@ impl App {
     }
 
     fn refresh_visible_matches(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        self.worker.cancel_visible();
-        self.label_input.clear();
-        self.label_matches.clear();
-        self.clear_label_overlay(output)?;
+        self.reset_label_matches(output)?;
         let request_id = self.label_request_id;
         self.label_request_id = request_id.wrapping_add(1).max(1);
         let Some(query) = self.label_query.clone().filter(|query| !query.is_empty()) else {
@@ -1433,6 +1607,7 @@ impl App {
         self.worker
             .find_visible(document_id, request_id, revision, query, keys)
             .map_err(AppError::Renderer)?;
+        self.label_loading = true;
         self.draw_label_status(output)
     }
 
@@ -1448,10 +1623,7 @@ impl App {
         u32,
     )> {
         let current_key = self.render_key(viewport);
-        if self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
-        {
+        if self.continuous_view() {
             self.visible_pages
                 .iter()
                 .filter(|page| same_render_view(page.frame.key, current_key))
@@ -1489,6 +1661,49 @@ impl App {
         }
     }
 
+    fn assign_jump_labels(matches: &[VisibleMatch]) -> Option<Vec<String>> {
+        if matches.is_empty() {
+            return Some(Vec::new());
+        }
+        let continuations = matches
+            .iter()
+            .filter_map(|matched| matched.next_char)
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let alphabet: Vec<char> =
+            "asdfghjklqwertyuiopzxcvbnmASDFGHJKLQWERTYUIOPZXCVBNM!@#$%^&*()[]{};:,.?/\\|"
+                .chars()
+                .filter(|c| !continuations.contains(&c.to_ascii_lowercase()))
+                .collect();
+        if matches.len() == 1 {
+            let next_label_char = matches[0]
+                .next_char
+                .filter(|character| character.is_ascii_alphanumeric() || *character == '_');
+            let label = next_label_char
+                .or_else(|| alphabet.first().copied())
+                .map(|c| c.to_string())?;
+            return Some(vec![label]);
+        }
+        if alphabet.len() < 2 {
+            return None;
+        }
+        let width = (1..)
+            .find(|width| alphabet.len().saturating_pow(*width as u32) >= matches.len())
+            .unwrap_or(1);
+        Some(
+            (0..matches.len())
+                .map(|mut index| {
+                    let mut label = vec![alphabet[0]; width];
+                    for slot in label.iter_mut().rev() {
+                        *slot = alphabet[index % alphabet.len()];
+                        index /= alphabet.len();
+                    }
+                    label.into_iter().collect()
+                })
+                .collect(),
+        )
+    }
+
     fn receive_visible_matches(
         &mut self,
         document_id: DocumentId,
@@ -1503,6 +1718,7 @@ impl App {
         {
             return Ok(());
         }
+        self.label_loading = false;
         let viewport = self.viewport()?;
         let visible = self.visible_view_frames(viewport);
         if visible.is_empty()
@@ -1517,8 +1733,7 @@ impl App {
         {
             return Ok(());
         }
-        let cw = (u32::from(viewport.pixel_width) / u32::from(viewport.columns).max(1)).max(1);
-        let ch = (u32::from(viewport.pixel_height) / u32::from(viewport.rows).max(1)).max(1);
+        let cell_size = viewport.cell_size();
         matches.retain_mut(|matched| {
             visible
                 .iter()
@@ -1531,7 +1746,7 @@ impl App {
                         *width,
                         *height,
                         viewport,
-                        (cw, ch),
+                        cell_size,
                     )
                 })
                 .is_some_and(|(hit, anchor)| {
@@ -1540,59 +1755,14 @@ impl App {
                     true
                 })
         });
-        let continuations = matches
-            .iter()
-            .filter_map(|matched| matched.next_char)
-            .map(|c| c.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let mut alphabet = "asdfghjklqwertyuiopzxcvbnm"
-            .chars()
-            .filter(|character| !continuations.contains(&character.to_ascii_lowercase()))
-            .collect::<Vec<_>>();
-        alphabet.extend(
-            "ASDFGHJKLQWERTYUIOPZXCVBNM"
-                .chars()
-                .filter(|character| !continuations.contains(&character.to_ascii_lowercase())),
-        );
-        alphabet.extend(
-            "!@#$%^&*()[]{};:,.?/\\|"
-                .chars()
-                .filter(|character| !continuations.contains(&character.to_ascii_lowercase())),
-        );
-        let next_label_char = (matches.len() == 1)
-            .then(|| matches[0].next_char)
-            .flatten()
-            .filter(|character| character.is_ascii_alphanumeric() || *character == '_');
-        if alphabet.is_empty() && next_label_char.is_none() && !matches.is_empty() {
-            self.label_matches.clear();
-            self.clear_label_overlay(output)?;
+        let Some(labels) = Self::assign_jump_labels(&matches) else {
+            self.reset_label_matches(output)?;
             self.draw_status(
                 output,
-                self.viewport()?,
+                viewport,
                 "matches found, but no label keys avoid query continuations",
             )?;
             return Ok(());
-        }
-        let labels = if matches.len() == 1 {
-            vec![
-                next_label_char
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| alphabet[0].to_string()),
-            ]
-        } else {
-            let width = (0..)
-                .find(|width| alphabet.len().saturating_pow(*width as u32) >= matches.len())
-                .unwrap_or(1);
-            (0..matches.len())
-                .map(|mut index| {
-                    let mut label = vec![alphabet[0]; width];
-                    for slot in label.iter_mut().rev() {
-                        *slot = alphabet[index % alphabet.len()];
-                        index /= alphabet.len();
-                    }
-                    label.into_iter().collect()
-                })
-                .collect()
         };
         self.label_matches = matches
             .into_iter()
@@ -1616,6 +1786,7 @@ impl App {
         {
             return Ok(());
         }
+        self.label_loading = false;
         let viewport = self.viewport()?;
         let visible = self.visible_view_frames(viewport);
         if visible.is_empty()
@@ -1625,9 +1796,7 @@ impl App {
         {
             return Ok(());
         }
-        self.label_matches.clear();
-        self.label_input.clear();
-        self.clear_label_overlay(output)?;
+        self.reset_label_matches(output)?;
         self.draw_status(output, viewport, &format!("visible search: {error}"))?;
         Ok(())
     }
@@ -1635,21 +1804,19 @@ impl App {
     fn clear_label_overlay(&mut self, output: &mut impl Write) -> io::Result<()> {
         if let Some(id) = self.label_overlay_id.take() {
             kitty::delete_image(output, id)?;
+            output.flush()?;
         }
-        self.label_overlay = None;
         Ok(())
     }
 
-    fn draw_label_overlay(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        self.clear_label_overlay(output)?;
-        if self.label_matches.is_empty() {
-            return Ok(());
-        }
-        let viewport = self.viewport()?;
+    fn render_label_overlay(
+        &self,
+        font: &mut crate::screenshot::FlashFont,
+        viewport: Viewport,
+    ) -> io::Result<Option<crate::screenshot::Overlay>> {
         let mut rects = Vec::new();
         let mut badges = Vec::new();
-        let cw = (u32::from(viewport.pixel_width) / u32::from(viewport.columns).max(1)).max(1);
-        let ch = (u32::from(viewport.pixel_height) / u32::from(viewport.rows).max(1)).max(1);
+        let cell_size = viewport.cell_size();
         for labeled in &self.label_matches {
             let page = self
                 .visible_pages
@@ -1681,68 +1848,39 @@ impl App {
             let Some((placement, top, frame_width, frame_height)) = page else {
                 continue;
             };
-            let crop = placement.crop.unwrap_or(crate::kitty::Crop {
-                x: 0,
-                y: 0,
-                width: frame_width,
-                height: frame_height,
-            });
-            if crop.width == 0 || crop.height == 0 {
-                continue;
-            }
             let mut badge_position = None;
             let mut match_height = 0;
             for rect in &labeled.visible.rects {
-                let x0 = rect.left.max(crop.x);
-                let x1 = rect.right.min(crop.x.saturating_add(crop.width));
-                let y0 = rect.top.max(crop.y);
-                let y1 = rect.bottom.min(crop.y.saturating_add(crop.height));
-                if x0 >= x1 || y0 >= y1 {
+                let Some(projected) = project_match_rect(
+                    rect,
+                    placement,
+                    top,
+                    (frame_width, frame_height),
+                    viewport,
+                    cell_size,
+                ) else {
                     continue;
-                }
-                let native = placement.native_cell.is_some();
-                let dst_x = u32::from(placement.left) * cw;
-                let dst_y = u32::from(top.saturating_sub(viewport.top)) * ch;
-                let pixel_x = dst_x
-                    + if native {
-                        x0 - crop.x
-                    } else {
-                        (x0 - crop.x) * u32::from(placement.columns) * cw / crop.width
-                    };
-                let pixel_y = if native {
-                    dst_y + placement.offset_y + (y0 - crop.y)
-                } else {
-                    dst_y + (y0 - crop.y) * u32::from(placement.rows) * ch / crop.height
                 };
-                let width = if native {
-                    x1 - x0
-                } else {
-                    (x1 - x0) * u32::from(placement.columns) * cw / crop.width
-                };
-                let height = if native {
-                    y1 - y0
-                } else {
-                    (y1 - y0) * u32::from(placement.rows) * ch / crop.height
-                };
-                if width > 0 && height > 0 {
-                    rects.push(ScreenshotRect {
-                        x: pixel_x,
-                        y: pixel_y,
-                        width,
-                        height,
-                        color: [0x3d, 0x59, 0xa1, 96],
-                    });
-                    badge_position = Some((pixel_x, pixel_x.saturating_add(width), pixel_y));
-                    match_height = match_height.max(height);
-                }
+                let ProjectedMatch {
+                    x: pixel_x,
+                    y: pixel_y,
+                    width,
+                    height,
+                    ..
+                } = projected;
+                rects.push(ScreenshotRect {
+                    x: pixel_x,
+                    y: pixel_y,
+                    width,
+                    height,
+                    color: [0x3d, 0x59, 0xa1, 96],
+                });
+                badge_position = Some((pixel_x, pixel_x.saturating_add(width), pixel_y));
+                match_height = match_height.max(height);
             }
             if let Some((word_x, x, rect_y)) = badge_position {
                 let glyph_size = badge_glyph_size(match_height);
-                let layout = self
-                    .flash_font
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("jump-label font was not initialized"))?
-                    .badge_layout(&labeled.label, glyph_size)?;
+                let layout = font.badge_layout(&labeled.label, glyph_size)?;
                 let (badge_width, badge_height) = (layout.width, layout.height);
                 let x = if x.saturating_add(badge_width) > u32::from(viewport.pixel_width)
                     && word_x >= badge_width
@@ -1762,32 +1900,51 @@ impl App {
                 });
             }
         }
-        let font = self
+        crate::screenshot::cropped_overlay(font, viewport, &rects, &badges)
+    }
+
+    fn label_overlay_pixels(
+        &mut self,
+        viewport: Viewport,
+    ) -> io::Result<Option<crate::screenshot::Overlay>> {
+        let mut font = self
             .flash_font
-            .as_mut()
+            .take()
             .ok_or_else(|| io::Error::other("jump-label font was not initialized"))?;
-        let rgba = crate::screenshot::overlay(font, viewport, &rects, &badges)?;
-        let compressed = kitty::compress_rgba(&rgba)?;
-        let id = self.next_image_id;
-        self.next_image_id = id.wrapping_add(1).max(1);
+        let result = self.render_label_overlay(&mut font, viewport);
+        self.flash_font = Some(font);
+        result
+    }
+
+    fn draw_label_overlay(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        self.clear_label_overlay(output)?;
+        if self.label_matches.is_empty() {
+            return Ok(());
+        }
+        let viewport = self.viewport()?;
+        let Some(overlay) = self.label_overlay_pixels(viewport)? else {
+            return Ok(());
+        };
+        let compressed = kitty::compress_rgba(&overlay.rgba)?;
+        let id = self.allocate_image_id();
         let placement = Placement {
             image_id: id,
-            columns: viewport.columns,
-            rows: viewport.rows,
+            columns: overlay.columns,
+            rows: overlay.rows,
             offset_y: 0,
             z_index: PAGE_IMAGE_Z_INDEX + 10,
             crop: None,
         };
-        execute!(output, MoveTo(0, viewport.top))?;
+        execute!(output, MoveTo(overlay.col, viewport.top + overlay.row))?;
         kitty::transmit_compressed_rgba(
             output,
             &compressed,
-            u32::from(viewport.pixel_width),
-            u32::from(viewport.pixel_height),
+            u32::from(overlay.pixel_width),
+            u32::from(overlay.pixel_height),
             placement,
         )?;
+        output.flush()?;
         self.label_overlay_id = Some(id);
-        self.label_overlay = Some(rgba);
         Ok(())
     }
 
@@ -1848,25 +2005,14 @@ impl App {
     }
 
     fn draw_search(&mut self, output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
-        self.status_line.clear();
-        let theme = self.theme;
-        let input = self.search_input.as_deref().unwrap_or_default();
-        execute!(
+        let input = self.search_input.clone().unwrap_or_default();
+        self.draw_input_prompt(
             output,
-            MoveTo(0, viewport.status_row),
-            SetBackgroundColor(theme.bg_dark),
-            Clear(ClearType::CurrentLine),
-            Print(" "),
-            SetForegroundColor(theme.yellow),
-            Print("search: "),
-            SetForegroundColor(theme.fg),
-            Print(input),
-            SetForegroundColor(theme.comment),
-            Print("  (enter to search, esc to cancel)"),
-            SetBackgroundColor(theme.bg),
-            SetForegroundColor(theme.fg)
-        )?;
-        output.flush()
+            viewport,
+            "search: ",
+            &input,
+            "  (enter to search, esc to cancel)",
+        )
     }
 
     fn start_search(&mut self, query: String, output: &mut impl Write) -> Result<(), AppError> {
@@ -1906,7 +2052,7 @@ impl App {
         let search = &mut self.session.tabs[index].search;
         search.scanned = update.scanned;
         search.total_pages = update.total;
-        search.matches = update.matches;
+        search.matches.extend(update.matches);
         search.total_occurrences = update.total_occurrences;
         if index == self.session.active_tab {
             if self.search_picker.is_some() {
@@ -1932,14 +2078,15 @@ impl App {
             return Ok(());
         }
         let current_page = self.session.tabs[index].page;
-        let target_page = matches
-            .iter()
-            .find(|result| result.page >= current_page)
-            .or_else(|| matches.first())
-            .map(|result| result.page);
         let search = &mut self.session.tabs[index].search;
         let should_jump = std::mem::take(&mut search.initial_navigation_pending);
-        search.matches = matches;
+        search.matches.extend(matches);
+        let target_page = search
+            .matches
+            .iter()
+            .find(|result| result.page >= current_page)
+            .or_else(|| search.matches.first())
+            .map(|result| result.page);
         search.total_occurrences = total_occurrences;
         search.scanned = search.total_pages;
         search.searching = false;
@@ -1951,10 +2098,7 @@ impl App {
             state.sync(current_page, &self.session.tabs[index].search.matches);
         }
         if should_jump && let Some(page) = target_page {
-            self.session.tabs[index].page = page;
-            self.session.tabs[index].scroll_x = 0;
-            self.session.tabs[index].scroll_y = 0;
-            self.session.tabs[index].center_content = true;
+            self.session.tabs[index].set_view_position(ViewPosition::top(page));
             self.request_current(output)?;
         } else if !self.session.tabs[index].search.matches.is_empty()
             || self.search_picker.is_some()
@@ -2004,10 +2148,7 @@ impl App {
             self.draw_status(output, self.viewport()?, "")?;
             return Ok(());
         };
-        self.tab_mut().page = page;
-        self.tab_mut().scroll_x = 0;
-        self.tab_mut().scroll_y = 0;
-        self.tab_mut().center_content = true;
+        self.tab_mut().set_view_position(ViewPosition::top(page));
         self.request_current(output)
     }
 
@@ -2093,52 +2234,36 @@ impl App {
         if self.session.pending_open.is_some() {
             return Ok(());
         }
-        let Some(pending) = self
-            .link_picker
-            .as_ref()
-            .and_then(|state| state.pending_preview)
-        else {
+        let origin = self.tab().view_position();
+        let Some(state) = &mut self.link_picker else {
+            return Ok(());
+        };
+        let Some(pending) = state.pending_preview else {
             return Ok(());
         };
         if Instant::now() < pending.ready_at {
             return Ok(());
         }
-
-        let selected = {
-            let Some(state) = &mut self.link_picker else {
-                return Ok(());
-            };
-            state.pending_preview = None;
-            if state.selection_key != Some(pending.selection_key) {
-                return Ok(());
-            }
-            state.selected
-        };
-        let Some(link) = self.tab().link_index.links.get(selected).cloned() else {
+        state.pending_preview = None;
+        if state.selection_key != Some(pending.selection_key) {
+            return Ok(());
+        }
+        let Some(link) = self.session.tabs[self.session.active_tab]
+            .link_index
+            .links
+            .get(state.selected)
+            .cloned()
+        else {
             return Ok(());
         };
-        let origin = ViewPosition {
-            page: self.tab().page,
-            scroll_x: self.tab().scroll_x,
-            scroll_y: self.tab().scroll_y,
-            center_content: self.tab().center_content,
-        };
-        let state = self.link_picker.as_mut().expect("link picker state");
         state.preview_origin.get_or_insert(origin);
         state.page = link.source_page;
         state.awaiting_current_page = false;
-
-        let tab = self.tab_mut();
-        tab.page = link.source_page;
-        tab.scroll_x = 0;
-        tab.scroll_y = 0;
-        tab.center_content = true;
-        tab.pending_destination = Some(LinkDestination {
-            page: link.source_page,
-            top_ratio: Some((link.source_top_ratio - 0.08).max(0.0)),
-            left_ratio: None,
-        });
-        self.request_current(output)
+        self.apply_preview_jump(
+            link.source_page,
+            Some((link.source_top_ratio - 0.08).max(0.0)),
+            output,
+        )
     }
 
     fn schedule_search_preview(&mut self) {
@@ -2148,10 +2273,49 @@ impl App {
         let Some(page) = state.selection_page else {
             return;
         };
-        state.pending_preview = Some(PendingSearchPreview {
-            page,
-            ready_at: Instant::now() + LINK_PREVIEW_DELAY,
+        state.pending_preview = Some((page, Instant::now() + LINK_PREVIEW_DELAY));
+    }
+
+    fn apply_preview_jump(
+        &mut self,
+        page: u32,
+        top_ratio: Option<f32>,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let tab = self.tab_mut();
+        tab.set_view_position(ViewPosition::top(page));
+        tab.pending_destination = top_ratio.map(|top_ratio| LinkDestination {
+            content_pan_x: None,
+            page: tab.page,
+            top_ratio: Some(top_ratio),
+            left_ratio: None,
         });
+        self.request_current(output)
+    }
+
+    fn take_picker_preview_origin(&mut self) -> Option<ViewPosition> {
+        let mut origin = None;
+        if let Some(state) = &mut self.link_picker {
+            state.pending_preview = None;
+            origin = state.preview_origin.take();
+        }
+        if let Some(state) = &mut self.search_picker {
+            state.pending_preview = None;
+            origin = origin.or(state.preview_origin.take());
+        }
+        origin
+    }
+
+    fn clear_picker_previews(&mut self) {
+        let _ = self.take_picker_preview_origin();
+    }
+
+    pub(super) fn restore_active_picker_preview(&mut self) {
+        if let Some(origin) = self.take_picker_preview_origin() {
+            let tab = self.tab_mut();
+            tab.set_view_position(origin);
+            tab.pending_destination = None;
+        }
     }
 
     fn forward_waiting(&self) -> io::Result<bool> {
@@ -2161,11 +2325,11 @@ impl App {
     }
 
     fn poll_forward_socket(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(path) = self.forward_socket.clone() else {
-            return Ok(());
-        };
         if self.forward_listener.is_none() {
-            self.forward_listener = Some(crate::ipc::ForwardListener::bind(Path::new(&path))?);
+            let Some(path) = self.forward_socket.as_deref() else {
+                return Ok(());
+            };
+            self.forward_listener = Some(crate::ipc::ForwardListener::bind(Path::new(path))?);
         }
         let ready = self
             .forward_listener
@@ -2187,13 +2351,9 @@ impl App {
             match result {
                 Ok(crate::ipc::ViewerRequest::Forward(request)) => {
                     self.cancel_forward("forward search superseded by a newer request")?;
-                    if let Some(previous) = self.navigation.inverse.take() {
-                        previous.operation.cancel();
-                    }
+                    self.navigation.inverse = None;
                     self.navigation.forward = Some(PendingForward {
                         request,
-                        document_revision: None,
-                        source_state: None,
                         reply,
                         deadline: Instant::now() + crate::ipc::FORWARD_TIMEOUT,
                         stage: ForwardStage::AwaitingDocument,
@@ -2315,7 +2475,7 @@ impl App {
         Ok(())
     }
 
-    fn save_screenshot(&self, path: &Path) -> io::Result<()> {
+    fn save_screenshot(&mut self, path: &Path) -> io::Result<()> {
         if self.link_picker.is_some() || self.search_picker.is_some() {
             return Err(io::Error::other(
                 "screenshot is unavailable while a link or search picker is open",
@@ -2324,12 +2484,17 @@ impl App {
         let viewport = self
             .viewport()
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let overlay = if self.label_overlay_id.is_some() && !self.label_matches.is_empty() {
+            self.label_overlay_pixels(viewport)?
+        } else {
+            None
+        };
         let pages = self.screenshot_pages(viewport)?;
         crate::screenshot::save(
             path,
             viewport,
             &pages,
-            self.label_overlay.as_deref(),
+            overlay.as_ref(),
             terminal_color_rgb(self.theme.bg),
         )
     }
@@ -2397,10 +2562,10 @@ impl App {
                 } else {
                     self.navigation.source_maps.remove(&path);
                 }
-                if let Some(source) = pending.source_state {
-                    self.navigation.source_snapshots.insert(path, source);
+                if pending.request.best_guess {
+                    self.navigation.best_guess.insert(path);
                 } else {
-                    self.navigation.source_snapshots.remove(&path);
+                    self.navigation.best_guess.remove(&path);
                 }
             }
             pending
@@ -2454,12 +2619,7 @@ impl App {
             // cannot acknowledge an older cached frame.
             let mut pending = self.navigation.forward.take().unwrap();
             match self.apply_forward_request(&pending.request, index, output) {
-                Ok(source_state) => {
-                    pending.document_revision = source_state
-                        .as_ref()
-                        .filter(|source| source.snapshot.is_some())
-                        .map(|source| source.revision);
-                    pending.source_state = source_state;
+                Ok(()) => {
                     pending.stage = ForwardStage::AwaitingFrame;
                     self.navigation.forward = Some(pending);
                 }
@@ -2488,43 +2648,14 @@ impl App {
         request: &ForwardRequest,
         index: usize,
         output: &mut impl Write,
-    ) -> Result<Option<SourceState>, AppError> {
-        if self.session.pending_open.is_some() {
-            return Err(io::Error::other("viewer is still opening a document").into());
-        }
+    ) -> Result<(), AppError> {
         if request.page > self.session.tabs[index].page_count {
             return Err(io::Error::other("forward page is outside the document").into());
         }
-        let source = request
-            .source_snapshot
-            .as_deref()
-            .map(|path| crate::source_snapshot::SourceSnapshot::load(path, &request.pdf))
-            .transpose()?;
-        let source_state = source
-            .map(|source| SourceState {
-                revision: source.revision,
-                snapshot: Some(source.path),
-                best_guess: request.best_guess,
-            })
-            .or_else(|| {
-                request.best_guess.then_some(SourceState {
-                    revision: self.session.tabs[index].watcher.accepted,
-                    snapshot: None,
-                    best_guess: true,
-                })
-            });
         let rect = request.rect();
         self.pending_scale = None;
+        self.restore_active_picker_preview();
         self.select_tab(index, output)?;
-        let mut preview_origin = None;
-        if let Some(state) = &mut self.link_picker {
-            state.pending_preview = None;
-            preview_origin = state.preview_origin.take();
-        }
-        if let Some(state) = &mut self.search_picker {
-            state.pending_preview = None;
-            preview_origin = preview_origin.or(state.preview_origin.take());
-        }
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
         if let Some(previous) = self.navigation.flash.take() {
@@ -2533,29 +2664,14 @@ impl App {
         let tab = self.tab_mut();
         tab.search.initial_navigation_pending = false;
         let document_id = tab.document_id;
-        let current = ViewPosition {
-            page: tab.page,
-            scroll_x: tab.scroll_x,
-            scroll_y: tab.scroll_y,
-            center_content: tab.center_content,
-        };
-        if let Some(origin) = preview_origin {
-            tab.link_history.push(origin);
-        }
+        let current = tab.view_position();
         let page = request.page.saturating_sub(1).min(tab.page_count - 1);
         if page != tab.page {
             tab.page = page;
             tab.scroll_y = 0;
         }
-        tab.link_history.jump(
-            current,
-            ViewPosition {
-                page: tab.page,
-                scroll_x: tab.scroll_x,
-                scroll_y: tab.scroll_y,
-                center_content: tab.center_content,
-            },
-        );
+        let provisional = tab.view_position();
+        tab.link_history.jump(current, provisional);
         self.navigation.flash = Some(PendingFlash {
             document_id,
             revision: request.revision,
@@ -2565,15 +2681,14 @@ impl App {
         });
         self.worker
             .flash(document_id, page, rect, request.word.clone());
-        self.generation += 1;
-        self.worker.begin_generation(self.generation);
+        self.bump_generation(true);
         // A cached unhighlighted target is not a submitted forward-search frame.
         self.tab_mut().cache.retain(|key, _| key.page != page);
         let viewport = self.viewport()?;
         let key = self.render_key(viewport);
         self.desired_key = Some(key);
-        self.pending.clear();
-        self.pending.insert(key);
+        self.sync_worker_view_window(key.page);
+        self.pending.insert(key, false);
         self.performance_snapshot = None;
         self.worker
             .render(RenderRequest {
@@ -2581,7 +2696,7 @@ impl App {
                 generation: self.generation,
             })
             .map_err(AppError::Renderer)?;
-        Ok(source_state)
+        Ok(())
     }
 
     fn clear_flash_state(&mut self, flash: &PendingFlash) {
@@ -2627,14 +2742,7 @@ impl App {
                 }))
         {
             let key = self.page_key(flash.page, self.viewport()?);
-            if self.pending.insert(key) {
-                self.worker
-                    .render(RenderRequest {
-                        key,
-                        generation: self.generation,
-                    })
-                    .map_err(AppError::Renderer)?;
-            }
+            self.request_visible_page(key)?;
         }
         Ok(())
     }
@@ -2643,45 +2751,23 @@ impl App {
         if self.session.pending_open.is_some() {
             return Ok(());
         }
-        let Some(pending) = self
-            .search_picker
-            .as_ref()
-            .and_then(|state| state.pending_preview)
-        else {
+        let origin = self.tab().view_position();
+        let Some(state) = &mut self.search_picker else {
             return Ok(());
         };
-        if Instant::now() < pending.ready_at {
+        let Some((page, ready_at)) = state.pending_preview else {
             return Ok(());
-        }
-
-        {
-            let Some(state) = &mut self.search_picker else {
-                return Ok(());
-            };
-            state.pending_preview = None;
-            if state.selection_page != Some(pending.page) {
-                return Ok(());
-            }
-        }
-        if pending.page == self.tab().page {
-            return Ok(());
-        }
-        let origin = ViewPosition {
-            page: self.tab().page,
-            scroll_x: self.tab().scroll_x,
-            scroll_y: self.tab().scroll_y,
-            center_content: self.tab().center_content,
         };
-        let state = self.search_picker.as_mut().expect("search picker state");
+        if Instant::now() < ready_at {
+            return Ok(());
+        }
+        state.pending_preview = None;
+        if state.selection_page != Some(page) || page == origin.page {
+            return Ok(());
+        }
         state.preview_origin.get_or_insert(origin);
-        state.page = pending.page;
-
-        let tab = self.tab_mut();
-        tab.page = pending.page;
-        tab.scroll_x = 0;
-        tab.scroll_y = 0;
-        tab.center_content = true;
-        self.request_current(output)
+        state.page = page;
+        self.apply_preview_jump(page, None, output)
     }
 
     fn handle_link_picker_pointer(
@@ -2690,14 +2776,14 @@ impl App {
         output: &mut impl Write,
     ) -> Result<bool, AppError> {
         let area = link_picker_area(self.viewport()?);
-        let links = self.tab().link_index.links.clone();
-        let outline = Arc::clone(&self.tab().outline);
+        let tab = &self.session.tabs[self.session.active_tab];
+        let links = &tab.link_index.links;
         let Some(state) = self.link_picker.as_ref() else {
             return Ok(false);
         };
         let Some(selected) = link_picker_link_at_position(
             area,
-            LinkPickerDocument::new(&links, &outline),
+            LinkPickerDocument::from_tab(tab),
             state,
             self.link_picker_geometry,
             mouse.column,
@@ -2713,7 +2799,7 @@ impl App {
         }
         let state = self.link_picker.as_mut().expect("link picker state");
         state.focus = LinkPickerFocus::Links;
-        state.select(selected, &links);
+        state.select(selected, links);
         self.schedule_link_preview();
         self.redraw_link_picker(output)?;
         Ok(true)
@@ -2760,7 +2846,7 @@ impl App {
         let Some((frame, placement, image_top)) = self.page_at_mouse(mouse, viewport) else {
             return Ok(());
         };
-        let Some(target) = link_at_cell(
+        let target = link_at_cell(
             &frame.links,
             placement,
             frame.width,
@@ -2768,17 +2854,15 @@ impl App {
             image_top,
             mouse.column,
             mouse.row,
-        ) else {
+        );
+        let Some(target) = target else {
             self.draw_status(output, viewport, "no link here")?;
             return Ok(());
         };
-        if let Some(state) = &mut self.link_picker
-            && matches!(&target, LinkTarget::Internal { .. })
+        if matches!(&target, LinkTarget::Internal { .. })
+            && let Some(origin) = self.take_picker_preview_origin()
         {
-            state.pending_preview = None;
-            if let Some(origin) = state.preview_origin.take() {
-                self.tab_mut().link_history.push(origin);
-            }
+            self.tab_mut().link_history.push(origin);
         }
         if self.link_picker.is_some() && !self.persistent_link_picker {
             self.close_link_picker(output)?;
@@ -2793,30 +2877,34 @@ impl App {
                 top_ratio,
                 left_ratio,
             } => {
-                let current = ViewPosition {
-                    page: self.tab().page,
-                    scroll_x: self.tab().scroll_x,
-                    scroll_y: self.tab().scroll_y,
-                    center_content: self.tab().center_content,
-                };
+                let current = self.tab().view_position();
                 let page = page.min(self.tab().page_count - 1);
+                let content_pan_x = self.tab().pending_destination.map_or_else(
+                    || {
+                        if self.tab().fit != FitMode::Content || current.center_content {
+                            return None;
+                        }
+                        self.viewport()
+                            .ok()
+                            .and_then(|viewport| {
+                                let key = self.page_key(current.page, viewport);
+                                let from = self.tab().cache.get(&key)?;
+                                Some(current.scroll_x - content_scroll(from, viewport).0)
+                            })
+                            .or_else(|| (current.page != page).then_some(0))
+                    },
+                    |pending| pending.content_pan_x,
+                );
                 let tab = self.tab_mut();
                 tab.search.initial_navigation_pending = false;
                 tab.page = page;
-                tab.center_content = true;
                 if top_ratio.is_some() {
                     tab.scroll_y = 0;
                 }
-                tab.link_history.jump(
-                    current,
-                    ViewPosition {
-                        page: tab.page,
-                        scroll_x: tab.scroll_x,
-                        scroll_y: tab.scroll_y,
-                        center_content: tab.center_content,
-                    },
-                );
+                let provisional = tab.view_position();
+                tab.link_history.jump(current, provisional);
                 tab.pending_destination = Some(LinkDestination {
+                    content_pan_x,
                     page,
                     top_ratio,
                     left_ratio,
@@ -2835,40 +2923,32 @@ impl App {
         Ok(())
     }
 
-    fn follow_link_back(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let current = ViewPosition {
-            page: self.tab().page,
-            scroll_x: self.tab().scroll_x,
-            scroll_y: self.tab().scroll_y,
-            center_content: self.tab().center_content,
-        };
-        let Some(previous) = self.tab_mut().link_history.backward(current) else {
-            self.draw_status(output, self.viewport()?, "no link history")?;
+    fn jump_history(
+        &mut self,
+        target: Option<ViewPosition>,
+        empty_msg: &str,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some(pos) = target else {
+            self.draw_status(output, self.viewport()?, empty_msg)?;
             return Ok(());
         };
         let tab = self.tab_mut();
         tab.search.initial_navigation_pending = false;
-        tab.page = previous.page.min(tab.page_count - 1);
-        tab.scroll_x = previous.scroll_x;
-        tab.scroll_y = previous.scroll_y;
-        tab.center_content = previous.center_content;
+        tab.set_view_position(pos);
         tab.pending_destination = None;
         self.request_current(output)
     }
 
+    fn follow_link_back(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        let current = self.tab().view_position();
+        let previous = self.tab_mut().link_history.backward(current);
+        self.jump_history(previous, "no link history", output)
+    }
+
     fn follow_link_forward(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(next) = self.tab_mut().link_history.forward() else {
-            self.draw_status(output, self.viewport()?, "no forward link history")?;
-            return Ok(());
-        };
-        let tab = self.tab_mut();
-        tab.search.initial_navigation_pending = false;
-        tab.page = next.page.min(tab.page_count - 1);
-        tab.scroll_x = next.scroll_x;
-        tab.scroll_y = next.scroll_y;
-        tab.center_content = next.center_content;
-        tab.pending_destination = None;
-        self.request_current(output)
+        let next = self.tab_mut().link_history.forward();
+        self.jump_history(next, "no forward link history", output)
     }
 
     fn open_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -2917,35 +2997,43 @@ impl App {
         self.open_link_picker(output)
     }
 
-    fn redraw_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(_) = self.link_picker else {
+    fn paint_link_picker(
+        &mut self,
+        page: u32,
+        viewport: Viewport,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
+        let Some(state) = &mut self.link_picker else {
             return Ok(());
         };
-        let viewport = self.viewport()?;
-        let page = self
-            .current_visible_page(viewport)
-            .map_or(self.tab().page, |page| page.frame.key.page);
-        let links = self.tab().link_index.links.clone();
-        let outline = Arc::clone(&self.tab().outline);
-        let progress = LinkIndexProgress::from(&self.tab().link_index);
-        let state = self.link_picker.as_mut().expect("link picker state");
+        let tab = &self.session.tabs[self.session.active_tab];
+        let progress = LinkIndexProgress::from(&tab.link_index);
         let selection_before = state.selection_key;
-        state.sync(page, &links, progress.indexing);
+        state.sync(page, &tab.link_index.links, progress.indexing);
         let schedule_preview =
             selection_before != state.selection_key && state.focus == LinkPickerFocus::Links;
-        let state = state.clone();
+        let document = LinkPickerDocument::from_tab(tab);
+        let area = link_picker_area(viewport);
+        let (geometry, theme) = (self.link_picker_geometry, self.theme);
+        draw_side_picker_terminal(output, area, |frame| {
+            draw_link_picker(frame, area, document, state, progress, geometry, theme)
+        })?;
         if schedule_preview {
             self.schedule_link_preview();
         }
-        draw_link_picker_terminal(
-            output,
-            link_picker_area(viewport),
-            LinkPickerDocument::new(&links, &outline),
-            &state,
-            progress,
-            self.link_picker_geometry,
-            self.theme,
-        )?;
+        Ok(())
+    }
+
+    fn redraw_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.link_picker.is_some() {
+            let viewport = self.viewport()?;
+            let page = self
+                .current_visible_page(viewport)
+                .map_or(self.tab().page, |page| page.frame.key.page);
+            synchronized_output(output, |output| {
+                self.paint_link_picker(page, viewport, output)
+            })?;
+        }
         Ok(())
     }
 
@@ -3006,10 +3094,7 @@ impl App {
     ) -> Result<(), AppError> {
         if let Some(origin) = origin {
             let tab = self.tab_mut();
-            tab.page = origin.page.min(tab.page_count - 1);
-            tab.scroll_x = origin.scroll_x;
-            tab.scroll_y = origin.scroll_y;
-            tab.center_content = origin.center_content;
+            tab.set_view_position(origin);
             tab.pending_destination = None;
             self.clear_viewer(output)?;
             self.reset_render_state();
@@ -3056,28 +3141,42 @@ impl App {
         }
     }
 
-    fn redraw_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(_) = self.search_picker else {
+    fn paint_search_picker(
+        &mut self,
+        page: u32,
+        viewport: Viewport,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
+        let Some(state) = &mut self.search_picker else {
             return Ok(());
         };
-        let viewport = self.viewport()?;
-        let page = self
-            .current_visible_page(viewport)
-            .map_or(self.tab().page, |page| page.frame.key.page);
-        let search = self.tab().search.clone();
-        let outline = Arc::clone(&self.tab().outline);
-        let state = self.search_picker.as_mut().expect("search picker state");
-        state.sync(page, &search.matches);
-        let state = state.clone();
-        draw_search_picker_terminal(
-            output,
-            link_picker_area(viewport),
-            &search,
-            &outline,
-            &state,
-            self.link_picker_geometry,
-            self.theme,
-        )?;
+        let tab = &self.session.tabs[self.session.active_tab];
+        state.sync(page, &tab.search.matches);
+        let area = link_picker_area(viewport);
+        let (geometry, theme) = (self.link_picker_geometry, self.theme);
+        draw_side_picker_terminal(output, area, |frame| {
+            draw_search_picker(
+                frame,
+                area,
+                &tab.search,
+                &tab.outline,
+                state,
+                geometry,
+                theme,
+            )
+        })
+    }
+
+    fn redraw_search_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if self.search_picker.is_some() {
+            let viewport = self.viewport()?;
+            let page = self
+                .current_visible_page(viewport)
+                .map_or(self.tab().page, |page| page.frame.key.page);
+            synchronized_output(output, |output| {
+                self.paint_search_picker(page, viewport, output)
+            })?;
+        }
         Ok(())
     }
 
@@ -3089,43 +3188,80 @@ impl App {
         self.restore_preview_origin(state.preview_origin, output)
     }
 
+    fn handle_side_picker_chrome_key(
+        &mut self,
+        area: Rect,
+        key: KeyEvent,
+        is_link: bool,
+        output: &mut impl Write,
+    ) -> Result<bool, AppError> {
+        let layout = resolved_link_picker_layout(area, self.link_picker_geometry.layout);
+        let current_focus = if is_link {
+            self.link_picker.as_ref().expect("link picker state").focus
+        } else {
+            self.search_picker
+                .as_ref()
+                .expect("search picker state")
+                .focus
+        };
+        if let Some(focus) = link_picker_focus_for_key(current_focus, layout, key) {
+            if is_link {
+                let state = self.link_picker.as_mut().expect("link picker state");
+                state.focus = focus;
+                if focus == LinkPickerFocus::Document {
+                    state.pending_preview = None;
+                } else {
+                    self.schedule_link_preview();
+                }
+            } else {
+                let state = self.search_picker.as_mut().expect("search picker state");
+                state.focus = focus;
+                if focus == LinkPickerFocus::Document {
+                    state.pending_preview = None;
+                } else {
+                    self.schedule_search_preview();
+                }
+            }
+            self.redraw_active_side_picker(output)?;
+            return Ok(true);
+        }
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            match normalize_shifted_key(key).code {
+                KeyCode::Char('s') => {
+                    self.cycle_link_picker_layout(output)?;
+                    return Ok(true);
+                }
+                KeyCode::Char('a') => {
+                    self.set_link_picker_layout(LinkPickerLayout::Auto, output)?;
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     fn handle_search_picker_key(
         &mut self,
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        let key = normalize_shifted_key(key);
         let area = link_picker_area(self.viewport()?);
-        let layout = resolved_link_picker_layout(area, self.link_picker_geometry.layout);
-        if let Some(focus) = link_picker_focus_for_key(
-            self.search_picker
-                .as_ref()
-                .expect("search picker state")
-                .focus,
-            layout,
-            key,
-        ) {
-            let state = self.search_picker.as_mut().expect("search picker state");
-            state.focus = focus;
-            if focus == LinkPickerFocus::Document {
-                state.pending_preview = None;
-            } else {
-                self.schedule_search_preview();
-            }
-            return self.redraw_search_picker(output);
+        if self.handle_side_picker_chrome_key(area, key, false, output)? {
+            return Ok(());
         }
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc => return self.close_search_picker(output),
-            KeyCode::Char('/') if !control && !alt => {
+            KeyCode::Char('/') if plain => {
                 self.close_search_picker(output)?;
                 return self.begin_search(output);
-            }
-            KeyCode::Char('s') if !control && !alt => {
-                return self.cycle_link_picker_layout(output);
-            }
-            KeyCode::Char('a') if !control && !alt => {
-                return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
             }
             _ => {}
         }
@@ -3134,20 +3270,27 @@ impl App {
             .as_ref()
             .is_some_and(|state| state.focus == LinkPickerFocus::Document)
         {
-            return self.handle_link_picker_document_key(key, output);
+            self.dispatch_document_navigation_key(key, true, output)?;
+            return Ok(());
         }
 
-        let visible_height = link_picker_visible_height(area, self.link_picker_geometry);
-        let matches = self.tab().search.matches.clone();
+        let visible_height = search_picker_visible_height(area, self.link_picker_geometry);
+        let tab = &mut self.session.tabs[self.session.active_tab];
+        let matches = &tab.search.matches;
         let selected = self
             .search_picker
             .as_ref()
             .expect("search picker state")
             .selected;
-        if let Some(next) =
-            link_picker_navigation_index(selected, matches.len(), key, visible_height)
-        {
-            self.tab_mut().search.initial_navigation_pending = false;
+        if let Some(next) = picker_navigation_index(
+            selected,
+            matches.len(),
+            key,
+            visible_height,
+            true,
+            ListEdge::Wrap,
+        ) {
+            tab.search.initial_navigation_pending = false;
             let state = self.search_picker.as_mut().expect("search picker state");
             state.selected = next;
             state.selection_page = matches.get(next).map(|result| result.page);
@@ -3156,10 +3299,9 @@ impl App {
         } else if key.code == KeyCode::Enter
             && let Some(result) = matches.get(selected)
         {
-            let state = self.search_picker.as_mut().expect("search picker state");
-            state.pending_preview = None;
-            state.preview_origin = None;
-            self.set_page(result.page, output)?;
+            let page = result.page;
+            self.clear_picker_previews();
+            self.set_page(page, output)?;
         }
         Ok(())
     }
@@ -3169,33 +3311,17 @@ impl App {
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        let key = normalize_shifted_key(key);
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let filtering = self
+        let plain = !control && !alt;
+        let (filtering, has_filter) = self
             .link_picker
             .as_ref()
-            .is_some_and(|state| state.filtering);
-        let has_filter = self
-            .link_picker
-            .as_ref()
-            .is_some_and(|state| !state.filter.is_empty());
+            .map_or((false, false), |s| (s.filtering, !s.filter.is_empty()));
         let area = link_picker_area(self.viewport()?);
-        let layout = resolved_link_picker_layout(area, self.link_picker_geometry.layout);
-        if !filtering
-            && let Some(focus) = link_picker_focus_for_key(
-                self.link_picker.as_ref().expect("link picker state").focus,
-                layout,
-                key,
-            )
-        {
-            let state = self.link_picker.as_mut().expect("link picker state");
-            state.focus = focus;
-            if focus == LinkPickerFocus::Document {
-                state.pending_preview = None;
-            } else {
-                self.schedule_link_preview();
-            }
-            return self.redraw_link_picker(output);
+        if !filtering && self.handle_side_picker_chrome_key(area, key, true, output)? {
+            return Ok(());
         }
         match key.code {
             KeyCode::Esc if self.link_mode => {
@@ -3210,44 +3336,30 @@ impl App {
                 return self.redraw_link_picker(output);
             }
             KeyCode::Esc => return self.close_link_picker(output),
-            KeyCode::Char('/') if !filtering && !control && !alt => {
+            KeyCode::Char('/') if !filtering && plain => {
                 let state = self.link_picker.as_mut().expect("link picker state");
                 state.filtering = true;
                 state.focus = LinkPickerFocus::Links;
                 state.number_input.clear();
                 return self.redraw_link_picker(output);
             }
-            KeyCode::Char('s') if !filtering && !control && !alt => {
-                return self.cycle_link_picker_layout(output);
-            }
-            KeyCode::Char('a') if !filtering && !control && !alt => {
-                return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
-            }
-            KeyCode::Char('L') if !filtering && !control && !alt => {
+            KeyCode::Char('L') if !filtering && plain => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
-            KeyCode::Char('q') if !control && !alt && (self.link_mode || !filtering) => {
+            KeyCode::Char('q') if plain && (self.link_mode || !filtering) => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
-            KeyCode::Char('B') if !filtering && !control && !alt => {
-                self.follow_link_forward(output)?;
-                return Ok(());
+            KeyCode::Char('B') if !filtering && plain => {
+                return self.follow_link_forward(output).map(|_| ());
             }
-            KeyCode::Char('b') if !filtering && key.modifiers == KeyModifiers::SHIFT => {
-                self.follow_link_forward(output)?;
-                return Ok(());
-            }
-            KeyCode::Char('b') if !filtering && !control && !alt => {
-                self.follow_link_back(output)?;
-                return Ok(());
+            KeyCode::Char('b') if !filtering && plain => {
+                return self.follow_link_back(output).map(|_| ());
             }
             KeyCode::Char('o') if control && !alt => {
-                self.follow_link_back(output)?;
-                return Ok(());
+                return self.follow_link_back(output).map(|_| ());
             }
             KeyCode::Char('i') if control && !alt => {
-                self.follow_link_forward(output)?;
-                return Ok(());
+                return self.follow_link_forward(output).map(|_| ());
             }
             _ => {}
         }
@@ -3257,45 +3369,37 @@ impl App {
             .as_ref()
             .is_some_and(|state| state.focus == LinkPickerFocus::Document)
         {
-            return self.handle_link_picker_document_key(key, output);
+            self.dispatch_document_navigation_key(key, true, output)?;
+            return Ok(());
         }
 
         let viewport = self.viewport()?;
-        let links = self.tab().link_index.links.clone();
-        let indexing = self.tab().link_index.indexing;
         let page = self
             .current_visible_page(viewport)
             .map_or(self.tab().page, |page| page.frame.key.page);
         let visible_height =
             link_picker_visible_height(link_picker_area(viewport), self.link_picker_geometry);
+        let tab = &self.session.tabs[self.session.active_tab];
+        let links = &tab.link_index.links;
+        let indexing = tab.link_index.indexing;
         let state = self.link_picker.as_mut().expect("link picker state");
-        state.sync(page, &links, indexing);
+        state.sync(page, links, indexing);
         let selected_before = state.selected;
 
-        let input_consumed = if state.filtering {
-            match key.code {
-                KeyCode::Enter => {
-                    state.filtering = false;
-                    false
-                }
-                KeyCode::Backspace => {
-                    state.filter.pop();
-                    true
-                }
-                KeyCode::Char(character) if !control && !alt => {
-                    state.filter.push(character);
-                    true
-                }
-                _ => false,
-            }
-        } else {
+        let input_consumed = if !state.filtering {
             false
+        } else if key.code == KeyCode::Enter {
+            state.filtering = false;
+            false
+        } else {
+            edit_picker_filter(&mut state.filter, key)
         };
-        let filtered = filter_document_links(&links, &state.filter);
+        let rows = state.rows(LinkPickerDocument::from_tab(tab));
+        let filtered = &rows.filtered;
         if !filtered.contains(&state.selected)
             && let Some(first) = filtered.first().copied()
         {
-            state.select(first, &links);
+            state.select(first, links);
         }
         let selected_position = filtered
             .iter()
@@ -3303,7 +3407,14 @@ impl App {
             .unwrap_or(0);
         let navigation = (!input_consumed)
             .then(|| {
-                link_picker_navigation_index(selected_position, filtered.len(), key, visible_height)
+                picker_navigation_index(
+                    selected_position,
+                    filtered.len(),
+                    key,
+                    visible_height,
+                    true,
+                    ListEdge::Wrap,
+                )
             })
             .flatten();
         let mut explicit_selection = navigation.is_some();
@@ -3312,7 +3423,7 @@ impl App {
         if input_consumed {
             redraw = true;
         } else if let Some(selected) = navigation {
-            state.select(filtered[selected], &links);
+            state.select(filtered[selected], links);
             state.number_input.clear();
         } else {
             match key.code {
@@ -3327,7 +3438,7 @@ impl App {
                 KeyCode::Backspace => {
                     state.number_input.pop();
                     if let Some(index) = link_number_index(&state.number_input, filtered.len()) {
-                        state.select(filtered[index], &links);
+                        state.select(filtered[index], links);
                         explicit_selection = true;
                     }
                     redraw = true;
@@ -3336,7 +3447,7 @@ impl App {
                     if let Some(index) =
                         update_link_number_selection(&mut state.number_input, digit, filtered.len())
                     {
-                        state.select(filtered[index], &links);
+                        state.select(filtered[index], links);
                         explicit_selection = true;
                     }
                     redraw = true;
@@ -3347,12 +3458,10 @@ impl App {
         let selection_changed = state.selected != selected_before;
 
         if let Some(target) = target {
-            if matches!(&target, LinkTarget::Internal { .. }) {
-                let state = self.link_picker.as_mut().expect("link picker state");
-                state.pending_preview = None;
-                if let Some(origin) = state.preview_origin.take() {
-                    self.tab_mut().link_history.push(origin);
-                }
+            if matches!(&target, LinkTarget::Internal { .. })
+                && let Some(origin) = self.take_picker_preview_origin()
+            {
+                self.tab_mut().link_history.push(origin);
             }
             if !self.persistent_link_picker {
                 self.close_link_picker(output)?;
@@ -3367,28 +3476,34 @@ impl App {
         Ok(())
     }
 
-    fn handle_link_picker_document_key(
+    fn dispatch_document_navigation_key(
         &mut self,
         key: KeyEvent,
+        from_side_picker: bool,
         output: &mut impl Write,
-    ) -> Result<(), AppError> {
-        if let KeyCode::Char(ch) = key.code
-            && !match key.modifiers {
-                KeyModifiers::CONTROL => matches!(ch, 'd' | 'u' | 'f' | 'b'),
-                KeyModifiers::NONE | KeyModifiers::SHIFT => !matches!(ch, 'f' | 'b'),
-                _ => false,
+    ) -> Result<bool, AppError> {
+        if key.modifiers == KeyModifiers::CONTROL {
+            let forward = match key.code {
+                KeyCode::Char('b' | 'u') => false,
+                KeyCode::Char('f' | 'd') => true,
+                _ => return Ok(false),
+            };
+            if from_side_picker {
+                self.clear_picker_previews();
             }
-        {
-            return Ok(());
+            self.move_view(Axis::Vertical, forward, true, true, output)?;
+            return Ok(true);
         }
-        let control = key.modifiers == KeyModifiers::CONTROL;
-        let shift = key.modifiers == KeyModifiers::SHIFT;
-        if matches!(
-            key.code,
-            KeyCode::Down
-                | KeyCode::Char(
-                    'j' | 'k' | 'J' | 'K' | ' ' | 'g' | 'G' | 'm' | 'i' | 'd' | 'u' | 'f' | 'b'
-                )
+        let code = normalize_shifted_key(key).code;
+        if matches!(code, KeyCode::Char(_))
+            && !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+        {
+            return Ok(false);
+        }
+        let matched = matches!(
+            code,
+            KeyCode::Char('J' | 'K' | 'j' | 'k' | ' ' | 'd' | 'u' | 'g' | 'G' | 'm' | 'i')
+                | KeyCode::Down
                 | KeyCode::Up
                 | KeyCode::PageDown
                 | KeyCode::PageUp
@@ -3397,59 +3512,47 @@ impl App {
                 | KeyCode::Left
                 | KeyCode::Home
                 | KeyCode::End
-        ) {
-            if let Some(state) = self.link_picker.as_mut() {
-                state.pending_preview = None;
-                state.preview_origin = None;
-            }
-            if let Some(state) = self.search_picker.as_mut() {
-                state.pending_preview = None;
-                state.preview_origin = None;
-            }
+        ) || (!from_side_picker && matches!(code, KeyCode::Char('h' | 'l')));
+        if !matched {
+            return Ok(false);
         }
-        match key.code {
+        if from_side_picker {
+            self.clear_picker_previews();
+        }
+        match code {
             KeyCode::Char('J') => self.page_step(true, output)?,
-            KeyCode::Char('j') if shift => self.page_step(true, output)?,
             KeyCode::Char('K') => self.page_step(false, output)?,
-            KeyCode::Char('k') if shift => self.page_step(false, output)?,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_view(Axis::Vertical, true, false, true, output)?
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_view(Axis::Vertical, false, false, true, output)?
             }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
+            KeyCode::PageDown | KeyCode::Char(' ' | 'd') => {
                 self.move_view(Axis::Vertical, true, true, true, output)?
             }
-            KeyCode::PageUp | KeyCode::Backspace => {
+            KeyCode::PageUp | KeyCode::Backspace | KeyCode::Char('u') => {
                 self.move_view(Axis::Vertical, false, true, true, output)?
             }
-            KeyCode::Char('d') if !shift => {
-                self.move_view(Axis::Vertical, true, true, true, output)?
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.move_view(Axis::Horizontal, true, false, true, output)?
             }
-            KeyCode::Char('u') if !shift => {
-                self.move_view(Axis::Vertical, false, true, true, output)?
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.move_view(Axis::Horizontal, false, false, true, output)?
             }
-            KeyCode::Char('f') if control => {
-                self.move_view(Axis::Vertical, true, true, true, output)?
-            }
-            KeyCode::Char('b') if control => {
-                self.move_view(Axis::Vertical, false, true, true, output)?
-            }
-            KeyCode::Right => self.move_view(Axis::Horizontal, true, false, true, output)?,
-            KeyCode::Left => self.move_view(Axis::Horizontal, false, false, true, output)?,
             KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
                 self.set_page_vertically(self.tab().page_count - 1, output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
-            _ => {}
+            _ => unreachable!(),
         }
-        Ok(())
+        Ok(true)
     }
 
     fn handle_key(&mut self, key: KeyEvent, output: &mut impl Write) -> Result<bool, AppError> {
+        let key = normalize_shifted_key(key);
         if self.search_picker.is_some() {
             self.handle_search_picker_key(key, output)?;
             return Ok(false);
@@ -3474,20 +3577,24 @@ impl App {
             self.select_tab(index, output)?;
             return Ok(false);
         }
+        if key.modifiers == KeyModifiers::CONTROL {
+            match key.code {
+                KeyCode::Char('o') => {
+                    self.follow_link_back(output)?;
+                    return Ok(false);
+                }
+                KeyCode::Char('i') => {
+                    self.follow_link_forward(output)?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        if self.dispatch_document_navigation_key(key, false, output)? {
+            return Ok(false);
+        }
         let shift = key.modifiers == KeyModifiers::SHIFT;
         match key.code {
-            KeyCode::Char('b' | 'u') if key.modifiers == KeyModifiers::CONTROL => {
-                self.move_view(Axis::Vertical, false, true, true, output)?
-            }
-            KeyCode::Char('f' | 'd') if key.modifiers == KeyModifiers::CONTROL => {
-                self.move_view(Axis::Vertical, true, true, true, output)?
-            }
-            KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
-                self.follow_link_back(output)?
-            }
-            KeyCode::Char('i') if key.modifiers == KeyModifiers::CONTROL => {
-                self.follow_link_forward(output)?
-            }
             KeyCode::Char(_)
                 if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {}
             KeyCode::Char('x') if self.session.pending_open.is_none() && !self.link_mode => {
@@ -3505,7 +3612,6 @@ impl App {
             KeyCode::Char('N') => self.navigate_search(false, output)?,
             KeyCode::Char('L') => self.toggle_link_mode(output)?,
             KeyCode::Char('B') => self.follow_link_forward(output)?,
-            KeyCode::Char('b') if shift => self.follow_link_forward(output)?,
             KeyCode::Char('b') => self.follow_link_back(output)?,
             KeyCode::Enter => self.open_link_picker(output)?,
             KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
@@ -3513,52 +3619,17 @@ impl App {
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
             KeyCode::Char('D') => self.duplicate_tab(output)?,
-            KeyCode::Char('d') if shift => self.duplicate_tab(output)?,
-            KeyCode::Char('d') => self.move_view(Axis::Vertical, true, true, true, output)?,
-            KeyCode::Char('u') if !shift => {
-                self.move_view(Axis::Vertical, false, true, true, output)?
-            }
             KeyCode::Tab => self.switch_tab(1, output)?,
             KeyCode::BackTab => self.switch_tab(-1, output)?,
-            KeyCode::Char('J') => self.page_step(true, output)?,
-            KeyCode::Char('j') if shift => self.page_step(true, output)?,
-            KeyCode::Char('K') => self.page_step(false, output)?,
-            KeyCode::Char('k') if shift => self.page_step(false, output)?,
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_view(Axis::Vertical, true, false, true, output)?
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_view(Axis::Vertical, false, false, true, output)?
-            }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.move_view(Axis::Vertical, true, true, true, output)?
-            }
-            KeyCode::PageUp | KeyCode::Backspace => {
-                self.move_view(Axis::Vertical, false, true, true, output)?
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.move_view(Axis::Horizontal, true, false, true, output)?
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.move_view(Axis::Horizontal, false, false, true, output)?
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
-            KeyCode::Char('G') | KeyCode::End => {
-                self.set_page_vertically(self.tab().page_count - 1, output)?
-            }
-            KeyCode::Char('m') => self.cycle_fit(output)?,
-            KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(output)?,
-            KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(output)?,
+            KeyCode::Char('+' | '=') => self.zoom_in(output)?,
+            KeyCode::Char('-' | '_') => self.zoom_out(output)?,
             KeyCode::Char('0') => self.reset_zoom(output)?,
-            KeyCode::Char('i') => self.toggle_invert(output)?,
             KeyCode::Char('S') => self.toggle_smooth_scroll(output)?,
-            KeyCode::Char('s') if shift => self.toggle_smooth_scroll(output)?,
             KeyCode::Char('p') => self.toggle_performance(output)?,
             KeyCode::Char('t') => self.open_outline(output)?,
             KeyCode::Char('T') => self.open_theme_picker(output)?,
             KeyCode::Char('y') => self.request_copy(output)?,
             KeyCode::Char('R') => self.reload_config(output)?,
-            KeyCode::Char('r') if shift => self.reload_config(output)?,
             _ => {}
         }
         Ok(false)
@@ -3591,11 +3662,7 @@ impl App {
     ) -> Result<(), AppError> {
         self.tab_mut().search.initial_navigation_pending = false;
         let viewport = self.viewport()?;
-        if self.viewer.continuous_scroll
-            && axis == Axis::Vertical
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
-        {
+        if self.continuous_view() && axis == Axis::Vertical {
             let pixels = if large {
                 u32::from(viewport.pixel_height) * self.viewer.page_scroll_percent as u32 / 100
             } else {
@@ -3622,10 +3689,7 @@ impl App {
         let (max_x, max_y) = viewport.max_scroll(frame.width, frame.height);
         let mut min_x = 0_i64;
         let mut max_x = i64::from(max_x);
-        if self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
-        {
+        if self.continuous_view() {
             for page in &self.visible_pages {
                 let origin = content_horizontal_scroll(0, &frame, &page.frame, viewport);
                 min_x = min_x.min(-origin);
@@ -3687,13 +3751,61 @@ impl App {
     }
 
     fn input_wait(&self) -> Duration {
-        let background_wait = Duration::from_millis(10);
-        if self.smooth_scroll_remaining == 0 || self.pending_vertical_scroll != 0 {
-            return background_wait;
+        let fast_wait = Duration::from_millis(10);
+        if self.smooth_scroll_remaining != 0 && self.pending_vertical_scroll == 0 {
+            return Duration::from_millis(self.viewer.scroll_frame_ms)
+                .saturating_sub(self.smooth_scroll_tick.elapsed())
+                .min(fast_wait);
         }
-        Duration::from_millis(self.viewer.scroll_frame_ms)
-            .saturating_sub(self.smooth_scroll_tick.elapsed())
-            .min(background_wait)
+        if !self.pending.is_empty()
+            || self.session.pending_open.is_some()
+            || self.navigation.forward.is_some()
+            || self.navigation.inverse.is_some()
+            || self.focus_task.is_some()
+            || self.focus_waiting.is_some()
+            || self.pending_vertical_scroll != 0
+            || self.label_loading
+            || self
+                .forward_listener
+                .as_ref()
+                .is_some_and(crate::ipc::ForwardListener::has_in_flight_clients)
+            || self
+                .session
+                .tabs
+                .iter()
+                .any(|tab| tab.search.searching || tab.link_index.indexing)
+        {
+            return fast_wait;
+        }
+        let mut wait = if self.forward_socket.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+        let now = Instant::now();
+        for deadline in [
+            self.link_picker
+                .as_ref()
+                .and_then(|state| state.pending_preview.map(|pending| pending.ready_at)),
+            self.search_picker
+                .as_ref()
+                .and_then(|state| state.pending_preview.map(|(_, ready_at)| ready_at)),
+            self.navigation
+                .flash
+                .as_ref()
+                .and_then(|flash| flash.expires_at),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        for tab in &self.session.tabs {
+            if tab.watcher.candidate.is_some() {
+                wait = wait.min(tab.watcher.next_poll.saturating_duration_since(now));
+            }
+        }
+        wait.max(Duration::from_millis(1))
     }
 
     fn poll_smooth_scroll(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -3750,7 +3862,7 @@ impl App {
     }
 
     fn request_visible_page(&mut self, key: RenderKey) -> Result<(), AppError> {
-        if self.pending.insert(key) {
+        if self.pending.insert(key, false) != Some(false) {
             self.worker
                 .render(RenderRequest {
                     key,
@@ -3762,7 +3874,7 @@ impl App {
     }
 
     fn apply_vertical_scroll(&mut self, viewport: Viewport) -> Result<bool, AppError> {
-        let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
+        let cell = viewport.cell_size().1;
         while self.pending_vertical_scroll != 0 {
             let page = self.tab().page;
             let key = self.page_key(page, viewport);
@@ -3913,15 +4025,15 @@ impl App {
         let current_key = self.render_key(viewport);
         let page_frame = |page| {
             let key = self.page_key(page, viewport);
-            let frame = tab
-                .cache
+            tab.cache
                 .get(&key)
                 .map(Arc::as_ref)
                 .or_else(|| {
                     self.visible_pages
                         .iter()
                         .find(|visible| {
-                            visible.frame.key.page == page
+                            visible.frame.key.document_id == tab.document_id
+                                && visible.frame.key.page == page
                                 && visible.frame.key.fit == tab.fit
                                 && visible.frame.key.width == viewport.pixel_width
                                 && visible.frame.key.height == viewport.pixel_height
@@ -3940,16 +4052,7 @@ impl App {
                                 && frame.revision.pdf == tab.revision
                         })
                         .map(Arc::as_ref)
-                })?;
-            if frame.key.document_id != tab.document_id
-                || frame.key.fit != tab.fit
-                || frame.key.width != viewport.pixel_width
-                || frame.key.height != viewport.pixel_height
-                || frame.revision.pdf != tab.revision
-            {
-                return None;
-            }
-            Some(frame)
+                })
         };
         let page_size = |page| {
             page_frame(page).map(|frame| {
@@ -4011,9 +4114,7 @@ impl App {
                 });
                 Some((width, height, origin))
             },
-            self.viewer.continuous_scroll
-                && self.link_picker.is_none()
-                && self.search_picker.is_none(),
+            self.continuous_view(),
             page_size,
         );
         let (page, scroll_x, scroll_y) = match position {
@@ -4096,25 +4197,27 @@ impl App {
                 return Ok(());
             }
         };
-        self.apply_config(&config);
+        let warning = self.apply_config(&config);
         self.clear_viewer(output)?;
         self.reset_render_state();
         self.request_current(output)?;
         let viewport = self.viewport()?;
-        self.draw_status(output, viewport, "config reloaded")?;
+        let status = match warning {
+            Some(warning) => format!("config reloaded ({warning})"),
+            None => "config reloaded".to_string(),
+        };
+        self.draw_status(output, viewport, &status)?;
         Ok(())
     }
 
-    fn apply_config(&mut self, config: &Config) {
+    fn apply_config(&mut self, config: &Config) -> Option<String> {
         let mut defaults = AppDefaults::from_config(config, self.focus_token.clone());
         if config.session().is_none()
             && let Some(session) = self.session_name.as_deref()
+            && let Some(socket) = defaults.editor.socket_mut()
+            && let Ok(Some(prefixed)) = crate::config::prefixed_session_socket(session, socket)
         {
-            let mut selected = Config::default();
-            selected.editor = defaults.editor.clone();
-            if selected.select_session(Some(session)).is_ok() {
-                defaults.editor = selected.editor;
-            }
+            *socket = prefixed;
         }
         let fit_changed = self.default_fit != defaults.fit;
         let invert_changed = self.default_invert != defaults.invert;
@@ -4141,7 +4244,8 @@ impl App {
         }
         self.themes = defaults.themes;
         self.flash_font = None;
-        self.apply_theme(defaults.theme_index);
+        self.theme_index = defaults.theme_index;
+        self.set_palette(defaults.theme);
         for tab in &mut self.session.tabs {
             if fit_changed {
                 tab.fit = defaults.fit;
@@ -4153,6 +4257,43 @@ impl App {
                 tab.invert = defaults.invert;
             }
         }
+        defaults.theme_warning
+    }
+
+    pub(super) fn bump_generation(&mut self, invalidate_view: bool) {
+        self.generation = self.generation.wrapping_add(1);
+        if invalidate_view {
+            self.view_generation = self.generation;
+            self.last_render_view = None;
+            self.pending.clear();
+            self.worker.invalidate_view(self.view_generation);
+        } else {
+            self.pending.retain(|_, is_prefetch| *is_prefetch);
+        }
+        self.worker.begin_generation(self.generation);
+    }
+
+    fn sync_worker_view_window(&mut self, page: u32) {
+        let radius = u32::try_from(self.viewer.prefetch_pages)
+            .expect("validated prefetch_pages exceeds u32")
+            .max(1);
+        let active_doc = self.tab().document_id;
+        let max_visible = self
+            .visible_pages
+            .last()
+            .filter(|visible| visible.frame.key.document_id == active_doc)
+            .map_or(page, |visible| visible.frame.key.page)
+            .max(page);
+        let min_page = page.saturating_sub(radius);
+        let max_page = max_visible
+            .saturating_add(radius)
+            .min(self.tab().page_count.saturating_sub(1));
+        self.pending.retain(|key, is_prefetch| {
+            !*is_prefetch
+                || (key.document_id == active_doc && key.page >= min_page && key.page <= max_page)
+        });
+        self.worker
+            .set_view_state(self.view_generation, min_page, max_page);
     }
 
     fn request_current(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -4162,11 +4303,8 @@ impl App {
         self.missing_visible_page = None;
         self.status_line.clear();
         if self.label_query.is_some() {
-            self.worker.cancel_visible();
-            self.clear_label_overlay(output)?;
-            self.label_matches.clear();
+            self.reset_label_matches(output)?;
             self.label_request_id = self.label_request_id.wrapping_add(1).max(1);
-            self.label_input.clear();
         }
         if self.viewer.set_window_title && self.title_document != Some(self.tab().document_id) {
             let title: String = self
@@ -4185,9 +4323,16 @@ impl App {
         self.draw_tab_bar(output, viewport.columns)?;
         let key = self.render_key(viewport);
         self.desired_key = Some(key);
-        self.generation = self.generation.wrapping_add(1);
-        self.worker.begin_generation(self.generation);
-        self.pending.clear();
+        let signature = RenderKey {
+            page: 0,
+            search_request_id: self.tab().search.active_highlight_id(),
+            selected_link_ordinal: None,
+            ..key
+        };
+        let invalidate_view = self.last_render_view != Some(signature);
+        self.bump_generation(invalidate_view);
+        self.last_render_view = Some(signature);
+        self.sync_worker_view_window(key.page);
         self.performance_snapshot = None;
 
         if let Some(frame) = self.tab().cache.get(&key).cloned() {
@@ -4196,27 +4341,74 @@ impl App {
             self.prefetch_neighbors(key);
         } else {
             self.draw_status(output, viewport, "rendering")?;
-            if self.pending.insert(key) {
-                self.worker
-                    .render(RenderRequest {
-                        key,
-                        generation: self.generation,
-                    })
-                    .map_err(AppError::Renderer)?;
-            }
+            self.pending.insert(key, false);
+            self.worker
+                .render(RenderRequest {
+                    key,
+                    generation: self.generation,
+                })
+                .map_err(AppError::Renderer)?;
+        }
+        Ok(())
+    }
+
+    fn receive_render_error(
+        &mut self,
+        key: RenderKey,
+        generation: u64,
+        error: &str,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        self.pending.remove(&key);
+        if generation < self.view_generation {
+            return Ok(());
+        }
+        let mut active_failure = self.desired_key == Some(key);
+        if self
+            .pending_scale
+            .is_some_and(|(waiting, _, _)| waiting == key)
+        {
+            self.pending_scale = None;
+            active_failure = true;
+        }
+        if self.missing_visible_page == Some(key) {
+            self.missing_visible_page = None;
+            active_failure = true;
+        }
+        if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
+            self.pending_vertical_scroll = 0;
+            self.smooth_scroll_remaining = 0;
+            active_failure = true;
+        }
+        if self.desired_key == Some(key) {
+            self.finish_forward(Some(format!("render failed: {error}")));
+        }
+        if active_failure {
+            let viewport = self.viewport()?;
+            self.draw_status(output, viewport, &format!("render failed: {error}"))?;
         }
         Ok(())
     }
 
     fn receive_frame(&mut self, frame: Frame, output: &mut impl Write) -> Result<(), AppError> {
-        if frame.generation != self.generation {
+        if frame.generation < self.view_generation {
             return Ok(());
         }
+        let was_pending = self.pending.remove(&frame.key).is_some();
         let Some(index) = self.tab_index(frame.key.document_id) else {
             return Ok(());
         };
+        let viewport = self.viewport()?;
         let tab = &self.session.tabs[index];
-        if frame.key.page >= tab.page_count || frame.revision.pdf != tab.revision {
+        let expected_key = tab.render_key(viewport, self.link_mode, None);
+        if frame.key.page >= tab.page_count
+            || frame.revision.pdf != tab.revision
+            || !same_render_view(frame.key, expected_key)
+            || frame.key.link_mode != self.link_mode
+            || frame.key.link_highlight != expected_key.link_highlight
+            || frame.key.search_highlight != expected_key.search_highlight
+            || frame.key.search_request_id != tab.search.highlight_request_id(frame.key.page)
+        {
             return Ok(());
         }
         if frame.flash.is_some()
@@ -4225,7 +4417,8 @@ impl App {
             })
         {
             // ClearFlash may have arrived while this frame was rendering.
-            if self.pending.contains(&frame.key) {
+            if was_pending {
+                self.pending.insert(frame.key, false);
                 self.worker
                     .render(RenderRequest {
                         key: frame.key,
@@ -4236,8 +4429,17 @@ impl App {
             return Ok(());
         }
         let key = frame.key;
-        self.pending.remove(&key);
-        let frame = Arc::new(frame);
+        let frame_generation = frame.generation;
+        let frame = if frame.flash.is_none()
+            && let Some(existing) = self.session.tabs[index]
+                .cache
+                .get(&key)
+                .filter(|existing| existing.revision == frame.revision && existing.flash.is_none())
+        {
+            Arc::clone(existing)
+        } else {
+            Arc::new(frame)
+        };
         let current_page = self.session.tabs[index].page;
         // Keep one on-demand neighbor even with prefetch disabled: continuous
         // scrolling may need its dimensions before it becomes visible.
@@ -4257,20 +4459,21 @@ impl App {
             .map_or(current_page, |page| page.frame.key.page)
             .max(current_page)
             .saturating_add(cache_radius);
-        self.session.tabs[index]
-            .cache
-            .insert(key, Arc::clone(&frame));
-        self.session.tabs[index].cache.retain(|cached, _| {
-            cached.width == key.width
-                && cached.height == key.height
-                && cached.zoom == key.zoom
-                && cached.fit == key.fit
-                && cached.invert == key.invert
-                && cached.dark_mode_style == key.dark_mode_style
+        let selected_ordinal = self.render_key(viewport).selected_link_ordinal;
+        let link_mode = self.link_mode;
+        let tab = &mut self.session.tabs[index];
+        tab.cache.insert(key, Arc::clone(&frame));
+        let search = &tab.search;
+        tab.cache.retain(|cached, _| {
+            same_render_view(*cached, key)
+                && cached.link_mode == link_mode
+                && cached.link_highlight == key.link_highlight
+                && cached.search_highlight == key.search_highlight
+                && cached.search_request_id == search.highlight_request_id(cached.page)
                 && cached.page >= current_page.saturating_sub(cache_radius)
                 && cached.page <= visible_end
                 && (cached.selected_link_ordinal.is_none()
-                    || cached.selected_link_ordinal == key.selected_link_ordinal)
+                    || cached.selected_link_ordinal == selected_ordinal)
         });
         if let Some((waiting, fit, zoom)) = self.pending_scale
             && waiting == key
@@ -4280,7 +4483,7 @@ impl App {
             return Ok(());
         }
         if self.desired_key == Some(key) {
-            self.position_content_frame(&frame, self.viewport()?);
+            self.position_content_frame(&frame, viewport);
         }
 
         // Center across page boundaries only when the active display is continuous.
@@ -4303,7 +4506,6 @@ impl App {
             _ => None,
         };
         if let Some((left, right, top, bottom)) = flash_scroll {
-            let viewport = self.viewport()?;
             self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
                 self.tab().scroll_x.max(0) as u32,
                 frame.width,
@@ -4324,34 +4526,21 @@ impl App {
                 } else {
                     i64::from(viewport.pixel_height) * 8 / 100
                 };
-            if self.viewer.continuous_scroll
-                && self.link_picker.is_none()
-                && self.search_picker.is_none()
-            {
+            if self.continuous_view() {
                 self.pending_vertical_scroll = target;
             } else {
                 let tab = self.tab_mut();
                 tab.scroll_y = target.max(0) as u32;
-                let updated = ViewPosition {
-                    page: tab.page,
-                    scroll_x: tab.scroll_x,
-                    scroll_y: tab.scroll_y,
-                    center_content: tab.center_content,
-                };
+                let updated = tab.view_position();
                 tab.link_history.update_tip(updated);
             }
         }
 
         if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
-            if self.apply_vertical_scroll(self.viewport()?)? {
+            if self.apply_vertical_scroll(viewport)? {
                 if flash_scroll.is_some() {
                     let tab = self.tab_mut();
-                    let updated = ViewPosition {
-                        page: tab.page,
-                        scroll_x: tab.scroll_x,
-                        scroll_y: tab.scroll_y,
-                        center_content: tab.center_content,
-                    };
+                    let updated = tab.view_position();
                     tab.link_history.update_tip(updated);
                 }
                 let rest = self.smooth_scroll_remaining;
@@ -4360,9 +4549,7 @@ impl App {
             }
             return Ok(());
         }
-        if self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
+        if self.continuous_view()
             && self.desired_key != Some(key)
             && (self.missing_visible_page == Some(key)
                 || self.visible_pages.iter().any(|page| page.frame.key == key))
@@ -4371,18 +4558,19 @@ impl App {
         }
 
         if self.desired_key == Some(key) {
-            let viewport = self.viewport()?;
             let current_key = self.render_key(viewport);
             if current_key == key {
+                if was_pending && frame_generation < self.generation {
+                    // Cancel the duplicate priority render now satisfied by an in-flight prefetch.
+                    self.bump_generation(false);
+                    if let Some((waiting, _, _)) = self.pending_scale {
+                        self.request_visible_page(waiting)?;
+                    }
+                }
                 self.draw_frame(&frame, viewport, output)?;
                 if flash_scroll.is_some() {
                     let tab = self.tab_mut();
-                    let updated = ViewPosition {
-                        page: tab.page,
-                        scroll_x: tab.scroll_x,
-                        scroll_y: tab.scroll_y,
-                        center_content: tab.center_content,
-                    };
+                    let updated = tab.view_position();
                     tab.link_history.update_tip(updated);
                 }
                 self.prefetch_neighbors(key);
@@ -4401,6 +4589,12 @@ impl App {
         tab.scroll_x = scroll_x;
         tab.scroll_y = scroll_y;
         tab.center_content = false;
+    }
+
+    fn allocate_image_id(&mut self) -> u32 {
+        let id = self.next_image_id;
+        self.next_image_id = id.wrapping_add(1).max(1);
+        id
     }
 
     fn draw_frame(
@@ -4431,10 +4625,7 @@ impl App {
             if flash.positioning_pending || self.pending_vertical_scroll != 0 {
                 return None;
             }
-            if self.viewer.continuous_scroll
-                && self.link_picker.is_none()
-                && self.search_picker.is_none()
-            {
+            if self.continuous_view() {
                 self.visible_pages
                     .iter()
                     .find(|page| matches(&page.frame))
@@ -4473,7 +4664,17 @@ impl App {
                         .as_mut()
                         .and_then(|pending| pending.request.warning.take())
                     {
-                        self.draw_status(output, viewport, &format!("warning: {warning}"))?;
+                        let label =
+                            if warning == "assuming saved source is unchanged since compilation" {
+                                if highlight.word_precise {
+                                    "forward search"
+                                } else {
+                                    "forward search (SyncTeX region; no unique source word)"
+                                }
+                            } else {
+                                "warning"
+                            };
+                        self.draw_status(output, viewport, &format!("{label}: {warning}"))?;
                     } else if !highlight.word_precise {
                         self.draw_status(
                             output,
@@ -4504,31 +4705,32 @@ impl App {
                 .is_none_or(|state| state.preview_origin.is_none());
             if let Some(left_ratio) = destination.left_ratio {
                 let target_x = left_ratio * frame.width as f32;
+                let base_x = if self.tab().fit == FitMode::Content {
+                    content_scroll(frame, viewport).0
+                } else {
+                    self.tab().scroll_x
+                };
                 self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
-                    self.tab().scroll_x.max(0) as u32,
+                    base_x.max(0) as u32,
                     frame.width,
                     u32::from(viewport.pixel_width),
                     target_x,
                     target_x,
                 ) as i64;
+            } else if self.tab().fit == FitMode::Content
+                && let Some(pan_x) = destination.content_pan_x
+            {
+                self.tab_mut().scroll_x = content_scroll(frame, viewport).0 + pan_x;
             }
             if let Some(top_ratio) = destination.top_ratio {
                 self.tab_mut().scroll_y = (top_ratio * frame.height as f32).round() as u32;
             }
         }
-        if self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
-        {
+        if self.continuous_view() {
             let result = self.draw_continuous(frame, viewport, output);
             if resolved_destination {
                 let tab = self.tab_mut();
-                let updated = ViewPosition {
-                    page: tab.page,
-                    scroll_x: tab.scroll_x,
-                    scroll_y: tab.scroll_y,
-                    center_content: tab.center_content,
-                };
+                let updated = tab.view_position();
                 tab.link_history.update_tip(updated);
             }
             return result;
@@ -4545,12 +4747,7 @@ impl App {
         self.tab_mut().scroll_y = placement.scroll_y;
         if resolved_destination {
             let tab = self.tab_mut();
-            let updated = ViewPosition {
-                page: tab.page,
-                scroll_x: tab.scroll_x,
-                scroll_y: tab.scroll_y,
-                center_content: tab.center_content,
-            };
+            let updated = tab.view_position();
             tab.link_history.update_tip(updated);
         }
         let retained_id = self
@@ -4558,13 +4755,7 @@ impl App {
             .as_ref()
             .filter(|previous| Arc::ptr_eq(&previous.frame, frame))
             .map(|previous| previous.image_id);
-        let image_id = if let Some(id) = retained_id {
-            id
-        } else {
-            let id = self.next_image_id;
-            self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
-            id
-        };
+        let image_id = retained_id.unwrap_or_else(|| self.allocate_image_id());
         let original = PositionedImage {
             left: placement.left,
             top: viewport.top,
@@ -4592,17 +4783,7 @@ impl App {
         self.prepare_image_canvas(output, viewport)?;
         execute!(output, MoveTo(positioned.left, positioned.top))?;
         let transfer_started = Instant::now();
-        if retained_id.is_some() {
-            kitty::place_image(output, positioned.placement)?;
-        } else {
-            kitty::transmit_compressed_rgba(
-                output,
-                &frame.compressed_rgba,
-                frame.width,
-                frame.height,
-                positioned.placement,
-            )?;
-        }
+        write_page_image(output, frame, positioned.placement, retained_id.is_some())?;
         let transfer_elapsed = transfer_started.elapsed();
         if let Some(previous) = self.visible_page.replace(VisiblePage {
             frame: Arc::clone(frame),
@@ -4614,51 +4795,16 @@ impl App {
             kitty::delete_image(output, previous.image_id)?;
         }
         self.submitted_key = Some(frame.key);
-        let snapshot = PerformanceSnapshot {
-            render_ms: frame.render_elapsed.as_millis(),
-            dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
-            highlight_ms: frame.highlight_elapsed.map(|elapsed| elapsed.as_millis()),
-            compression_ms: frame.compression_elapsed.as_millis(),
-            transfer_ms: transfer_elapsed.as_millis(),
-            link_count: frame.links.len(),
-        };
+        let snapshot = PerformanceSnapshot::from_frame(frame, transfer_elapsed);
         self.performance_snapshot = Some(snapshot);
-        let state = snapshot.status(self.show_performance, self.link_mode);
-        let links = self.tab().link_index.links.clone();
-        let outline = Arc::clone(&self.tab().outline);
-        let progress = LinkIndexProgress::from(&self.tab().link_index);
-        let search = self.tab().search.clone();
-        let mut schedule_link_preview = false;
-        if let Some(link_picker) = &mut self.link_picker {
-            let selection_before = link_picker.selection_key;
-            link_picker.sync(frame.key.page, &links, progress.indexing);
-            schedule_link_preview = selection_before != link_picker.selection_key
-                && link_picker.focus == LinkPickerFocus::Links;
-            let link_picker = link_picker.clone();
-            draw_link_picker_terminal_unsynchronized(
-                output,
-                link_picker_area(viewport),
-                LinkPickerDocument::new(&links, &outline),
-                &link_picker,
-                progress,
-                self.link_picker_geometry,
-                self.theme,
-            )?;
-        } else if let Some(search_picker) = &mut self.search_picker {
-            search_picker.sync(frame.key.page, &search.matches);
-            let search_picker = search_picker.clone();
-            draw_search_picker_terminal_unsynchronized(
-                output,
-                link_picker_area(viewport),
-                &search,
-                &outline,
-                &search_picker,
-                self.link_picker_geometry,
-                self.theme,
-            )?;
-        }
-        if schedule_link_preview {
-            self.schedule_link_preview();
+        let state = self
+            .startup_warning
+            .take()
+            .unwrap_or_else(|| snapshot.status(self.show_performance, self.link_mode));
+        if self.link_picker.is_some() {
+            self.paint_link_picker(frame.key.page, viewport, output)?;
+        } else if self.search_picker.is_some() {
+            self.paint_search_picker(frame.key.page, viewport, output)?;
         }
         self.draw_status(output, viewport, &state)?;
         Ok(())
@@ -4679,7 +4825,7 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let cell = (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1);
+        let cell = viewport.cell_size().1;
         let max_y = if self.tab().page + 1 == self.tab().page_count {
             frame
                 .height
@@ -4745,16 +4891,11 @@ impl App {
                 top,
             ) {
                 let row = (top / cell) as u16;
-                let retained = old_pages
+                let retained_id = old_pages
                     .iter()
-                    .find(|old| Arc::ptr_eq(&old.frame, &rendered));
-                let image_id = if let Some(old) = retained {
-                    old.image_id
-                } else {
-                    let id = self.next_image_id;
-                    self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
-                    id
-                };
+                    .find(|old| Arc::ptr_eq(&old.frame, &rendered))
+                    .map(|old| old.image_id);
+                let image_id = retained_id.unwrap_or_else(|| self.allocate_image_id());
                 let kitty_placement = Placement {
                     image_id,
                     columns: 0,
@@ -4764,17 +4905,7 @@ impl App {
                     crop: placement.crop,
                 };
                 execute!(output, MoveTo(placement.left, viewport.top + row))?;
-                if retained.is_some() {
-                    kitty::place_image(output, kitty_placement)?;
-                } else {
-                    kitty::transmit_compressed_rgba(
-                        output,
-                        &rendered.compressed_rgba,
-                        rendered.width,
-                        rendered.height,
-                        kitty_placement,
-                    )?;
-                }
+                write_page_image(output, &rendered, kitty_placement, retained_id.is_some())?;
                 self.visible_pages.push(VisiblePage {
                     frame: rendered,
                     placement,
@@ -4809,20 +4940,13 @@ impl App {
         }
         self.visible_page = self.visible_pages.first().cloned();
         self.submitted_key = Some(frame.key);
-        let snapshot = PerformanceSnapshot {
-            render_ms: frame.render_elapsed.as_millis(),
-            dark_mode_ms: frame.dark_mode_elapsed.map(|elapsed| elapsed.as_millis()),
-            highlight_ms: frame.highlight_elapsed.map(|elapsed| elapsed.as_millis()),
-            compression_ms: frame.compression_elapsed.as_millis(),
-            transfer_ms: started.elapsed().as_millis(),
-            link_count: frame.links.len(),
-        };
+        let snapshot = PerformanceSnapshot::from_frame(frame, started.elapsed());
         self.performance_snapshot = Some(snapshot);
-        self.draw_status(
-            output,
-            viewport,
-            &snapshot.status(self.show_performance, self.link_mode),
-        )?;
+        let state = self
+            .startup_warning
+            .take()
+            .unwrap_or_else(|| snapshot.status(self.show_performance, self.link_mode));
+        self.draw_status(output, viewport, &state)?;
         Ok(())
     }
 
@@ -4831,10 +4955,7 @@ impl App {
         mouse: MouseEvent,
         viewport: Viewport,
     ) -> Option<(Arc<Frame>, ImagePlacement, u16)> {
-        if self.viewer.continuous_scroll
-            && self.link_picker.is_none()
-            && self.search_picker.is_none()
-        {
+        if self.continuous_view() {
             return self
                 .visible_pages
                 .iter()
@@ -4963,6 +5084,7 @@ impl App {
     }
 
     fn prefetch_neighbors(&mut self, key: RenderKey) {
+        self.sync_worker_view_window(key.page);
         let page_count = self.tab().page_count;
         let max_distance = u32::try_from(self.viewer.prefetch_pages)
             .expect("validated prefetch_pages exceeds u32")
@@ -4984,7 +5106,8 @@ impl App {
                 ..key
             };
             let cached = self.tab().cache.contains_key(&neighbor);
-            if !cached && self.pending.insert(neighbor) {
+            if !cached && !self.pending.contains_key(&neighbor) {
+                self.pending.insert(neighbor, true);
                 self.worker.prefetch(RenderRequest {
                     key: neighbor,
                     generation: self.generation,
@@ -5090,9 +5213,14 @@ impl App {
 
     fn reset_render_state(&mut self) {
         self.desired_key = None;
+        self.last_render_view = None;
         self.pending.clear();
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
+    }
+
+    fn continuous_view(&self) -> bool {
+        self.viewer.continuous_scroll && self.link_picker.is_none() && self.search_picker.is_none()
     }
 
     fn viewport(&self) -> io::Result<Viewport> {
@@ -5125,17 +5253,10 @@ impl App {
         let Some((frame, placement, image_top)) = self.page_at_mouse(mouse, viewport) else {
             return Ok(());
         };
-        let key = frame.key;
-        let Some(cell) = mouse
-            .row
-            .checked_sub(image_top)
-            .and_then(|row| placement.source_cell(mouse.column, row, frame.width, frame.height))
-        else {
+        let Some(pixel) = source_pixel_at_cell(placement, image_top, &frame, mouse) else {
             return Ok(());
         };
-        let pixel_x = cell.x + cell.width / 2;
-        let pixel_y = cell.y + cell.height / 2;
-        self.begin_inverse_at(key, (pixel_x, pixel_y), viewport, output)
+        self.begin_inverse_at(frame.key, pixel, viewport, output)
     }
     fn begin_inverse_at(
         &mut self,
@@ -5157,13 +5278,9 @@ impl App {
         };
         let request_id = self.navigation.next_request_id;
         self.navigation.next_request_id = request_id.wrapping_add(1);
-        if let Some(previous) = self.navigation.inverse.take() {
-            previous.operation.cancel();
-        }
         self.navigation.inverse = Some(PendingInverse {
             revision: frame.revision,
             operation: crate::process::Operation::default(),
-            stage: InverseStage::HitTest,
             document_id: key.document_id,
             page: key.page,
             request_id,
@@ -5179,7 +5296,7 @@ impl App {
         click: SynctexClick,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let Some(mut pending) = self.navigation.inverse.take() else {
+        let Some(pending) = self.navigation.inverse.take() else {
             return Ok(());
         };
         if pending.document_id != click.document_id
@@ -5212,25 +5329,15 @@ impl App {
                     .source_maps
                     .get(&self.session.tabs[index].path)
                     .cloned(),
-                source_snapshot: self
-                    .navigation
-                    .source_snapshots
-                    .get(&self.session.tabs[index].path)
-                    .and_then(|source| source.snapshot_for_revision(pending.revision))
-                    .map(Path::to_path_buf),
                 best_guess: self
                     .navigation
-                    .source_snapshots
-                    .get(&self.session.tabs[index].path)
-                    .is_some_and(|source| source.best_guess),
+                    .best_guess
+                    .contains(&self.session.tabs[index].path),
                 operation: pending.operation.clone(),
             })
         })();
         match result {
-            Ok(()) => {
-                pending.stage = InverseStage::Resolving;
-                self.navigation.inverse = Some(pending);
-            }
+            Ok(()) => self.navigation.inverse = Some(pending),
             Err(error) => self.draw_status(
                 output,
                 self.viewport()?,
@@ -5266,14 +5373,36 @@ impl App {
                         )?;
                     }
                     let shown = target.file.rsplit('/').next().unwrap_or(&target.file);
-                    let detail = result.warning.as_deref().unwrap_or(
-                        match (target.precise, clipboard_only) {
+                    let mut warning = result.warning;
+                    if let Some(warning) = &mut warning {
+                        for assumption in [
+                            "assuming saved source is unchanged since compilation",
+                            "best-guess navigation: assuming saved source is unchanged since compilation",
+                        ] {
+                            if let Some(start) = warning.find(assumption) {
+                                let end = start + assumption.len();
+                                if (start == 0 || warning[..start].ends_with("; "))
+                                    && (end == warning.len() || warning[end..].starts_with("; "))
+                                {
+                                    let range = if end < warning.len() {
+                                        start..end + 2
+                                    } else {
+                                        start.saturating_sub(2)..end
+                                    };
+                                    warning.replace_range(range, "");
+                                }
+                            }
+                        }
+                    }
+                    let detail = warning
+                        .as_deref()
+                        .filter(|warning| !warning.is_empty())
+                        .unwrap_or(match (target.precise, clipboard_only) {
                             (true, true) => "word, copied",
                             (false, true) => "line only, copied",
                             (true, false) => "word",
                             (false, false) => "line only",
-                        },
-                    );
+                        });
                     self.draw_status(
                         output,
                         viewport,
@@ -5310,6 +5439,21 @@ fn write_clipboard_osc52(output: &mut impl Write, text: &str) -> io::Result<()> 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     write!(output, "\x1b]52;c;{encoded}\x07")?;
     output.flush()
+}
+
+fn source_pixel_at_cell(
+    placement: ImagePlacement,
+    image_top: u16,
+    frame: &Frame,
+    mouse: MouseEvent,
+) -> Option<(u32, u32)> {
+    let cell = placement.source_cell(
+        mouse.column,
+        mouse.row.checked_sub(image_top)?,
+        frame.width,
+        frame.height,
+    )?;
+    Some((cell.x + cell.width / 2, cell.y + cell.height / 2))
 }
 
 fn link_at_cell(
@@ -5390,15 +5534,23 @@ fn same_render_view(a: RenderKey, b: RenderKey) -> bool {
         && a.dark_mode_style == b.dark_mode_style
 }
 
-fn visible_match_points(
-    rects: &[crate::pdf::PixelRect],
+struct ProjectedMatch {
+    source: crate::pdf::PixelRect,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn project_match_rect(
+    rect: &crate::pdf::PixelRect,
     placement: ImagePlacement,
     top: u16,
-    frame_width: u32,
-    frame_height: u32,
+    frame_size: (u32, u32),
     viewport: Viewport,
     cell_size: (u32, u32),
-) -> Option<((u32, u32), (u32, u32))> {
+) -> Option<ProjectedMatch> {
+    let (frame_width, frame_height) = frame_size;
     let (cell_width, cell_height) = cell_size;
     let crop = placement.crop.unwrap_or(crate::kitty::Crop {
         x: 0,
@@ -5411,48 +5563,91 @@ fn visible_match_points(
     }
     let crop_right = crop.x.saturating_add(crop.width).min(frame_width);
     let crop_bottom = crop.y.saturating_add(crop.height).min(frame_height);
+    let x0 = rect.left.max(crop.x);
+    let x1 = rect.right.min(crop_right);
+    let y0 = rect.top.max(crop.y);
+    let y1 = rect.bottom.min(crop_bottom);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let native = placement.native_cell.is_some();
+    let source_width = x1 - x0;
+    let source_height = y1 - y0;
+    let x = u32::from(placement.left) * cell_width
+        + if native {
+            x0 - crop.x
+        } else {
+            (x0 - crop.x) * u32::from(placement.columns) * cell_width / crop.width
+        };
+    let page_y = u32::from(top.saturating_sub(viewport.top)) * cell_height;
+    let y = if native {
+        page_y + placement.offset_y + (y0 - crop.y)
+    } else {
+        page_y + (y0 - crop.y) * u32::from(placement.rows) * cell_height / crop.height
+    };
+    let width = if native {
+        source_width
+    } else {
+        source_width * u32::from(placement.columns) * cell_width / crop.width
+    };
+    let height = if native {
+        source_height
+    } else {
+        source_height * u32::from(placement.rows) * cell_height / crop.height
+    };
+    if width == 0
+        || height == 0
+        || x >= u32::from(viewport.pixel_width)
+        || y >= u32::from(viewport.pixel_height)
+    {
+        return None;
+    }
+    Some(ProjectedMatch {
+        source: crate::pdf::PixelRect {
+            left: x0,
+            right: x1,
+            top: y0,
+            bottom: y1,
+        },
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn visible_match_points(
+    rects: &[crate::pdf::PixelRect],
+    placement: ImagePlacement,
+    top: u16,
+    frame_width: u32,
+    frame_height: u32,
+    viewport: Viewport,
+    cell_size: (u32, u32),
+) -> Option<((u32, u32), (u32, u32))> {
     let mut hit = None;
     let mut anchor = None;
     for rect in rects {
-        let x0 = rect.left.max(crop.x);
-        let x1 = rect.right.min(crop_right);
-        let y0 = rect.top.max(crop.y);
-        let y1 = rect.bottom.min(crop_bottom);
-        if x0 >= x1 || y0 >= y1 {
+        let Some(projected) = project_match_rect(
+            rect,
+            placement,
+            top,
+            (frame_width, frame_height),
+            viewport,
+            cell_size,
+        ) else {
             continue;
-        }
-        let native = placement.native_cell.is_some();
-        let source_width = x1 - x0;
-        let source_height = y1 - y0;
-        let x = u32::from(placement.left) * cell_width
-            + if native {
-                x0 - crop.x
-            } else {
-                (x0 - crop.x) * u32::from(placement.columns) * cell_width / crop.width
-            };
-        let page_y = u32::from(top.saturating_sub(viewport.top)) * cell_height;
-        let y = if native {
-            page_y + placement.offset_y + (y0 - crop.y)
-        } else {
-            page_y + (y0 - crop.y) * u32::from(placement.rows) * cell_height / crop.height
         };
-        let width = if native {
-            source_width
-        } else {
-            source_width * u32::from(placement.columns) * cell_width / crop.width
-        };
-        let height = if native {
-            source_height
-        } else {
-            source_height * u32::from(placement.rows) * cell_height / crop.height
-        };
-        if width == 0
-            || height == 0
-            || x >= u32::from(viewport.pixel_width)
-            || y >= u32::from(viewport.pixel_height)
-        {
-            continue;
-        }
+        let ProjectedMatch {
+            source,
+            x,
+            y,
+            width,
+            height,
+        } = projected;
+        let (x0, y0) = (source.left, source.top);
+        let source_width = source.right - source.left;
+        let source_height = source.bottom - source.top;
         let visible_right = x.saturating_add(width).min(u32::from(viewport.pixel_width));
         let visible_bottom = y
             .saturating_add(height)
@@ -5611,7 +5806,7 @@ fn centered_scaled_view(
     let height = u32::from(viewport.pixel_height);
     let half_width = i64::from(width / 2);
     let half_height = i64::from(height / 2);
-    let gap = (height / u32::from(viewport.rows).max(1)).max(1);
+    let (cell_width, gap) = viewport.cell_size();
     let mut center_y = i64::from(scroll_y) + half_height;
     let mut geometry = page_size(page).ok_or(page)?;
     let initial_origin = geometry.2.unwrap_or(0);
@@ -5634,7 +5829,6 @@ fn centered_scaled_view(
     let center_x = if page_width < width {
         // Narrow images are centered by whole terminal cells; leftover pixels
         // stay on the right, not symmetrically around the image midpoint.
-        let cell_width = (width / u32::from(viewport.columns).max(1)).max(1);
         let left = u32::from(viewport.place(page_width, page_height, 0, 0).left) * cell_width;
         (width / 2).saturating_sub(left).min(page_width)
     } else {
@@ -5703,2638 +5897,20 @@ fn numbered_tab_index(key: KeyEvent) -> Option<usize> {
         .then(|| usize::from(digit as u8 - b'1'))
 }
 
-fn pick_pdf(
-    directory: PathBuf,
-    output: &mut impl Write,
-    theme: Palette,
-    interrupt: impl Fn() -> io::Result<bool>,
-) -> Result<Option<PathBuf>, AppError> {
-    let mut browser = BrowserState::new(directory);
-    browser.set_recents(crate::recent::load());
-    browser.preload_recursive();
-    let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::new(backend)?;
-    let mut redraw = true;
-    let mut visible_height = 1;
-    let mut filtering = false;
-
-    let selection = loop {
-        if interrupt()? {
-            break None;
-        }
-        if browser.poll_recursive() {
-            redraw = true;
-        }
-        if redraw {
-            terminal.autoresize()?;
-            let area = terminal.size()?;
-            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
-            browser.adjust_scroll(visible_height);
-            terminal.draw(|frame| draw_picker(frame, &browser, filtering, theme))?;
-            redraw = false;
-        }
-
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-        let key = match read_event()? {
-            Event::Key(key) => key,
-            Event::Resize(_, _) => {
-                redraw = true;
-                continue;
-            }
-            _ => continue,
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if apply_picker_navigation(&mut browser, key, visible_height, filtering) {
-            redraw = true;
-            continue;
-        }
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Esc if filtering => {
-                clear_picker_filter(&mut browser);
-                filtering = false;
-            }
-            KeyCode::Esc if !clear_picker_filter(&mut browser) => break None,
-            KeyCode::Esc => {}
-            KeyCode::Char('/') if !control && !alt => filtering = true,
-            KeyCode::Enter => {
-                if let Some(path) = browser.enter_selected() {
-                    break Some(path);
-                }
-            }
-            KeyCode::Backspace if filtering => {
-                browser.filter.pop();
-                browser.rebuild_filter();
-                browser.select_first();
-                browser.scroll_offset = 0;
-            }
-            KeyCode::Char(character) if filtering && !control && !alt => {
-                browser.filter.push(character);
-                browser.rebuild_filter();
-                browser.select_first();
-                browser.scroll_offset = 0;
-            }
-            _ => {}
-        }
-        redraw = true;
-    };
-    drop(terminal);
-    clear_picker(output, theme)?;
-    Ok(selection)
-}
-
-fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
-    execute!(
-        output,
-        SetBackgroundColor(theme.bg),
-        SetForegroundColor(theme.fg),
-        Hide,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )?;
-    output.flush()
-}
-
-fn show_help(
-    output: &mut impl Write,
-    theme: Palette,
-    interrupt: impl Fn() -> io::Result<bool>,
-) -> Result<(), AppError> {
-    let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::new(backend)?;
-    let mut redraw = true;
-
-    loop {
-        if interrupt()? {
-            break;
-        }
-        if redraw {
-            terminal.autoresize()?;
-            terminal.draw(|frame| draw_help_menu(frame, theme))?;
-            redraw = false;
-        }
-
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-        match read_event()? {
-            Event::Resize(_, _) => redraw = true,
-            Event::Key(key)
-                if key.kind == KeyEventKind::Press
-                    && matches!(
-                        key.code,
-                        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc
-                    ) =>
-            {
-                break;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn pick_theme(
-    themes: &[(String, Palette)],
-    current: usize,
-    output: &mut impl Write,
-    interrupt: impl Fn() -> io::Result<bool>,
-) -> Result<Option<usize>, AppError> {
-    let mut filter = String::new();
-    let mut filtered = filter_theme_indices(themes, &filter);
-    let mut selected = filtered
-        .iter()
-        .position(|index| *index == current)
-        .unwrap_or(0);
-    let mut filtering = false;
-    let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::new(backend)?;
-    let mut redraw = true;
-    let mut visible_height = 1;
-
-    let selection = loop {
-        if interrupt()? {
-            break None;
-        }
-        if redraw {
-            terminal.autoresize()?;
-            let area = terminal.size()?;
-            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
-            terminal.draw(|frame| {
-                draw_theme_picker(frame, themes, &filtered, selected, &filter, filtering)
-            })?;
-            redraw = false;
-        }
-
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-        let key = match read_event()? {
-            Event::Key(key) => key,
-            Event::Resize(_, _) => {
-                redraw = true;
-                continue;
-            }
-            _ => continue,
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let last = filtered.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Esc if filtering => {
-                let actual = filtered.get(selected).copied().unwrap_or(current);
-                filter.clear();
-                filtered = filter_theme_indices(themes, &filter);
-                selected = filtered
-                    .iter()
-                    .position(|index| *index == actual)
-                    .unwrap_or(0);
-                filtering = false;
-            }
-            KeyCode::Esc => break None,
-            KeyCode::Char('/') if !control && !alt => filtering = true,
-            KeyCode::Enter => break filtered.get(selected).copied(),
-            KeyCode::Down => {
-                selected = if selected == last { 0 } else { selected + 1 };
-            }
-            KeyCode::Up => {
-                selected = if selected == 0 { last } else { selected - 1 };
-            }
-            KeyCode::Char('j') if !filtering => {
-                selected = if selected == last { 0 } else { selected + 1 };
-            }
-            KeyCode::Char('k') if !filtering => {
-                selected = if selected == 0 { last } else { selected - 1 };
-            }
-            KeyCode::Char('f' | 'd') if control => {
-                selected = (selected + visible_height).min(last);
-            }
-            KeyCode::Char('b' | 'u') if control => {
-                selected = selected.saturating_sub(visible_height);
-            }
-            KeyCode::Char('g') if !filtering && !control && !alt => selected = 0,
-            KeyCode::Char('G') if !filtering && !control && !alt => selected = last,
-            KeyCode::Home => selected = 0,
-            KeyCode::End => selected = last,
-            KeyCode::PageDown => selected = (selected + visible_height).min(last),
-            KeyCode::PageUp => selected = selected.saturating_sub(visible_height),
-            KeyCode::Backspace if filtering => {
-                filter.pop();
-                filtered = filter_theme_indices(themes, &filter);
-                selected = 0;
-            }
-            KeyCode::Char(character) if filtering && !control && !alt => {
-                filter.push(character);
-                filtered = filter_theme_indices(themes, &filter);
-                selected = 0;
-            }
-            _ => continue,
-        }
-        redraw = true;
-    };
-    drop(terminal);
-    Ok(selection)
-}
-
-fn draw_link_picker_terminal(
-    output: &mut impl Write,
-    area: Rect,
-    document: LinkPickerDocument<'_>,
-    state: &LinkPickerState,
-    progress: LinkIndexProgress,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) -> io::Result<()> {
-    synchronized_output(output, |output| {
-        draw_link_picker_terminal_unsynchronized(
-            output, area, document, state, progress, geometry, theme,
-        )
-    })
-}
-
-fn draw_link_picker_terminal_unsynchronized(
-    output: &mut impl Write,
-    area: Rect,
-    document: LinkPickerDocument<'_>,
-    state: &LinkPickerState,
-    progress: LinkIndexProgress,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) -> io::Result<()> {
-    let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, area.right(), area.bottom())),
-        },
-    )?;
-    terminal
-        .draw(|frame| draw_link_picker(frame, area, document, state, progress, geometry, theme))?;
-    drop(terminal);
-    execute!(output, Hide)?;
-    Ok(())
-}
-
-fn draw_search_picker_terminal(
-    output: &mut impl Write,
-    area: Rect,
-    search: &SearchState,
-    outline: &[OutlineItem],
-    state: &SearchPickerState,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) -> io::Result<()> {
-    synchronized_output(output, |output| {
-        draw_search_picker_terminal_unsynchronized(
-            output, area, search, outline, state, geometry, theme,
-        )
-    })
-}
-
-fn draw_search_picker_terminal_unsynchronized(
-    output: &mut impl Write,
-    area: Rect,
-    search: &SearchState,
-    outline: &[OutlineItem],
-    state: &SearchPickerState,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) -> io::Result<()> {
-    let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, area.right(), area.bottom())),
-        },
-    )?;
-    terminal
-        .draw(|frame| draw_search_picker(frame, area, search, outline, state, geometry, theme))?;
-    drop(terminal);
-    execute!(output, Hide)?;
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PositionedImage {
-    left: u16,
-    top: u16,
-    placement: Placement,
-}
-
-fn clear_image_canvas(output: &mut impl Write, viewport: Viewport) -> io::Result<()> {
-    execute!(output, ResetColor)?;
-    for row in viewport.top..viewport.top.saturating_add(viewport.rows) {
-        execute!(output, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LinkPickerImage {
-    image_id: u32,
-    source_width: u32,
-    source_height: u32,
-    crop: Option<kitty::Crop>,
-    cell_width: u32,
-    cell_height: u32,
-    original: PositionedImage,
-}
-
-impl LinkPickerImage {
-    fn new(image_id: u32, frame: &Frame, placement: ImagePlacement, viewport: Viewport) -> Self {
-        let (source_width, source_height) = placement
-            .crop
-            .map(|crop| (crop.width, crop.height))
-            .unwrap_or((frame.width, frame.height));
-        Self {
-            image_id,
-            source_width,
-            source_height,
-            crop: placement.crop,
-            cell_width: (u32::from(viewport.pixel_width) / u32::from(viewport.columns)).max(1),
-            cell_height: (u32::from(viewport.pixel_height) / u32::from(viewport.rows)).max(1),
-            original: PositionedImage {
-                left: placement.left,
-                top: viewport.top,
-                placement: Placement {
-                    image_id,
-                    columns: if placement.native_cell.is_some() {
-                        0
-                    } else {
-                        placement.columns
-                    },
-                    rows: if placement.native_cell.is_some() {
-                        0
-                    } else {
-                        placement.rows
-                    },
-                    offset_y: placement.offset_y,
-                    z_index: PAGE_IMAGE_Z_INDEX,
-                    crop: placement.crop,
-                },
-            },
-        }
-    }
-
-    fn fit(self, pane: Rect) -> PositionedImage {
-        let max_width = u32::from(pane.width).saturating_mul(self.cell_width);
-        let max_height = u32::from(pane.height).saturating_mul(self.cell_height);
-        let scale = (max_width as f64 / f64::from(self.source_width))
-            .min(max_height as f64 / f64::from(self.source_height))
-            .min(1.0);
-        let pixel_width = (f64::from(self.source_width) * scale).round().max(1.0) as u32;
-        let pixel_height = (f64::from(self.source_height) * scale).round().max(1.0) as u32;
-        let columns = pixel_width
-            .div_ceil(self.cell_width)
-            .min(u32::from(pane.width))
-            .max(1) as u16;
-        let rows = pixel_height
-            .div_ceil(self.cell_height)
-            .min(u32::from(pane.height))
-            .max(1) as u16;
-        PositionedImage {
-            left: pane.x + pane.width.saturating_sub(columns) / 2,
-            top: pane.y + pane.height.saturating_sub(rows) / 2,
-            placement: Placement {
-                image_id: self.image_id,
-                columns,
-                rows,
-                offset_y: 0,
-                z_index: PAGE_IMAGE_Z_INDEX,
-                crop: self.crop,
-            },
-        }
-    }
-}
-
-fn position_link_picker_image(
-    image: LinkPickerImage,
-    preview: Rect,
-    layout: LinkPickerLayout,
-) -> PositionedImage {
-    if layout == LinkPickerLayout::Floating {
-        image.original
-    } else {
-        image.fit(preview)
-    }
-}
-
-fn link_picker_area(viewport: Viewport) -> Rect {
-    Rect::new(0, viewport.top, viewport.columns, viewport.rows)
-}
-
-fn resolved_link_picker_layout(area: Rect, layout: LinkPickerLayout) -> LinkPickerLayout {
-    match layout {
-        LinkPickerLayout::Auto if u32::from(area.width) >= u32::from(area.height) * 2 => {
-            LinkPickerLayout::Vertical
-        }
-        LinkPickerLayout::Auto => LinkPickerLayout::Horizontal,
-        layout => layout,
-    }
-}
-
-fn next_link_picker_layout(area: Rect, layout: LinkPickerLayout) -> LinkPickerLayout {
-    match resolved_link_picker_layout(area, layout) {
-        LinkPickerLayout::Vertical => LinkPickerLayout::Horizontal,
-        LinkPickerLayout::Horizontal => LinkPickerLayout::Floating,
-        LinkPickerLayout::Floating => LinkPickerLayout::Vertical,
-        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
-    }
-}
-
-const fn link_picker_layout_name(layout: LinkPickerLayout) -> &'static str {
-    match layout {
-        LinkPickerLayout::Auto => "auto",
-        LinkPickerLayout::Vertical => "vertical",
-        LinkPickerLayout::Horizontal => "horizontal",
-        LinkPickerLayout::Floating => "floating",
-    }
-}
-
-fn link_picker_layout_status(area: Rect, layout: LinkPickerLayout) -> String {
-    if layout == LinkPickerLayout::Auto {
-        format!(
-            "auto/{}",
-            link_picker_layout_name(resolved_link_picker_layout(area, layout))
-        )
-    } else {
-        link_picker_layout_name(layout).to_string()
-    }
-}
-
-fn link_picker_focus_for_key(
-    current: LinkPickerFocus,
-    layout: LinkPickerLayout,
-    key: KeyEvent,
-) -> Option<LinkPickerFocus> {
-    if layout == LinkPickerLayout::Floating {
-        return None;
-    }
-    let plain = !key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-    match key.code {
-        KeyCode::Char('h') if plain => Some(LinkPickerFocus::Document),
-        KeyCode::Char('l') if plain => Some(LinkPickerFocus::Links),
-        KeyCode::Tab | KeyCode::BackTab => Some(match current {
-            LinkPickerFocus::Document => LinkPickerFocus::Links,
-            LinkPickerFocus::Links => LinkPickerFocus::Document,
-        }),
-        _ => None,
-    }
-}
-
-fn link_picker_panes(area: Rect, geometry: LinkPickerGeometry) -> (Rect, Rect) {
-    let picker_percent = geometry.split_percent.clamp(20, 80);
-    let document_percent = 100 - picker_percent;
-    let panes = match resolved_link_picker_layout(area, geometry.layout) {
-        LinkPickerLayout::Vertical => Layout::horizontal([
-            Constraint::Percentage(document_percent),
-            Constraint::Percentage(picker_percent),
-        ])
-        .split(area),
-        LinkPickerLayout::Horizontal => Layout::vertical([
-            Constraint::Percentage(document_percent),
-            Constraint::Percentage(picker_percent),
-        ])
-        .split(area),
-        LinkPickerLayout::Floating => return (area, picker_rect(area)),
-        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
-    };
-    (panes[0], panes[1])
-}
-
-fn place_positioned_image(output: &mut impl Write, image: PositionedImage) -> io::Result<()> {
-    execute!(output, MoveTo(image.left, image.top))?;
-    kitty::place_image(output, image.placement)
-}
-
-fn show_link_picker_split(
-    output: &mut impl Write,
-    area: Rect,
-    image: LinkPickerImage,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) -> io::Result<()> {
-    let (preview, pane) = link_picker_panes(area, geometry);
-    execute!(
-        output,
-        SetBackgroundColor(theme.bg_dark),
-        SetForegroundColor(theme.fg)
-    )?;
-    for row in pane.y..pane.y.saturating_add(pane.height) {
-        execute!(
-            output,
-            MoveTo(pane.x, row),
-            Print(" ".repeat(usize::from(pane.width)))
-        )?;
-    }
-    if geometry.layout != LinkPickerLayout::Floating {
-        place_positioned_image(output, image.fit(preview))?;
-    }
-    execute!(output, Hide)?;
-    output.flush()
-}
-
-fn clear_link_picker_pane(
-    output: &mut impl Write,
-    area: Rect,
-    geometry: LinkPickerGeometry,
-) -> io::Result<()> {
-    let (_, pane) = link_picker_panes(area, geometry);
-    execute!(output, ResetColor)?;
-    for row in pane.y..pane.y.saturating_add(pane.height) {
-        execute!(
-            output,
-            MoveTo(pane.x, row),
-            Print(" ".repeat(usize::from(pane.width)))
-        )?;
-    }
-    output.flush()
-}
-
-fn restore_link_picker_split(
-    output: &mut impl Write,
-    area: Rect,
-    image: LinkPickerImage,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) -> io::Result<()> {
-    clear_link_picker_pane(output, area, geometry)?;
-    place_positioned_image(output, image.original)?;
-    execute!(
-        output,
-        SetBackgroundColor(theme.bg),
-        SetForegroundColor(theme.fg),
-        Hide
-    )?;
-    output.flush()
-}
-
-fn link_number_index(input: &str, link_count: usize) -> Option<usize> {
-    input
-        .parse::<usize>()
-        .ok()
-        .filter(|number| (1..=link_count).contains(number))
-        .map(|number| number - 1)
-}
-
-fn update_link_number_selection(
-    input: &mut String,
-    digit: char,
-    link_count: usize,
-) -> Option<usize> {
-    let mut candidate = input.clone();
-    candidate.push(digit);
-    if let Some(index) = link_number_index(&candidate, link_count) {
-        *input = candidate;
-        return Some(index);
-    }
-
-    input.clear();
-    input.push(digit);
-    if let Some(index) = link_number_index(input, link_count) {
-        Some(index)
-    } else {
-        input.clear();
-        None
-    }
-}
-
-fn link_picker_navigation_index(
-    selected: usize,
-    link_count: usize,
-    key: KeyEvent,
-    visible_height: usize,
-) -> Option<usize> {
-    if link_count == 0 {
-        return None;
-    }
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    match key.code {
-        KeyCode::Down => Some((selected + 1) % link_count),
-        KeyCode::Up => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
-        KeyCode::Char('j') if !control && !alt => Some((selected + 1) % link_count),
-        KeyCode::Char('k') if !control && !alt => {
-            Some(selected.checked_sub(1).unwrap_or(link_count - 1))
-        }
-        KeyCode::Char('f' | 'd') if control => {
-            Some((selected + visible_height).min(link_count - 1))
-        }
-        KeyCode::Char('b' | 'u') if control => Some(selected.saturating_sub(visible_height)),
-        KeyCode::Char('g') if !control && !alt => Some(0),
-        KeyCode::Char('G') if !control && !alt => Some(link_count - 1),
-        KeyCode::Home => Some(0),
-        KeyCode::End => Some(link_count - 1),
-        KeyCode::PageDown => Some((selected + visible_height).min(link_count - 1)),
-        KeyCode::PageUp => Some(selected.saturating_sub(visible_height)),
-        _ => None,
-    }
-}
-
-fn filter_document_links(links: &[DocumentLink], filter: &str) -> Vec<usize> {
-    let terms: Vec<_> = filter
-        .split_whitespace()
-        .map(|term| term.to_lowercase())
-        .collect();
-    if terms.is_empty() {
-        return (0..links.len()).collect();
-    }
-    let mut haystack = String::new();
-    links
-        .iter()
-        .enumerate()
-        .filter_map(|(index, link)| {
-            use std::fmt::Write as _;
-            haystack.clear();
-            match &link.target {
-                LinkTarget::Internal { page, .. } => {
-                    let _ = write!(
-                        haystack,
-                        "{} source page {} pdf page {}",
-                        link.label,
-                        link.source_page + 1,
-                        page + 1
-                    );
-                }
-                LinkTarget::Uri(uri) => {
-                    let _ = write!(
-                        haystack,
-                        "{} source page {} {}",
-                        link.label,
-                        link.source_page + 1,
-                        uri
-                    );
-                }
-            }
-            if haystack.is_ascii() {
-                haystack.make_ascii_lowercase();
-            } else {
-                haystack = haystack.to_lowercase();
-            }
-            terms
-                .iter()
-                .all(|term| haystack.contains(term))
-                .then_some(index)
-        })
-        .collect()
-}
-
-fn pick_outline(
-    items: &[OutlineItem],
-    current_page: u32,
-    output: &mut impl Write,
-    theme: Palette,
-    interrupt: impl Fn() -> io::Result<bool>,
-) -> Result<Option<u32>, AppError> {
-    let mut filter = String::new();
-    let mut filtered: Vec<usize> = (0..items.len()).collect();
-    let mut selected = outline_start_index(items, current_page);
-    let mut scroll_offset = 0usize;
-    let backend = CrosstermBackend::new(&mut *output);
-    let mut terminal = Terminal::new(backend)?;
-    let mut redraw = true;
-    let mut visible_height = 1;
-    let mut filtering = false;
-
-    let selection = loop {
-        if interrupt()? {
-            break None;
-        }
-        if redraw {
-            terminal.autoresize()?;
-            let area = terminal.size()?;
-            visible_height = usize::from(picker_rect(area.into()).height.saturating_sub(4).max(1));
-            if selected < scroll_offset {
-                scroll_offset = selected;
-            } else if selected >= scroll_offset + visible_height {
-                scroll_offset = selected - visible_height + 1;
-            }
-            terminal.draw(|frame| {
-                draw_outline(
-                    frame,
-                    items,
-                    &filtered,
-                    selected,
-                    scroll_offset,
-                    PickerFilter {
-                        query: &filter,
-                        active: filtering,
-                    },
-                    theme,
-                )
-            })?;
-            redraw = false;
-        }
-
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-        let key = match read_event()? {
-            Event::Key(key) => key,
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                MouseEventKind::ScrollDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                _ => continue,
-            },
-            Event::Resize(_, _) => {
-                redraw = true;
-                continue;
-            }
-            _ => continue,
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let last = filtered.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Esc if filtering => {
-                filter.clear();
-                filtered = filter_outline(items, &filter);
-                selected = outline_start_index(items, current_page);
-                scroll_offset = 0;
-                filtering = false;
-            }
-            KeyCode::Esc => break None,
-            KeyCode::Char('/') if !control && !alt => filtering = true,
-            KeyCode::Enter => {
-                if let Some(index) = filtered.get(selected) {
-                    break Some(items[*index].page);
-                }
-            }
-            KeyCode::Down => selected = (selected + 1).min(last),
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Char('j') if !filtering => selected = (selected + 1).min(last),
-            KeyCode::Char('k') if !filtering => selected = selected.saturating_sub(1),
-            KeyCode::Char('f' | 'd') if control => {
-                selected = (selected + visible_height).min(last);
-            }
-            KeyCode::Char('b' | 'u') if control => {
-                selected = selected.saturating_sub(visible_height);
-            }
-            KeyCode::Char('g') if !filtering && !control && !alt => selected = 0,
-            KeyCode::Char('G') if !filtering && !control && !alt => selected = last,
-            KeyCode::Home => selected = 0,
-            KeyCode::End => selected = last,
-            KeyCode::PageDown => selected = (selected + visible_height).min(last),
-            KeyCode::PageUp => selected = selected.saturating_sub(visible_height),
-            KeyCode::Backspace if filtering => {
-                filter.pop();
-                filtered = filter_outline(items, &filter);
-                selected = 0;
-                scroll_offset = 0;
-            }
-            KeyCode::Char(character) if filtering && !control && !alt => {
-                filter.push(character);
-                filtered = filter_outline(items, &filter);
-                selected = 0;
-                scroll_offset = 0;
-            }
-            _ => {}
-        }
-        redraw = true;
-    };
-    drop(terminal);
-    clear_picker(output, theme)?;
-    Ok(selection)
-}
-
-fn outline_start_index(items: &[OutlineItem], current_page: u32) -> usize {
-    items
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, item)| item.page <= current_page)
-        .map(|(index, _)| index)
-        .unwrap_or(0)
-}
-
-fn filter_outline(items: &[OutlineItem], filter: &str) -> Vec<usize> {
-    if filter.is_empty() {
-        return (0..items.len()).collect();
-    }
-    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-    use nucleo_matcher::{Config, Matcher, Utf32Str};
-    let pattern = Pattern::parse(filter, CaseMatching::Ignore, Normalization::Smart);
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut buffer = Vec::new();
-    let mut scored: Vec<_> = items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            let haystack = Utf32Str::new(&item.title, &mut buffer);
-            pattern
-                .score(haystack, &mut matcher)
-                .map(|score| (index, score))
-        })
-        .collect();
-    scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-    scored.into_iter().map(|(index, _)| index).collect()
-}
-
-fn draw_outline(
-    frame: &mut RatatuiFrame,
-    items: &[OutlineItem],
-    filtered: &[usize],
-    selected: usize,
-    scroll_offset: usize,
-    filter: PickerFilter<'_>,
-    theme: Palette,
-) {
-    let colors = PickerTheme::from(theme);
-    let area = frame.area();
-    let popup = picker_rect(area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(colors.backdrop)),
-        area,
-    );
-    frame.render_widget(RatatuiClear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(colors.border))
-        .title(" Outline ")
-        .title_style(
-            Style::default()
-                .fg(colors.accent)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-
-    let filter_line = if filter.query.is_empty() && !filter.active {
-        Line::from(Span::styled(
-            " / to filter",
-            Style::default().fg(colors.muted).bg(colors.chrome),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled(" / ", Style::default().fg(colors.accent).bg(colors.chrome)),
-            Span::styled(
-                filter.query.to_string(),
-                Style::default().fg(colors.text).bg(colors.chrome),
-            ),
-        ])
-    };
-    frame.render_widget(
-        Paragraph::new(filter_line).style(Style::default().bg(colors.chrome)),
-        rows[0],
-    );
-
-    let visible_height = usize::from(rows[1].height);
-    let width = usize::from(rows[1].width);
-    let mut lines: Vec<Line> = filtered
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(position, item_index)| {
-            let item = &items[*item_index];
-            let is_selected = position == selected;
-            let style = if is_selected {
-                Style::default().fg(colors.text).bg(colors.selection)
-            } else {
-                Style::default().fg(colors.text).bg(colors.surface)
-            };
-            let indent = "  ".repeat(usize::from(item.depth).min(6) + 1);
-            let page_label = format!(" {} ", item.page + 1);
-            let mut line = Line::from(vec![
-                Span::styled(if is_selected { "▌" } else { " " }, style.fg(colors.accent)),
-                Span::styled(indent, style),
-                Span::styled(item.title.clone(), style.add_modifier(Modifier::BOLD)),
-            ]);
-            let used = line.width();
-            let page_width = page_label.chars().count();
-            if used + page_width < width {
-                let page_style = if is_selected {
-                    style
-                } else {
-                    Style::default().fg(colors.muted).bg(colors.surface)
-                };
-                line.spans
-                    .push(Span::styled(" ".repeat(width - used - page_width), style));
-                line.spans.push(Span::styled(page_label, page_style));
-            }
-            line
-        })
-        .collect();
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "   No matches",
-            Style::default().fg(colors.muted).bg(colors.surface),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
-        rows[1],
-    );
-
-    frame.render_widget(
-        Paragraph::new(picker_hint_line(
-            &[
-                ("j/k/wheel", "select"),
-                ("^b/^f", "page"),
-                ("g/G", "ends"),
-                ("/", "filter"),
-                ("enter", "jump"),
-                ("esc", if filter.active { "clear" } else { "close" }),
-            ],
-            None,
-            colors,
-        ))
-        .style(Style::default().bg(colors.chrome)),
-        rows[2],
-    );
-}
-
-fn apply_picker_navigation(
-    browser: &mut BrowserState,
-    key: KeyEvent,
-    visible_height: usize,
-    filtering: bool,
-) -> bool {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Down => browser.select_down(),
-        KeyCode::Up => browser.select_up(),
-        KeyCode::Char('j') if !filtering => browser.select_down(),
-        KeyCode::Char('k') if !filtering => browser.select_up(),
-        KeyCode::Char('f' | 'd') if control => browser.page_down(visible_height),
-        KeyCode::Char('b' | 'u') if control => browser.page_up(visible_height),
-        KeyCode::Char('g')
-            if !control && !key.modifiers.contains(KeyModifiers::ALT) && !filtering =>
-        {
-            browser.select_first();
-        }
-        KeyCode::Char('G')
-            if !control && !key.modifiers.contains(KeyModifiers::ALT) && !filtering =>
-        {
-            browser.select_last();
-        }
-        KeyCode::Home => browser.select_first(),
-        KeyCode::End => browser.select_last(),
-        KeyCode::PageDown => browser.page_down(visible_height),
-        KeyCode::PageUp => browser.page_up(visible_height),
-        _ => return false,
-    }
-    true
-}
-
-fn clear_picker_filter(browser: &mut BrowserState) -> bool {
-    if browser.filter.is_empty() {
-        return false;
-    }
-    browser.filter.clear();
-    browser.rebuild_filter();
-    browser.select_first();
-    browser.scroll_offset = 0;
-    true
-}
-
-fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, filtering: bool, theme: Palette) {
-    let colors = PickerTheme::from(theme);
-    let entries: Vec<_> = browser.filtered_entries().collect();
-    let area = frame.area();
-    let popup = picker_rect(area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(colors.backdrop)),
-        area,
-    );
-    frame.render_widget(RatatuiClear, popup);
-
-    let directory = shorten_path(&browser.current_dir.display().to_string());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(colors.border))
-        .title(format!(" {directory} "))
-        .title_style(
-            Style::default()
-                .fg(colors.accent)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-
-    let filter = if browser.filter.is_empty() && !filtering {
-        Line::from(Span::styled(
-            " / to filter",
-            Style::default().fg(colors.muted).bg(colors.chrome),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled(" / ", Style::default().fg(colors.accent).bg(colors.chrome)),
-            Span::styled(
-                browser.filter.as_str(),
-                Style::default().fg(colors.text).bg(colors.chrome),
-            ),
-        ])
-    };
-    frame.render_widget(
-        Paragraph::new(filter).style(Style::default().bg(colors.chrome)),
-        rows[0],
-    );
-
-    let visible_height = usize::from(rows[1].height);
-    let recent_heading_index = browser.recent_heading_index();
-    let mut lines = Vec::with_capacity(visible_height);
-    for (index, entry) in entries.iter().enumerate().skip(browser.scroll_offset) {
-        if Some(index) == recent_heading_index && lines.len() + 1 < visible_height {
-            lines.push(picker_recent_heading_line(
-                usize::from(rows[1].width),
-                colors,
-            ));
-        }
-        if lines.len() >= visible_height {
-            break;
-        }
-        lines.push(picker_entry_line(
-            entry,
-            browser,
-            index == browser.selected,
-            usize::from(rows[1].width),
-            colors,
-        ));
-        if lines.len() >= visible_height {
-            break;
-        }
-    }
-    if lines.is_empty() {
-        let message = if browser.filter.is_empty() {
-            "   No PDF files found"
-        } else {
-            "   No matches"
-        };
-        lines.push(Line::from(Span::styled(
-            message,
-            Style::default().fg(colors.muted).bg(colors.surface),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
-        rows[1],
-    );
-
-    let status = if browser.recursive_loading() {
-        Some((format!("scan • {}", entries.len()), colors.loading))
-    } else {
-        let position = if entries.is_empty() {
-            0
-        } else {
-            browser.selected + 1
-        };
-        Some((format!("{position}/{}", entries.len()), colors.muted))
-    };
-    let escape_action = if filtering || !browser.filter.is_empty() {
-        "clear"
-    } else {
-        "close"
-    };
-    let mut bindings = vec![("j/k", ""), ("^b/^f", "page"), ("g/G", "ends")];
-    bindings.push(("/", "filter"));
-    bindings.push(("enter", "open"));
-    bindings.push(("esc", escape_action));
-    frame.render_widget(
-        Paragraph::new(picker_hint_line(&bindings, status, colors))
-            .style(Style::default().bg(colors.chrome)),
-        rows[2],
-    );
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum SearchPickerDisplayRow {
-    Section(usize),
-    Match(usize),
-    Context(usize),
-}
-
-fn search_picker_display_rows(
-    matches: &[SearchPageMatch],
-    outline: &[OutlineItem],
-) -> Vec<SearchPickerDisplayRow> {
-    let mut rows = Vec::with_capacity(matches.len().saturating_mul(3));
-    let mut previous_section = None;
-    for (index, result) in matches.iter().enumerate() {
-        let section = link_picker_section_index(outline, result.page);
-        if section != previous_section {
-            if let Some(section) = section {
-                rows.push(SearchPickerDisplayRow::Section(section));
-            }
-            previous_section = section;
-        }
-        rows.push(SearchPickerDisplayRow::Match(index));
-        if !result.context.is_empty() {
-            rows.push(SearchPickerDisplayRow::Context(index));
-        }
-    }
-    rows
-}
-
-fn search_picker_row_window(
-    rows: &[SearchPickerDisplayRow],
-    selected: usize,
-    visible_height: usize,
-) -> (usize, usize) {
-    let selected_row = rows
-        .iter()
-        .position(|row| matches!(row, SearchPickerDisplayRow::Match(index) if *index == selected))
-        .unwrap_or(0);
-    let height = visible_height.max(1).min(rows.len());
-    let start = selected_row
-        .saturating_sub(height / 3)
-        .min(rows.len().saturating_sub(height));
-    (start, start + height)
-}
-
-fn draw_search_picker(
-    frame: &mut RatatuiFrame,
-    area: Rect,
-    search: &SearchState,
-    outline: &[OutlineItem],
-    state: &SearchPickerState,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) {
-    let layout = resolved_link_picker_layout(area, geometry.layout);
-    let results_focused =
-        state.focus == LinkPickerFocus::Links || layout == LinkPickerLayout::Floating;
-    let mut colors = PickerTheme::from(theme);
-    colors.surface = picker_color(theme.bg_dark);
-    colors.chrome = picker_color(theme.bg_dark1);
-    let (_, pane) = link_picker_panes(area, geometry);
-    frame.render_widget(RatatuiClear, pane);
-    let borders = match layout {
-        LinkPickerLayout::Vertical => Borders::LEFT,
-        LinkPickerLayout::Horizontal => Borders::TOP,
-        LinkPickerLayout::Floating => Borders::ALL,
-        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
-    };
-    let block = Block::default()
-        .borders(borders)
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(if results_focused {
-            colors.accent
-        } else {
-            colors.border
-        }));
-    let inner = block.inner(pane);
-    frame.render_widget(block, pane);
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(1),
-        Constraint::Length(u16::from(layout == LinkPickerLayout::Floating)),
-    ])
-    .split(inner);
-
-    let mut header = vec![
-        Span::styled(
-            " Search ",
-            Style::default()
-                .fg(if results_focused {
-                    colors.accent
-                } else {
-                    colors.muted
-                })
-                .bg(colors.chrome)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            truncated_search_query(&search.query, 36),
-            Style::default().fg(colors.text).bg(colors.chrome),
-        ),
-        Span::styled(
-            format!(
-                "  · {} hits on {} pages",
-                search.total_occurrences,
-                search.matches.len()
-            ),
-            Style::default().fg(colors.muted).bg(colors.chrome),
-        ),
-    ];
-    if search.searching {
-        header.push(Span::styled(
-            format!("  scanning {}/{}", search.scanned, search.total_pages),
-            Style::default().fg(colors.loading).bg(colors.chrome),
-        ));
-    }
-    if !results_focused {
-        header.push(Span::styled(
-            "  PDF focused  · l: results",
-            Style::default()
-                .fg(colors.loading)
-                .bg(colors.chrome)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(header))
-            .style(Style::default().bg(colors.chrome))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(colors.border)),
-            ),
-        rows[0],
-    );
-
-    if search.matches.is_empty() {
-        let message = if search.searching {
-            "Scanning document text…"
-        } else {
-            "No matches"
-        };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(colors.muted).bg(colors.surface)),
-            rows[1],
-        );
-    } else {
-        let display_rows = search_picker_display_rows(&search.matches, outline);
-        let (start, end) = search_picker_row_window(
-            &display_rows,
-            state.selected,
-            usize::from(rows[1].height).max(1),
-        );
-        let width = usize::from(rows[1].width);
-        let number_width = search.matches.len().to_string().len().max(1);
-        let lines: Vec<_> = display_rows[start..end]
-            .iter()
-            .map(|row| match row {
-                SearchPickerDisplayRow::Section(index) => {
-                    link_picker_section_heading_line(&outline[*index].title, width, colors)
-                }
-                SearchPickerDisplayRow::Match(index) => search_picker_match_line(
-                    *index,
-                    &search.matches[*index],
-                    state,
-                    number_width,
-                    width,
-                    results_focused,
-                    colors,
-                ),
-                SearchPickerDisplayRow::Context(index) => search_picker_context_line(
-                    *index,
-                    &search.matches[*index].context,
-                    state,
-                    width,
-                    results_focused,
-                    colors,
-                ),
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(colors.surface)),
-            rows[1],
-        );
-    }
-
-    if layout == LinkPickerLayout::Floating {
-        let position = usize::from(!search.matches.is_empty()) * (state.selected + 1);
-        frame.render_widget(
-            Paragraph::new(picker_hint_line(
-                &[
-                    ("j/k C-b/f g/G", "navigate"),
-                    ("/", "new search"),
-                    ("enter", "jump"),
-                    ("s/a", "layout"),
-                    ("esc", "close"),
-                ],
-                Some((format!("{position}/{}", search.matches.len()), colors.muted)),
-                colors,
-            ))
-            .style(Style::default().bg(colors.chrome)),
-            rows[2],
-        );
-    }
-}
-
-fn search_picker_match_line(
-    index: usize,
-    result: &SearchPageMatch,
-    state: &SearchPickerState,
-    number_width: usize,
-    width: usize,
-    focused: bool,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let selected = focused && index == state.selected;
-    let background = if selected {
-        colors.selection
-    } else {
-        colors.surface
-    };
-    let hits = if result.occurrences == 1 {
-        "hit"
-    } else {
-        "hits"
-    };
-    let current = if result.page == state.page {
-        " · current"
-    } else {
-        ""
-    };
-    let label = format!(
-        "{:>number_width$}  Page {} · {} {hits}{current}",
-        index + 1,
-        result.page + 1,
-        result.occurrences
-    );
-    Line::from(vec![
-        Span::styled(
-            if selected { "▌ " } else { "  " },
-            Style::default().fg(colors.accent).bg(background),
-        ),
-        Span::styled(
-            truncate_right(&label, width.saturating_sub(2)),
-            Style::default()
-                .fg(colors.text)
-                .bg(background)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])
-}
-
-fn search_picker_context_line(
-    index: usize,
-    context: &str,
-    state: &SearchPickerState,
-    width: usize,
-    focused: bool,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let background = if focused && index == state.selected {
-        colors.selection
-    } else {
-        colors.surface
-    };
-    Line::from(vec![
-        Span::styled("    ", Style::default().bg(background)),
-        Span::styled(
-            truncate_right(context, width.saturating_sub(4)),
-            Style::default().fg(colors.text_dim).bg(background),
-        ),
-    ])
-}
-
-fn draw_link_picker(
-    frame: &mut RatatuiFrame,
-    area: Rect,
-    document: LinkPickerDocument<'_>,
-    state: &LinkPickerState,
-    progress: LinkIndexProgress,
-    geometry: LinkPickerGeometry,
-    theme: Palette,
-) {
-    let LinkPickerDocument { links, outline } = document;
-    let selected = state.selected;
-    let page = state.page;
-    let layout = resolved_link_picker_layout(area, geometry.layout);
-    let links_focused =
-        state.focus == LinkPickerFocus::Links || layout == LinkPickerLayout::Floating;
-    let filtered = filter_document_links(links, &state.filter);
-    let selected_position = filtered.iter().position(|index| *index == selected);
-    let mut colors = PickerTheme::from(theme);
-    colors.surface = picker_color(theme.bg_dark);
-    colors.chrome = picker_color(theme.bg_dark1);
-    let (_, pane) = link_picker_panes(area, geometry);
-    frame.render_widget(RatatuiClear, pane);
-    let pane_borders = match layout {
-        LinkPickerLayout::Vertical => Borders::LEFT,
-        LinkPickerLayout::Horizontal => Borders::TOP,
-        LinkPickerLayout::Floating => Borders::ALL,
-        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
-    };
-    let pane_block = Block::default()
-        .borders(pane_borders)
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(if links_focused {
-            colors.accent
-        } else {
-            colors.border
-        }));
-    let inner = pane_block.inner(pane);
-    frame.render_widget(pane_block, pane);
-    let detail_height = link_picker_detail_height(inner.height);
-    let footer_height = u16::from(layout == LinkPickerLayout::Floating);
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(1),
-        Constraint::Length(detail_height),
-        Constraint::Length(footer_height),
-    ])
-    .split(inner);
-
-    let mut header = vec![
-        Span::styled(
-            " Links ",
-            Style::default()
-                .fg(if links_focused {
-                    colors.accent
-                } else {
-                    colors.muted
-                })
-                .bg(colors.chrome)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if state.filter.is_empty() {
-                links.len().to_string()
-            } else {
-                format!("{}/{}", filtered.len(), links.len())
-            },
-            Style::default().fg(colors.muted).bg(colors.chrome),
-        ),
-        Span::styled(
-            format!("  · {}", link_picker_layout_status(area, geometry.layout)),
-            Style::default().fg(colors.muted).bg(colors.chrome),
-        ),
-    ];
-    if !links_focused {
-        header.push(Span::styled(
-            "  PDF focused  · l: links",
-            Style::default()
-                .fg(colors.loading)
-                .bg(colors.chrome)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if progress.indexing {
-        header.push(Span::styled(
-            format!("  indexing {}/{}", progress.scanned, progress.total_pages),
-            Style::default().fg(colors.loading).bg(colors.chrome),
-        ));
-    }
-    if state.filtering || !state.filter.is_empty() {
-        header.push(Span::styled(
-            "  / ",
-            Style::default()
-                .fg(colors.accent)
-                .bg(colors.chrome)
-                .add_modifier(Modifier::BOLD),
-        ));
-        header.push(Span::styled(
-            if state.filter.is_empty() {
-                "type to filter…".to_string()
-            } else {
-                state.filter.clone()
-            },
-            Style::default().fg(colors.text).bg(colors.chrome),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(header))
-            .style(Style::default().bg(colors.chrome))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(colors.border)),
-            ),
-        rows[0],
-    );
-
-    if filtered.is_empty() {
-        let message = if progress.indexing {
-            format!(
-                "Indexing document links · {}/{} pages",
-                progress.scanned, progress.total_pages
-            )
-        } else if !state.filter.is_empty() {
-            format!("No links match ‘{}’", state.filter)
-        } else {
-            "No annotated links in this document".to_string()
-        };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(colors.muted).bg(colors.surface)),
-            rows[1],
-        );
-    } else {
-        let display_rows = link_picker_display_rows(links, &filtered, outline);
-        let visible_height = usize::from(rows[1].height).max(1);
-        let (start, end) = link_picker_row_window(&display_rows, selected, visible_height);
-        let width = usize::from(rows[1].width);
-        let number_width = filtered.len().to_string().len().max(1);
-        let lines: Vec<_> = display_rows[start..end]
-            .iter()
-            .map(|display_row| match display_row {
-                LinkPickerDisplayRow::Section(index) => {
-                    link_picker_section_heading_line(&outline[*index].title, width, colors)
-                }
-                LinkPickerDisplayRow::Page(source_page) => {
-                    link_picker_page_heading_line(*source_page, *source_page == page, width, colors)
-                }
-                LinkPickerDisplayRow::Link { index, ordinal } => link_picker_entry_line(
-                    *ordinal,
-                    *index,
-                    &links[*index],
-                    if links_focused { selected } else { usize::MAX },
-                    number_width,
-                    width,
-                    colors,
-                ),
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(colors.surface)),
-            rows[1],
-        );
-    }
-
-    if detail_height > 0
-        && let Some(position) = selected_position
-        && let Some(link) = links.get(selected)
-    {
-        draw_link_picker_detail(frame, rows[2], link, position, colors);
-    }
-
-    if layout == LinkPickerLayout::Floating {
-        let status = if filtered.is_empty() {
-            if state.filter.is_empty() {
-                "no links".to_string()
-            } else {
-                "no matches".to_string()
-            }
-        } else {
-            format!("{}/{}", selected_position.unwrap_or(0) + 1, filtered.len())
-        };
-        let action = match selected_position
-            .and_then(|_| links.get(selected))
-            .map(|link| &link.target)
-        {
-            Some(LinkTarget::Uri(_)) => "copy URL",
-            _ => "jump",
-        };
-        let escape_action = if state.filtering || !state.filter.is_empty() {
-            "clear"
-        } else {
-            "close"
-        };
-        let compact_bindings = [("j/k", ""), ("/", ""), ("#", ""), ("↵", ""), ("esc", "")];
-        let medium_bindings = [
-            ("j/k C-b/f g/G", ""),
-            ("/", ""),
-            ("#", ""),
-            ("enter", action),
-            ("esc", ""),
-        ];
-        let full_bindings = [
-            ("j/k C-b/f g/G", "navigate"),
-            ("/", "filter"),
-            ("#", "select"),
-            ("enter", action),
-            ("s/a", "layout"),
-            ("esc", escape_action),
-        ];
-        let bindings = if rows[3].width < 48 {
-            compact_bindings.as_slice()
-        } else if rows[3].width < 110 {
-            medium_bindings.as_slice()
-        } else {
-            full_bindings.as_slice()
-        };
-        frame.render_widget(
-            Paragraph::new(picker_hint_line(
-                bindings,
-                Some((status, colors.muted)),
-                colors,
-            ))
-            .style(Style::default().bg(colors.chrome)),
-            rows[3],
-        );
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LinkPickerDisplayRow {
-    Section(usize),
-    Page(u32),
-    Link { index: usize, ordinal: usize },
-}
-
-fn link_picker_display_rows(
-    links: &[DocumentLink],
-    filtered: &[usize],
-    outline: &[OutlineItem],
-) -> Vec<LinkPickerDisplayRow> {
-    let mut rows = Vec::with_capacity(filtered.len().saturating_mul(2));
-    let mut previous_section = None;
-    let mut previous_page = None;
-    for (ordinal, index) in filtered.iter().copied().enumerate() {
-        let link = &links[index];
-        let section = link_picker_section_index(outline, link.source_page);
-        if section != previous_section {
-            if let Some(section) = section {
-                rows.push(LinkPickerDisplayRow::Section(section));
-            }
-            previous_section = section;
-            previous_page = None;
-        }
-        if previous_page != Some(link.source_page) {
-            rows.push(LinkPickerDisplayRow::Page(link.source_page));
-            previous_page = Some(link.source_page);
-        }
-        rows.push(LinkPickerDisplayRow::Link { index, ordinal });
-    }
-    rows
-}
-
-fn link_picker_link_at_position(
-    area: Rect,
-    document: LinkPickerDocument<'_>,
-    state: &LinkPickerState,
-    geometry: LinkPickerGeometry,
-    column: u16,
-    row: u16,
-) -> Option<usize> {
-    let list_area = link_picker_list_area(area, geometry);
-    if column < list_area.x
-        || column >= list_area.x.saturating_add(list_area.width)
-        || row < list_area.y
-        || row >= list_area.y.saturating_add(list_area.height)
-    {
-        return None;
-    }
-    let filtered = filter_document_links(document.links, &state.filter);
-    let display_rows = link_picker_display_rows(document.links, &filtered, document.outline);
-    let (start, end) = link_picker_row_window(
-        &display_rows,
-        state.selected,
-        usize::from(list_area.height).max(1),
-    );
-    let offset = usize::from(row.saturating_sub(list_area.y));
-    match display_rows
-        .get(start + offset)
-        .filter(|_| start + offset < end)
-    {
-        Some(LinkPickerDisplayRow::Link { index, .. }) => Some(*index),
-        _ => None,
-    }
-}
-
-fn link_picker_list_area(area: Rect, geometry: LinkPickerGeometry) -> Rect {
-    let layout = resolved_link_picker_layout(area, geometry.layout);
-    let (_, pane) = link_picker_panes(area, geometry);
-    let borders = match layout {
-        LinkPickerLayout::Vertical => Borders::LEFT,
-        LinkPickerLayout::Horizontal => Borders::TOP,
-        LinkPickerLayout::Floating => Borders::ALL,
-        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
-    };
-    let inner = Block::default().borders(borders).inner(pane);
-    let detail_height = link_picker_detail_height(inner.height);
-    let footer_height = u16::from(layout == LinkPickerLayout::Floating);
-    Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(1),
-        Constraint::Length(detail_height),
-        Constraint::Length(footer_height),
-    ])
-    .split(inner)[1]
-}
-
-fn link_picker_section_index(outline: &[OutlineItem], page: u32) -> Option<usize> {
-    outline
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.page <= page)
-        .max_by_key(|(index, item)| (item.page, *index))
-        .map(|(index, _)| index)
-}
-
-fn link_picker_row_window(
-    rows: &[LinkPickerDisplayRow],
-    selected: usize,
-    visible_height: usize,
-) -> (usize, usize) {
-    let selected_row = rows
-        .iter()
-        .position(|row| {
-            matches!(
-                row,
-                LinkPickerDisplayRow::Link { index, .. } if *index == selected
-            )
-        })
-        .unwrap_or(0);
-    let height = visible_height.max(1).min(rows.len());
-    let max_start = rows.len().saturating_sub(height);
-    let start = selected_row.saturating_sub(height / 2).min(max_start);
-    (start, start + height)
-}
-
-fn link_picker_page_heading_line(
-    page: u32,
-    current: bool,
-    width: usize,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let label = if current {
-        format!(" Page {} · current ", page + 1)
-    } else {
-        format!(" Page {} ", page + 1)
-    };
-    let used = 2 + Line::raw(label.as_str()).width();
-    let mut spans = vec![
-        Span::styled("  ", Style::default().bg(colors.surface)),
-        Span::styled(
-            label,
-            Style::default()
-                .fg(if current { colors.recent } else { colors.muted })
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if used < width {
-        spans.push(Span::styled(
-            "─".repeat(width - used),
-            Style::default().fg(colors.border).bg(colors.surface),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn link_picker_section_heading_line(
-    title: &str,
-    width: usize,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let prefix = " Section  ";
-    let label = truncate_right(title, width.saturating_sub(Line::raw(prefix).width() + 1));
-    let mut line = Line::from(vec![
-        Span::styled(
-            prefix,
-            Style::default()
-                .fg(colors.loading)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{label} "),
-            Style::default()
-                .fg(colors.text)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let used = line.width();
-    if used < width {
-        line.spans.push(Span::styled(
-            "─".repeat(width - used),
-            Style::default().fg(colors.border).bg(colors.surface),
-        ));
-    }
-    line
-}
-
-fn link_picker_entry_line(
-    ordinal: usize,
-    index: usize,
-    link: &DocumentLink,
-    selected: usize,
-    number_width: usize,
-    width: usize,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let is_selected = index == selected;
-    let background = if is_selected {
-        colors.selection
-    } else {
-        colors.surface
-    };
-    let style = Style::default().fg(colors.text).bg(background);
-    let number = format!("{:>number_width$}  ", ordinal + 1);
-    let prefix_width = 2 + Line::raw(number.as_str()).width();
-    let label = truncate_right(
-        &link_picker_label(&link.label),
-        width.saturating_sub(prefix_width),
-    );
-    let mut line = Line::from(vec![
-        Span::styled(
-            if is_selected { "▌ " } else { "  " },
-            style.fg(colors.accent),
-        ),
-        Span::styled(number, style.fg(colors.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            label,
-            if is_selected {
-                style.add_modifier(Modifier::BOLD)
-            } else {
-                style
-            },
-        ),
-    ]);
-    let used = line.width();
-    if used < width {
-        line.spans
-            .push(Span::styled(" ".repeat(width - used), style));
-    }
-    line
-}
-
-fn draw_link_picker_detail(
-    frame: &mut RatatuiFrame,
-    area: Rect,
-    link: &DocumentLink,
-    selected: usize,
-    colors: PickerTheme,
-) {
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(colors.border))
-        .style(Style::default().bg(colors.surface));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let width = usize::from(inner.width);
-    let number = format!("{}  ", selected + 1);
-    let label = truncate_right(
-        &link_picker_label(&link.label),
-        width.saturating_sub(Line::raw(number.as_str()).width()),
-    );
-    let target = match &link.target {
-        LinkTarget::Internal { page, .. } => format!("PDF page {}", page + 1),
-        LinkTarget::Uri(uri) => uri.clone(),
-    };
-    let source = format!("Page {}", link.source_page + 1);
-    let fixed_width = Line::raw(source.as_str()).width() + 3;
-    let target = truncate_right(&target, width.saturating_sub(fixed_width));
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                number,
-                Style::default()
-                    .fg(colors.accent)
-                    .bg(colors.surface)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(colors.text)
-                    .bg(colors.surface)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                source,
-                Style::default().fg(colors.recent).bg(colors.surface),
-            ),
-            Span::styled(" → ", Style::default().fg(colors.muted).bg(colors.surface)),
-            Span::styled(
-                target,
-                Style::default().fg(colors.text_dim).bg(colors.surface),
-            ),
-        ]),
-    ];
-    let mut lines = lines;
-    let truncate_context = inner.height <= 4;
-    if let Some(context) = link.source_context.as_deref() {
-        lines.push(link_picker_context_line(
-            "Context",
-            context,
-            width,
-            truncate_context,
-            colors.loading,
-            colors,
-        ));
-    }
-    if let Some(context) = link.reference_context.as_deref() {
-        lines.push(link_picker_context_line(
-            "Reference",
-            context,
-            width,
-            truncate_context,
-            colors.recent,
-            colors,
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(colors.surface))
-            .wrap(Wrap { trim: true }),
-        inner,
-    );
-}
-
-fn link_picker_context_line(
-    label: &'static str,
-    context: &str,
-    width: usize,
-    truncate: bool,
-    label_color: RatatuiColor,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let label = format!("{label}  ");
-    let context = if truncate {
-        truncate_right(
-            context,
-            width.saturating_sub(Line::raw(label.as_str()).width()),
-        )
-    } else {
-        context.to_string()
-    };
-    Line::from(vec![
-        Span::styled(
-            label,
-            Style::default()
-                .fg(label_color)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(context, Style::default().fg(colors.text).bg(colors.surface)),
-    ])
-}
-
-fn link_picker_label(label: &str) -> String {
-    let citation = label.trim_matches(|character: char| {
-        character.is_whitespace() || matches!(character, '[' | ']' | ',' | ';')
-    });
-    if !citation.is_empty() && citation.chars().all(|character| character.is_ascii_digit()) {
-        format!("citation [{citation}]")
-    } else {
-        label.to_string()
-    }
-}
-
-fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
-    const NAVIGATION: &[(&str, &str)] = &[
-        ("j/k · ↑/↓", "scroll vertically"),
-        ("J / K", "next / previous page"),
-        ("h/l · ←/→", "move horizontally"),
-        ("d/u · ^d/^u · ^f/^b", "page viewport down / up"),
-        ("Space/PgDn · Bksp/PgUp", "page viewport down / up"),
-        ("g / G · [N]G / [N]gg", "first / last / page N"),
-        (":", "go to page"),
-        ("/", "search document"),
-        ("n / N", "next / prev match"),
-        ("Mouse wheel", "scroll vertically"),
-        ("Enter", "browse PDF links"),
-        ("Click", "follow PDF link"),
-        ("h / l (split)", "focus PDF/pane"),
-        ("/ (pane)", "filter/new search"),
-        ("Ctrl-b/f/d/u (pane)", "page results"),
-        ("g / G (pane)", "first/last"),
-        ("Tab / Shift-Tab", "switch tabs"),
-        ("Alt-1 … Alt-9", "select tab"),
-    ];
-    const VIEWER: &[(&str, &str)] = &[
-        ("m", "fit page / width / height / content"),
-        ("+ / -", "zoom in / out"),
-        ("0", "reset zoom"),
-        ("i", "toggle dark mode"),
-        ("x", "find visible PDF text + SyncTeX jump"),
-        ("Alt/Option-click", "word jump + focus"),
-        ("S", "toggle smooth scroll"),
-        ("p", "performance timings"),
-        ("t", "table of contents"),
-        ("T", "choose theme"),
-        ("y", "copy page text"),
-        ("L", "link mode + browser"),
-        ("s / a", "cycle / auto layout"),
-        ("b / B / ^o / ^i", "jump back / forward"),
-        ("f", "open PDF in new tab"),
-        ("D", "duplicate tab at current view"),
-        ("R", "reload config"),
-        ("q", "leave mode / close tab"),
-        ("Esc", "leave mode / clear / exit"),
-        ("?", "open help"),
-    ];
-
-    let colors = PickerTheme::from(theme);
-    let area = frame.area();
-    let popup = if area.width < 110 {
-        area
-    } else {
-        picker_rect(area)
-    };
-    frame.render_widget(
-        Block::default().style(Style::default().bg(colors.backdrop)),
-        area,
-    );
-    frame.render_widget(RatatuiClear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(colors.border))
-        .title(" Help ")
-        .title_style(
-            Style::default()
-                .fg(colors.accent)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let rows = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(if inner.width < 80 { 10 } else { 6 }),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-    let columns =
-        if inner.width < 90 && usize::from(rows[0].height) >= NAVIGATION.len() + VIEWER.len() + 4 {
-            Layout::vertical([
-                Constraint::Length(NAVIGATION.len() as u16 + 2),
-                Constraint::Min(1),
-            ])
-            .split(rows[0])
-        } else {
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .spacing(2)
-                .split(rows[0])
-        };
-
-    frame.render_widget(
-        Paragraph::new(help_lines("Navigation", NAVIGATION, 18, colors))
-            .style(Style::default().bg(colors.surface))
-            .wrap(Wrap { trim: true }),
-        columns[0],
-    );
-    frame.render_widget(
-        Paragraph::new(help_lines("Viewer", VIEWER, 18, colors))
-            .style(Style::default().bg(colors.surface))
-            .wrap(Wrap { trim: true }),
-        columns[1],
-    );
-    let path = crate::config::config_path()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "HOME is unset".into());
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!("Config: {path}")),
-            Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
-            Line::from("[viewer]: continuous_scroll, prefetch_pages, set_window_title, center_forward_search"),
-            Line::from("[viewer]: flash_duration_ms, flash_label_font, word_precision, source_context_lines"),
-            Line::from("[viewer]: flash_label_foreground, flash_label_background (#RRGGBB)"),
-            Line::from("[nvim]: focus_on_forward, focus_on_inverse, compile; [nvim.keys]: editor keys"),
-            Line::from("Commented defaults on first launch. Press R to reload config."),
-        ])
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .wrap(Wrap { trim: true }),
-        rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new(picker_hint_line(&[("? / esc / q", "close")], None, colors))
-            .style(Style::default().bg(colors.chrome)),
-        rows[2],
-    );
-}
-
-fn help_lines(
-    title: &'static str,
-    bindings: &[(&str, &str)],
-    key_width: usize,
-    colors: PickerTheme,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(bindings.len() + 2);
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        format!(" {title}"),
-        Style::default()
-            .fg(colors.directory)
-            .bg(colors.surface)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.extend(bindings.iter().map(|(key, action)| {
-        Line::from(vec![
-            Span::styled(
-                format!(" {key:<key_width$}"),
-                Style::default()
-                    .fg(colors.accent)
-                    .bg(colors.selection)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {action}"),
-                Style::default().fg(colors.text).bg(colors.surface),
-            ),
-        ])
-    }));
-    lines
-}
-
-fn filter_theme_indices(themes: &[(String, Palette)], filter: &str) -> Vec<usize> {
-    let filter = filter.trim().to_lowercase();
-    themes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (name, _))| {
-            (filter.is_empty() || name.to_lowercase().contains(&filter)).then_some(index)
-        })
-        .collect()
-}
-
-fn draw_theme_picker(
-    frame: &mut RatatuiFrame,
-    themes: &[(String, Palette)],
-    filtered: &[usize],
-    selected: usize,
-    filter: &str,
-    filtering: bool,
-) {
-    let selected_theme = filtered.get(selected).copied().unwrap_or(0);
-    let theme = themes
-        .get(selected_theme)
-        .map_or(crate::theme::TOKYO_NIGHT_MOON, |(_, theme)| *theme);
-    let colors = PickerTheme::from(theme);
-    let area = frame.area();
-    let popup = picker_rect(area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(colors.backdrop)),
-        area,
-    );
-    frame.render_widget(RatatuiClear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().bg(colors.surface).fg(colors.text))
-        .border_style(Style::default().fg(colors.border))
-        .title(" Themes ")
-        .title_style(
-            Style::default()
-                .fg(colors.accent)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-
-    let filter_line = if filter.is_empty() && !filtering {
-        Line::from(Span::styled(
-            " / to filter",
-            Style::default().fg(colors.muted).bg(colors.chrome),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled(" / ", Style::default().fg(colors.accent).bg(colors.chrome)),
-            Span::styled(
-                filter.to_string(),
-                Style::default().fg(colors.text).bg(colors.chrome),
-            ),
-        ])
-    };
-    frame.render_widget(
-        Paragraph::new(filter_line).style(Style::default().bg(colors.chrome)),
-        rows[0],
-    );
-
-    let visible_height = usize::from(rows[1].height).max(1);
-    let first_visible = selected.saturating_add(1).saturating_sub(visible_height);
-    let width = usize::from(rows[1].width);
-    let lines: Vec<_> = filtered
-        .iter()
-        .enumerate()
-        .skip(first_visible)
-        .take(visible_height)
-        .map(|(position, index)| {
-            let is_selected = position == selected;
-            let name = &themes[*index].0;
-            let background = if is_selected {
-                colors.selection
-            } else {
-                colors.surface
-            };
-            let mut style = Style::default().fg(colors.text).bg(background);
-            if is_selected {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            let mut line = Line::from(vec![
-                Span::styled(
-                    if is_selected { "▌ " } else { "  " },
-                    Style::default().fg(colors.accent).bg(background),
-                ),
-                Span::styled(name.clone(), style),
-            ]);
-            let used = line.width();
-            if used < width {
-                line.spans.push(Span::styled(
-                    " ".repeat(width - used),
-                    Style::default().bg(background),
-                ));
-            }
-            line
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(colors.surface)),
-        rows[1],
-    );
-
-    let status = Some((
-        format!(
-            "{}/{}",
-            usize::from(!filtered.is_empty()) * (selected + 1),
-            filtered.len()
-        ),
-        colors.muted,
-    ));
-    frame.render_widget(
-        Paragraph::new(picker_hint_line(
-            &[
-                ("j/k", "select"),
-                ("^b/^f", "page"),
-                ("g/G", "ends"),
-                ("/", "filter"),
-                ("enter", "apply"),
-                ("esc", if filtering { "clear" } else { "cancel" }),
-            ],
-            status,
-            colors,
-        ))
-        .style(Style::default().bg(colors.chrome)),
-        rows[2],
-    );
-}
-
-fn picker_recent_heading_line(width: usize, colors: PickerTheme) -> Line<'static> {
-    let label = " Most Recent ";
-    let mut spans = vec![
-        Span::styled("  ", Style::default().bg(colors.surface)),
-        Span::styled(
-            label,
-            Style::default()
-                .fg(colors.recent)
-                .bg(colors.surface)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let used = 2 + label.chars().count();
-    if used < width {
-        spans.push(Span::styled(
-            "─".repeat(width - used),
-            Style::default().fg(colors.border).bg(colors.surface),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn truncate_left(value: &str, max_width: usize) -> String {
-    if Line::raw(value).width() <= max_width {
-        return value.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let suffix_width = max_width.saturating_sub(1);
-    let mut suffix = Vec::new();
-    let mut used = 0;
-    for character in value.chars().rev() {
-        let width = Line::raw(character.to_string()).width();
-        if used + width > suffix_width {
-            break;
-        }
-        suffix.push(character);
-        used += width;
-    }
-    suffix.reverse();
-    format!("…{}", suffix.into_iter().collect::<String>())
-}
-
-fn truncate_right(value: &str, max_width: usize) -> String {
-    if Line::raw(value).width() <= max_width {
-        return value.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let prefix_width = max_width.saturating_sub(1);
-    let mut prefix = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let width = Line::raw(character.to_string()).width();
-        if used + width > prefix_width {
-            break;
-        }
-        prefix.push(character);
-        used += width;
-    }
-    prefix.push('…');
-    prefix
-}
-
-fn picker_entry_line(
-    entry: &BrowserEntry,
-    browser: &BrowserState,
-    selected: bool,
-    width: usize,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let background = if selected {
-        colors.selection
-    } else {
-        colors.surface
-    };
-    let marker_style = Style::default().fg(colors.accent).bg(background);
-    let icon = if entry.name == "../" {
-        "↑ "
-    } else if entry.is_dir {
-        "› "
-    } else {
-        "  "
-    };
-    let icon_color = if entry.name == "../" {
-        colors.text_dim
-    } else if entry.is_dir {
-        colors.directory
-    } else if entry.is_recent {
-        colors.recent
-    } else {
-        colors.text
-    };
-    let mut spans = vec![
-        Span::styled(if selected { "▌ " } else { "  " }, marker_style),
-        Span::styled(icon, Style::default().fg(icon_color).bg(background)),
-    ];
-
-    let display_name = if browser.filter.is_empty() || entry.name == "../" {
-        entry.name.clone()
-    } else {
-        let mut name = entry
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| entry.name.clone());
-        if entry.is_dir && !name.ends_with('/') {
-            name.push('/');
-        }
-        name
-    };
-    let matches = browser.match_indices(&display_name);
-    let basename_start = if entry.is_dir || !browser.filter.is_empty() {
-        0
-    } else {
-        display_name
-            .char_indices()
-            .rev()
-            .find(|(_, character)| *character == '/')
-            .map_or(0, |(index, _)| display_name[..=index].chars().count())
-    };
-    for (index, character) in display_name.chars().enumerate() {
-        let foreground = if matches.binary_search(&index).is_ok() {
-            colors.matched
-        } else if index < basename_start || entry.name == "../" {
-            colors.text_dim
-        } else if entry.is_recent {
-            colors.recent
-        } else if entry.is_dir {
-            colors.directory
-        } else {
-            colors.text
-        };
-        let mut style = Style::default().fg(foreground).bg(background);
-        if matches.binary_search(&index).is_ok() || (selected && index >= basename_start) {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(character.to_string(), style));
-    }
-
-    let mut line = Line::from(spans);
-    let mut used = line.width();
-    let source = (!browser.filter.is_empty())
-        .then(|| browser.entry_source(entry))
-        .flatten();
-    let show_parent = entry.is_recent || source == Some(BrowserEntrySource::Subdirectory);
-    let parent = show_parent
-        .then(|| entry.path.parent())
-        .flatten()
-        .map(|parent| shorten_path(&parent.to_string_lossy()));
-    if entry.is_recent || source.is_some() {
-        let available = width.saturating_sub(used + 2);
-        let label = source.map(BrowserEntrySource::label);
-        let label_width = label.map_or(0, |label| Line::raw(label).width());
-        let separator_width = usize::from(label.is_some() && parent.is_some()) * 2;
-        if available >= label_width + separator_width + usize::from(parent.is_some()) {
-            let parent_width = available.saturating_sub(label_width + separator_width);
-            let parent = parent.map(|parent| truncate_left(&parent, parent_width));
-            let context_width = label_width
-                + separator_width
-                + parent
-                    .as_deref()
-                    .map_or(0, |parent| Line::raw(parent).width());
-            let gap = width.saturating_sub(used + context_width);
-            line.spans.push(Span::styled(
-                " ".repeat(gap),
-                Style::default().bg(background),
-            ));
-            if let Some(label) = label {
-                let foreground = match source {
-                    Some(BrowserEntrySource::Recent) => colors.recent,
-                    Some(BrowserEntrySource::Here) => colors.loading,
-                    Some(BrowserEntrySource::Subdirectory) => colors.directory,
-                    None => colors.muted,
-                };
-                line.spans.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(foreground)
-                        .bg(background)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if label.is_some() && parent.is_some() {
-                line.spans
-                    .push(Span::styled("  ", Style::default().bg(background)));
-            }
-            if let Some(parent) = parent {
-                let matches = browser.match_indices(&parent);
-                for (index, character) in parent.chars().enumerate() {
-                    let matched = matches.binary_search(&index).is_ok();
-                    let mut style = Style::default()
-                        .fg(if matched {
-                            colors.matched
-                        } else {
-                            colors.text_dim
-                        })
-                        .bg(background);
-                    if matched {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    line.spans.push(Span::styled(character.to_string(), style));
-                }
-            }
-            used = width;
-        }
-    }
-    if used < width {
-        line.spans.push(Span::styled(
-            " ".repeat(width - used),
-            Style::default().bg(background),
-        ));
-    }
-    line
-}
-
-fn picker_hint_line(
-    bindings: &[(&str, &str)],
-    status: Option<(String, RatatuiColor)>,
-    colors: PickerTheme,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled(" ", Style::default().bg(colors.chrome))];
-    for (key, action) in bindings {
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default()
-                .fg(colors.accent)
-                .bg(colors.selection)
-                .add_modifier(Modifier::BOLD),
-        ));
-        if !action.is_empty() {
-            spans.push(Span::styled(
-                format!(" {action}  "),
-                Style::default().fg(colors.muted).bg(colors.chrome),
-            ));
-        }
-    }
-    if let Some((status, color)) = status {
-        spans.push(Span::styled(
-            status,
-            Style::default().fg(color).bg(colors.chrome),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn picker_rect(area: Rect) -> Rect {
-    let width = if area.width > 4 {
-        (area.width * 3 / 4).max(50).min(area.width - 4)
-    } else {
-        area.width.max(1)
-    };
-    let height = if area.height > 4 {
-        (area.height * 3 / 4).max(6).min(area.height - 2)
-    } else {
-        area.height.max(1)
-    };
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
-fn link_picker_detail_height(height: u16) -> u16 {
-    if height >= 24 {
-        8
-    } else if height >= 14 {
-        6
-    } else if height >= 9 {
-        5
-    } else {
-        0
-    }
-}
-
-fn link_picker_visible_height(area: Rect, geometry: LinkPickerGeometry) -> usize {
-    let (_, pane) = link_picker_panes(area, geometry);
-    let layout = resolved_link_picker_layout(area, geometry.layout);
-    let border_height = match layout {
-        LinkPickerLayout::Vertical => 0,
-        LinkPickerLayout::Horizontal => 1,
-        LinkPickerLayout::Floating => 2,
-        LinkPickerLayout::Auto => unreachable!("auto layout is resolved above"),
-    };
-    let chrome_height = if layout == LinkPickerLayout::Floating {
-        3
-    } else {
-        2
-    };
-    let content_height = pane.height.saturating_sub(border_height);
-    usize::from(
-        content_height
-            .saturating_sub(chrome_height + link_picker_detail_height(content_height))
-            .max(1),
-    )
-}
-
-fn shorten_path(path: &str) -> String {
-    std::env::var_os("HOME")
-        .and_then(|home| {
-            path.strip_prefix(home.to_string_lossy().as_ref())
-                .map(|suffix| format!("~{suffix}"))
-        })
-        .unwrap_or_else(|| path.to_string())
-}
-
-fn picker_color(color: crossterm::style::Color) -> RatatuiColor {
-    match color {
-        crossterm::style::Color::Rgb { r, g, b } => RatatuiColor::Rgb(r, g, b),
-        _ => RatatuiColor::Reset,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PickerTheme {
-    backdrop: RatatuiColor,
-    surface: RatatuiColor,
-    chrome: RatatuiColor,
-    selection: RatatuiColor,
-    border: RatatuiColor,
-    accent: RatatuiColor,
-    directory: RatatuiColor,
-    recent: RatatuiColor,
-    matched: RatatuiColor,
-    loading: RatatuiColor,
-    text: RatatuiColor,
-    text_dim: RatatuiColor,
-    muted: RatatuiColor,
-}
-
-impl From<Palette> for PickerTheme {
-    fn from(theme: Palette) -> Self {
-        Self {
-            backdrop: picker_color(theme.bg_dark1),
-            surface: picker_color(theme.bg),
-            chrome: picker_color(theme.bg_dark),
-            selection: picker_color(theme.bg_highlight),
-            border: picker_color(theme.blue7),
-            accent: picker_color(theme.blue),
-            directory: picker_color(theme.blue1),
-            recent: picker_color(theme.yellow),
-            matched: picker_color(theme.magenta),
-            loading: picker_color(theme.cyan),
-            text: picker_color(theme.fg),
-            text_dim: picker_color(theme.fg_dark),
-            muted: picker_color(theme.comment),
-        }
-    }
-}
+#[path = "picker.rs"]
+mod picker;
+use picker::*;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn truncation_ignores_embedded_line_breaks_like_line_width() {
+        assert_eq!(super::truncate_right("ab\ncdef", 5), "ab\ncd…");
+        assert_eq!(super::truncate_left("ab\ncdef", 5), "…\ncdef");
+        assert_eq!(super::truncate_right("ab\r\ncdef", 5), "ab\r\ncd…");
+        assert_eq!(super::truncate_right("ab\ncd", 4), "ab\ncd");
+    }
+
     #[test]
     fn horizontal_navigation_only_scrolls_to_reveal_hidden_targets() {
         let scroll = |current, left, right| {
@@ -8369,16 +5945,17 @@ mod tests {
     use super::{
         BrowserState, FILE_STABLE_FOR, FileFingerprint, FileWatcher, LinkIndexProgress,
         LinkPickerDocument, LinkPickerFocus, LinkPickerGeometry, LinkPickerImage, LinkPickerState,
-        PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState, ZOOM_DEFAULT,
-        ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, centered_scaled_view,
+        ListEdge, PerformanceSnapshot, PositionedImage, SearchPickerState, SearchState,
+        ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, apply_picker_navigation, centered_scaled_view,
         clear_image_canvas, clear_picker, clear_picker_filter, cycled_tab_index, draw_link_picker,
         draw_picker, draw_search_picker, draw_theme_picker, filter_document_links, filter_outline,
         filter_theme_indices, link_at_cell, link_picker_focus_for_key, link_picker_label,
-        link_picker_link_at_position, link_picker_list_area, link_picker_navigation_index,
-        link_picker_panes, link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
-        outline_start_index, picker_color, picker_rect, render_timing_status,
-        restore_link_picker_split, search_target_page, show_link_picker_split, stale_status_row,
-        stepped_zoom, synchronized_output, update_link_number_selection, write_clipboard_osc52,
+        link_picker_link_at_position, link_picker_list_area, link_picker_panes,
+        link_picker_visible_height, next_link_picker_layout, numbered_tab_index,
+        outline_start_index, picker_color, picker_navigation_index, picker_rect,
+        render_timing_status, restore_link_picker_split, search_target_page,
+        show_link_picker_split, stale_status_row, stepped_zoom, synchronized_output,
+        update_link_number_selection, write_clipboard_osc52,
     };
     use crate::config::LinkPickerLayout;
     use crate::kitty::Placement;
@@ -8408,7 +5985,7 @@ mod tests {
             page_width_pt: 80.0,
             page_height_pt: 240.0,
             content_bounds: [0.0, 0.0, 1.0, 1.0],
-            compressed_rgba: crate::kitty::compress_rgba(&[255; 80 * 240 * 4]).unwrap(),
+            compressed_rgba: crate::kitty::compress_rgba(&[255; 80 * 240 * 3]).unwrap(),
             render_elapsed: std::time::Duration::ZERO,
             dark_mode_elapsed: None,
             highlight_elapsed: None,
@@ -8474,7 +6051,7 @@ mod tests {
         // replacement is pending, leaving its terminal image visible.
         let target = app.page_key(1, viewport);
         app.tab_mut().cache.retain(|key, _| key.page != 1);
-        app.pending.insert(target);
+        app.pending.insert(target, false);
         (app, viewport, file)
     }
 
@@ -8487,13 +6064,60 @@ mod tests {
         frame.width = 160;
         frame.height = 120;
         frame.compressed_rgba =
-            crate::kitty::compress_rgba(&[220, 40, 80, 255].repeat(160 * 120)).unwrap();
+            crate::kitty::compress_rgba(&[220, 40, 80].repeat(160 * 120)).unwrap();
         app.tab_mut().cache.insert(key, neighbor);
         app.tab_mut().scroll_y = 245;
         let primary = app.tab().cache[&app.page_key(0, viewport)].clone();
         app.draw_continuous(&primary, viewport, &mut Vec::new())
             .unwrap();
         (app, viewport, file)
+    }
+
+    #[test]
+    fn continuous_cell_inverse_uses_visible_neighbor_intersection() {
+        let (mut app, viewport, _file) = continuous_gap_app();
+        let mouse = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: KeyModifiers::ALT,
+        };
+        let (frame, placement, top) = app.page_at_mouse(mouse, viewport).unwrap();
+        assert_eq!(frame.key.page, 1);
+        assert_eq!(
+            super::source_pixel_at_cell(placement, top, &frame, mouse),
+            Some((5, 2))
+        );
+        let tiny = super::ImagePlacement {
+            left: 2,
+            columns: 1,
+            rows: 1,
+            crop: Some(crate::kitty::Crop {
+                x: 159,
+                y: 119,
+                width: 1,
+                height: 1,
+            }),
+            native_cell: Some((10, 10)),
+            offset_y: 9,
+            ..placement
+        };
+        let tiny_mouse = crossterm::event::MouseEvent { column: 2, ..mouse };
+        assert_eq!(
+            super::source_pixel_at_cell(tiny, mouse.row, &frame, tiny_mouse),
+            Some((159, 119))
+        );
+        let outside = crossterm::event::MouseEvent { column: 3, ..mouse };
+        assert_eq!(
+            super::source_pixel_at_cell(tiny, mouse.row, &frame, outside),
+            None
+        );
+        let padding = crossterm::event::MouseEvent { row: 14, ..mouse };
+        assert!(app.page_at_mouse(padding, viewport).is_none());
+        app.begin_inverse_search(padding, &mut Vec::new()).unwrap();
+        assert!(app.navigation.inverse.is_none());
+        app.begin_inverse_search(mouse, &mut Vec::new()).unwrap();
+        assert_eq!(app.navigation.inverse.as_ref().unwrap().page, 1);
     }
 
     #[test]
@@ -8578,7 +6202,6 @@ mod tests {
         let inverse = app.navigation.inverse.as_ref().unwrap();
         assert_eq!(inverse.page, 1);
         assert_eq!(inverse.revision, revision);
-        assert!(matches!(inverse.stage, super::InverseStage::HitTest));
 
         app.navigation.inverse = None;
         app.visible_page = None;
@@ -8668,6 +6291,7 @@ mod tests {
         app.viewer.continuous_scroll = false;
         app.tab_mut().scroll_y = 20;
         app.tab_mut().pending_destination = Some(super::LinkDestination {
+            content_pan_x: None,
             page: 0,
             // A 90-degree XYZ null 300 null destination specifies only rendered x.
             top_ratio: None,
@@ -8677,6 +6301,67 @@ mod tests {
         app.draw_frame_unsynchronized(&frame, viewport, &mut Vec::new())
             .unwrap();
         assert_eq!(app.tab().scroll_y, 20);
+    }
+
+    #[test]
+    fn routine_forward_assumption_preserves_coarse_word_status() {
+        let assumption = "assuming saved source is unchanged since compilation";
+        for (precise, warning, label) in [
+            (true, assumption, "forward search:"),
+            (
+                false,
+                assumption,
+                "forward search (SyncTeX region; no unique source word):",
+            ),
+            (
+                false,
+                "assuming saved source is unchanged since compilation; source was edited",
+                "warning:",
+            ),
+        ] {
+            let (mut app, mut viewport, file) = continuous_app();
+            app.viewer.continuous_scroll = false;
+            viewport.columns = 180;
+            viewport.pixel_width = 1800;
+            let revision = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+            let key = app.page_key(0, viewport);
+            let mut frame = continuous_frame(key, revision, true);
+            std::sync::Arc::get_mut(&mut frame)
+                .unwrap()
+                .flash
+                .as_mut()
+                .unwrap()
+                .word_precise = precise;
+            let (reply, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+            app.navigation.forward = Some(super::PendingForward {
+                request: crate::synctex::ForwardRequest {
+                    pdf: file.path().to_owned(),
+                    revision: revision.pdf,
+                    page: 1,
+                    h: 10.0,
+                    v: 20.0,
+                    width: 10.0,
+                    height: 10.0,
+                    word: None,
+                    inverse_search: None,
+                    best_guess: false,
+                    warning: Some(warning.into()),
+                },
+                reply: crate::ipc::ForwardReply::new(reply),
+                deadline: Instant::now() + crate::ipc::FORWARD_TIMEOUT,
+                stage: super::ForwardStage::AwaitingFrame,
+            });
+            app.navigation.flash = Some(super::PendingFlash {
+                document_id: key.document_id,
+                revision: revision.pdf,
+                page: 0,
+                positioning_pending: false,
+                expires_at: None,
+            });
+            app.draw_frame(&frame, viewport, &mut Vec::new()).unwrap();
+            let status = String::from_utf8_lossy(&app.status_line);
+            assert!(status.contains(&format!("{label} {warning}")), "{status}");
+        }
     }
 
     #[test]
@@ -8705,7 +6390,7 @@ mod tests {
         let mut narrow = continuous_frame(narrow_key, revision, false);
         let first = std::sync::Arc::get_mut(&mut narrow).unwrap();
         first.width = 40;
-        first.compressed_rgba = crate::kitty::compress_rgba(&[255; 40 * 240 * 4]).unwrap();
+        first.compressed_rgba = crate::kitty::compress_rgba(&[255; 40 * 240 * 3]).unwrap();
         let wide = continuous_frame(wide_key, revision, false);
         app.tab_mut().cache.clear();
         app.tab_mut().cache.insert(narrow_key, narrow.clone());
@@ -8752,17 +6437,6 @@ mod tests {
         other_tab.document_id += 1;
         app.session.tabs.push(other_tab);
         app.session.active_tab = 1;
-        let path = app.session.tabs[0].path.clone();
-        let source_revision = app.session.tabs[0].watcher.accepted;
-        let snapshot = path.with_extension("manifest.json");
-        app.navigation.source_snapshots.insert(
-            path.clone(),
-            super::SourceState {
-                revision: source_revision,
-                snapshot: Some(snapshot.clone()),
-                best_guess: true,
-            },
-        );
         for pages in [2, 1] {
             let tab = &mut app.session.tabs[0];
             tab.page = 1;
@@ -8790,12 +6464,6 @@ mod tests {
             assert_eq!((tab.scroll_x, tab.scroll_y, tab.zoom), (37, 123, 150));
             assert!(tab.cache.is_empty());
             assert!(app.navigation.flash.is_none());
-            let source = &app.navigation.source_snapshots[&path];
-            assert!(source.best_guess);
-            assert_eq!(
-                source.snapshot_for_revision(source_revision),
-                Some(snapshot.as_path())
-            );
         }
     }
 
@@ -8815,7 +6483,7 @@ mod tests {
             .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(app.missing_visible_page, Some(target));
-        assert!(app.pending.contains(&target));
+        assert!(app.pending.contains_key(&target));
         assert!(!app.tab().cache.contains_key(&target));
         assert_eq!(app.visible_pages.len(), 2);
         let retained = &app.visible_pages[1];
@@ -8837,7 +6505,7 @@ mod tests {
             .unwrap();
         let output = String::from_utf8(output).unwrap();
         let upload = output
-            .find(&format!("\x1b_Ga=T,f=32,s=80,v=240,i={new_id},"))
+            .find(&format!("\x1b_Ga=T,f=24,s=80,v=240,i={new_id},"))
             .unwrap();
         let upload_end = upload + output[upload..].find("\x1b\\").unwrap() + 2;
         assert!(upload_end <= output.find(&delete).unwrap());
@@ -9168,18 +6836,18 @@ mod tests {
     #[test]
     fn search_picker_groups_contextual_results_by_section_and_page() {
         let search = SearchState {
-            query: "representation".into(),
+            query: "teakettle".into(),
             request_id: 1,
             matches: vec![
                 SearchPageMatch {
                     page: 0,
                     occurrences: 2,
-                    context: "…visual representation learning from video…".into(),
+                    context: "…copper teakettle simmering near gravel…".into(),
                 },
                 SearchPageMatch {
                     page: 2,
                     occurrences: 1,
-                    context: "…a representation objective used in prior work…".into(),
+                    context: "…a teakettle barrow parked in damp turnips…".into(),
                 },
             ],
             total_occurrences: 3,
@@ -9228,11 +6896,11 @@ mod tests {
             })
             .collect();
 
-        assert!(rendered.contains("Search representation"));
+        assert!(rendered.contains("Search teakettle"));
         assert!(rendered.contains("3 hits on 2 pages"));
         assert!(rendered.contains("Section  Introduction"));
         assert!(rendered.contains("Page 1 · 2 hits · current"));
-        assert!(rendered.contains("visual representation learning"));
+        assert!(rendered.contains("copper teakettle simmering"));
         assert!(rendered.contains("Section  Methods"));
         assert!(rendered.contains("Page 3 · 1 hit"));
     }
@@ -9297,6 +6965,7 @@ mod tests {
         let mut watcher = FileWatcher {
             accepted: initial,
             candidate: None,
+            failed: None,
             next_poll: started,
         };
 
@@ -9389,37 +7058,57 @@ mod tests {
     fn link_picker_supports_page_and_end_navigation_keys() {
         let control = KeyModifiers::CONTROL;
         assert_eq!(
-            link_picker_navigation_index(3, 30, KeyEvent::new(KeyCode::Char('f'), control), 10,),
+            picker_navigation_index(
+                3,
+                30,
+                KeyEvent::new(KeyCode::Char('f'), control),
+                10,
+                true,
+                ListEdge::Wrap
+            ),
             Some(13)
         );
         assert_eq!(
-            link_picker_navigation_index(13, 30, KeyEvent::new(KeyCode::Char('b'), control), 10,),
+            picker_navigation_index(
+                13,
+                30,
+                KeyEvent::new(KeyCode::Char('b'), control),
+                10,
+                true,
+                ListEdge::Wrap
+            ),
             Some(3)
         );
         assert_eq!(
-            link_picker_navigation_index(
+            picker_navigation_index(
                 13,
                 30,
                 KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
                 10,
+                true,
+                ListEdge::Wrap
             ),
             Some(0)
         );
         assert_eq!(
-            link_picker_navigation_index(
+            picker_navigation_index(
                 13,
                 30,
                 KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
                 10,
+                true,
+                ListEdge::Wrap
             ),
             Some(29)
         );
         assert_eq!(
-            link_picker_navigation_index(
+            picker_navigation_index(
                 13,
                 30,
                 KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
                 10,
+                true,
+                ListEdge::Wrap
             ),
             None
         );
@@ -9469,7 +7158,7 @@ mod tests {
                 source_page: 1,
                 source_top_ratio: 0.1,
                 ordinal: 0,
-                label: "(Grill et al., 2020)".into(),
+                label: "(Zabbo et al., 2020)".into(),
                 source_context: None,
                 reference_context: None,
                 target: LinkTarget::Internal {
@@ -9488,10 +7177,77 @@ mod tests {
                 target: LinkTarget::Uri("https://example.invalid/paper".into()),
             },
         ];
-        assert_eq!(filter_document_links(&links, "grill"), vec![0]);
+        assert_eq!(filter_document_links(&links, "zabbo"), vec![0]);
         assert_eq!(filter_document_links(&links, "source page 3"), vec![1]);
         assert_eq!(filter_document_links(&links, "example paper"), vec![1]);
         assert!(filter_document_links(&links, "missing").is_empty());
+    }
+
+    #[test]
+    fn link_picker_rows_cache_reuses_navigation_and_invalidates_changed_inputs() {
+        use std::sync::Arc;
+        let mut links = vec![DocumentLink {
+            source_page: 1,
+            source_top_ratio: 0.1,
+            ordinal: 0,
+            label: "zog".into(),
+            source_context: None,
+            reference_context: None,
+            target: LinkTarget::Uri("https://example.invalid/zog".into()),
+        }];
+        let outline = vec![OutlineItem {
+            title: "vex".into(),
+            page: 0,
+            depth: 0,
+        }];
+        let mut state = LinkPickerState::new(0);
+        let first = state.rows(LinkPickerDocument::new(&links, &outline));
+        state.select(0, &links);
+        state.page = 1;
+        state.filtering = true;
+        assert!(Arc::ptr_eq(
+            &first,
+            &state.rows(LinkPickerDocument::new(&links, &outline))
+        ));
+
+        state.filter = "missing".into();
+        let filtered = state.rows(LinkPickerDocument::new(&links, &outline));
+        assert!(filtered.filtered.is_empty());
+        assert!(!Arc::ptr_eq(&first, &filtered));
+        state.filter.clear();
+        let unfiltered = state.rows(LinkPickerDocument::new(&links, &outline));
+        links.push(DocumentLink {
+            source_page: 2,
+            label: "vex".into(),
+            ..links[0].clone()
+        });
+        let appended = state.rows(LinkPickerDocument::new(&links, &outline));
+        assert_eq!(appended.filtered, vec![0, 1]);
+        assert!(!Arc::ptr_eq(&unfiltered, &appended));
+        assert_eq!(
+            appended.display,
+            super::link_picker_display_rows(&links, &[0, 1], &outline)
+        );
+
+        let replacement_outline = vec![OutlineItem {
+            title: "zib".into(),
+            page: 2,
+            depth: 0,
+        }];
+        let mut document = LinkPickerDocument::new(&links, &replacement_outline);
+        let replaced_outline = state.rows(document);
+        assert!(!Arc::ptr_eq(&appended, &replaced_outline));
+        assert_ne!(appended.display, replaced_outline.display);
+        document.document_id = 1;
+        let replaced_document = state.rows(document);
+        assert!(!Arc::ptr_eq(&replaced_outline, &replaced_document));
+        document.revision = 1;
+        let replaced_revision = state.rows(document);
+        assert!(!Arc::ptr_eq(&replaced_document, &replaced_revision));
+        assert!(Arc::ptr_eq(&replaced_revision, &state.rows(document)));
+
+        state.reset_for_document(0);
+        assert!(!Arc::ptr_eq(&replaced_revision, &state.rows(document)));
     }
 
     #[test]
@@ -9606,7 +7362,7 @@ mod tests {
                 ordinal: 0,
                 label: "[12]".into(),
                 source_context: Some(
-                    "Prior work identifies the same limitation [12] in dense retrieval. Additional synthetic context continues onto a second line for validation."
+                    "Bramble crates nudge the lopsided kettle [12] in damp gravel. Additional synthetic context continues onto a second line for validation."
                         .into(),
                 ),
                 reference_context: Some("[12] Example et al. A synthetic reference title.".into()),
@@ -9741,7 +7497,7 @@ mod tests {
                 (pane.x..pane.x + pane.width).map(move |x| buffer[(x, y)].symbol().to_string())
             })
             .collect();
-        assert!(rendered.contains("Context  Prior work identifies"));
+        assert!(rendered.contains("Context  Bramble crates nudge"));
         assert!(rendered.contains("second line for validation."));
         assert!(rendered.contains("Reference  [12] Example et al."));
 
@@ -9807,7 +7563,7 @@ mod tests {
                     .map(move |x| buffer[(x, y)].symbol().to_string())
             })
             .collect();
-        assert!(rendered.contains("Context  Prior work identifies"));
+        assert!(rendered.contains("Context  Bramble crates nudge"));
         assert!(rendered.contains("Reference  [12] Example et al."));
     }
 
@@ -10189,7 +7945,7 @@ mod tests {
             Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
 
         terminal
-            .draw(|frame| draw_theme_picker(frame, &themes, &[0, 1], 1, "", false))
+            .draw(|frame| draw_theme_picker(frame, &themes, &[0, 1], 1, 0, "", false))
             .expect("draw theme picker");
         let buffer = terminal.backend().buffer();
         let rendered: String = (popup.y..popup.y + popup.height)
@@ -10555,6 +8311,148 @@ mod tests {
     }
 
     #[test]
+    fn content_follow_link_preserves_omitted_axes() {
+        let (mut app, viewport, _file) = continuous_app();
+        app.canvas_viewport = Some(viewport);
+        app.tab_mut().page_count = 12;
+        app.tab_mut().fit = crate::pdf::FitMode::Content;
+        app.tab_mut().center_content = false;
+        let revision = app.tab().cache.values().next().unwrap().revision;
+        for page in [0, 1, 2, 3, 4] {
+            let key = app.page_key(page, viewport);
+            let mut frame = continuous_frame(key, revision, false);
+            let data = std::sync::Arc::get_mut(&mut frame).unwrap();
+            data.width = 400;
+            data.height = 800;
+            data.content_bounds = [0.6, 0.5, 0.9, 0.75];
+            app.tab_mut().cache.insert(key, frame);
+        }
+
+        // /FitH top (left_ratio == None): preserve content-relative pan and apply top_ratio.
+        app.tab_mut().scroll_x = 120;
+        app.tab_mut().scroll_y = 310;
+        app.follow_link(
+            crate::pdf::LinkTarget::Internal {
+                page: 1,
+                top_ratio: Some(0.25),
+                left_ratio: None,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (1, 120, 200)
+        );
+
+        // Cross-page (None, None) destination onto differently indented page 2:
+        // rebase content-relative horizontal pan (-140px from 260 -> -80px from 60) and preserve scroll_y.
+        let key2 = app.page_key(2, viewport);
+        std::sync::Arc::get_mut(app.tab_mut().cache.get_mut(&key2).unwrap())
+            .unwrap()
+            .content_bounds = [0.1, 0.5, 0.4, 0.75];
+        app.follow_link(
+            crate::pdf::LinkTarget::Internal {
+                page: 2,
+                top_ratio: None,
+                left_ratio: None,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (2, -80, 200)
+        );
+
+        // /FitV left (top_ratio == None): start from target page's content origin and reveal left_ratio,
+        // while preserving scroll_y.
+        app.follow_link(
+            crate::pdf::LinkTarget::Internal {
+                page: 3,
+                top_ratio: None,
+                left_ratio: Some(0.65),
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (3, 260, 200)
+        );
+
+        // Full (Some(left), Some(top)) destination: center content horizontally first, then reveal.
+        app.follow_link(
+            crate::pdf::LinkTarget::Internal {
+                page: 4,
+                top_ratio: Some(0.5),
+                left_ratio: Some(0.1),
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (4, 40, 400)
+        );
+
+        // Uncached distant cross-page /FitH link (page 4 -> page 10): receive_frame evicts page 4
+        // from tab.cache before resolving the destination, yet content-relative pan (-220px from 260)
+        // must still rebase onto page 10's content center (60 + (-220) = -160).
+        assert!(matches!(
+            app.follow_link(
+                crate::pdf::LinkTarget::Internal {
+                    page: 10,
+                    top_ratio: Some(0.25),
+                    left_ratio: None,
+                },
+                &mut Vec::new(),
+            ),
+            Err(super::AppError::Renderer(_))
+        ));
+        let key10 = app.page_key(10, viewport);
+        let mut frame10 = std::sync::Arc::try_unwrap(continuous_frame(key10, revision, false))
+            .expect("unique synthetic frame");
+        frame10.width = 400;
+        frame10.height = 800;
+        frame10.content_bounds = [0.1, 0.5, 0.4, 0.75];
+        frame10.generation = app.generation;
+        app.receive_frame(frame10, &mut Vec::new()).unwrap();
+        assert!(!app.tab().cache.contains_key(&app.page_key(4, viewport)));
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (10, -160, 200)
+        );
+
+        // Chaining through an unrendered intermediate page (10 -> uncached 6 -> cached 10)
+        // must preserve the signed content-relative pan instead of resetting to content center.
+        assert!(matches!(
+            app.follow_link(
+                crate::pdf::LinkTarget::Internal {
+                    page: 6,
+                    top_ratio: Some(0.5),
+                    left_ratio: None,
+                },
+                &mut Vec::new(),
+            ),
+            Err(super::AppError::Renderer(_))
+        ));
+        app.follow_link(
+            crate::pdf::LinkTarget::Internal {
+                page: 10,
+                top_ratio: Some(0.75),
+                left_ratio: None,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (app.tab().page, app.tab().scroll_x, app.tab().scroll_y),
+            (10, -160, 600)
+        );
+    }
+
+    #[test]
     fn content_scrolling_keeps_differently_indented_pages_visible() {
         let (mut app, viewport, _file) = continuous_app();
         app.tab_mut().fit = crate::pdf::FitMode::Content;
@@ -10724,15 +8622,15 @@ mod tests {
     #[test]
     fn fit_cycle_preserves_center_when_old_raster_rounds_the_aspect_ratio() {
         let viewport = Viewport {
-            columns: 100,
+            columns: 50,
             rows: 40,
-            pixel_width: 1000,
+            pixel_width: 500,
             pixel_height: 800,
             top: 0,
             status_row: 40,
         };
         // Fit-page rounds a 210x10000pt page to 17x800px. Recovering its
-        // aspect ratio from those pixels would shift the center by 280px.
+        // aspect ratio from those pixels would shift the center by 140px.
         assert_eq!(
             centered_scaled_view(
                 viewport,
@@ -10751,7 +8649,7 @@ mod tests {
                 false,
                 |_| Some((17, 800, None)),
             ),
-            Ok((0, 0, 23410))
+            Ok((0, 0, 11505))
         );
     }
 
@@ -10956,6 +8854,152 @@ mod tests {
     }
 
     #[test]
+    fn jump_label_overlay_is_cropped_and_screenshots_render_it_on_demand() {
+        let (mut app, viewport, _file) = continuous_app();
+        let key = app.visible_pages[0].frame.key;
+        app.flash_font = Some(crate::screenshot::FlashFont::load("monospace").unwrap());
+        app.label_matches.push(super::LabeledMatch {
+            visible: crate::pdf::VisibleMatch {
+                key,
+                char_index: 0,
+                rects: vec![crate::pdf::PixelRect {
+                    left: 20,
+                    right: 35,
+                    top: 150,
+                    bottom: 158,
+                }],
+                hit: (25, 154),
+                anchor: (25, 154),
+                next_char: None,
+            },
+            label: "q".into(),
+        });
+        let overlay = app.label_overlay_pixels(viewport).unwrap().unwrap();
+        assert_eq!((overlay.col, overlay.row), (2, 5));
+        assert!(
+            overlay.rgba.len()
+                < usize::from(viewport.pixel_width) * usize::from(viewport.pixel_height) * 4
+        );
+        let mut output = Vec::new();
+        app.draw_label_overlay(&mut output).unwrap();
+        assert!(app.label_overlay_id.is_some());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!(
+            "\x1b[{};{}H",
+            viewport.top + overlay.row + 1,
+            overlay.col + 1
+        )));
+        assert!(output.contains(&format!(
+            "s={},v={}",
+            overlay.pixel_width, overlay.pixel_height
+        )));
+        assert!(output.contains(&format!(",c={},r={}", overlay.columns, overlay.rows)));
+
+        let directory = tempfile::tempdir().unwrap();
+        let active = directory.path().join("active.png");
+        app.save_screenshot(&active).unwrap();
+        app.clear_label_overlay(&mut Vec::new()).unwrap();
+        let inactive = directory.path().join("inactive.png");
+        app.save_screenshot(&inactive).unwrap();
+        let pixels = |path| {
+            let mut reader =
+                png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                    .read_info()
+                    .unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            reader.next_frame(&mut pixels).unwrap();
+            pixels
+        };
+        let active = pixels(active);
+        let inactive = pixels(inactive);
+        let width = usize::from(viewport.pixel_width);
+        let x0 = usize::from(overlay.col) * 10;
+        let y0 = usize::from(overlay.row) * 10;
+        assert_ne!(active, inactive);
+        for y in 0..usize::from(viewport.pixel_height) {
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                let mut expected: [u8; 4] = inactive[offset..offset + 4].try_into().unwrap();
+                if (x0..x0 + usize::from(overlay.pixel_width)).contains(&x)
+                    && (y0..y0 + usize::from(overlay.pixel_height)).contains(&y)
+                {
+                    let src = ((y - y0) * usize::from(overlay.pixel_width) + x - x0) * 4;
+                    let source = &overlay.rgba[src..src + 4];
+                    let alpha = u32::from(source[3]);
+                    for channel in 0..3 {
+                        expected[channel] = ((u32::from(source[channel]) * alpha
+                            + u32::from(expected[channel]) * (255 - alpha)
+                            + 127)
+                            / 255) as u8;
+                    }
+                }
+                assert_eq!(&active[offset..offset + 4], &expected);
+            }
+        }
+        app.label_overlay_id = Some(99);
+        app.label_matches.clear();
+        app.flash_font = None;
+        app.save_screenshot(&directory.path().join("empty.png"))
+            .unwrap();
+    }
+
+    #[test]
+    fn match_projection_clamps_frame_bounds_for_native_and_scaled_placements() {
+        let viewport = Viewport {
+            columns: 10,
+            rows: 10,
+            pixel_width: 100,
+            pixel_height: 100,
+            top: 2,
+            status_row: 12,
+        };
+        let mut placement = ImagePlacement {
+            left: 1,
+            columns: 4,
+            rows: 4,
+            crop: Some(crate::kitty::Crop {
+                x: 10,
+                y: 20,
+                width: 40,
+                height: 40,
+            }),
+            scroll_x: 10,
+            scroll_y: 20,
+            native_cell: Some((10, 10)),
+            offset_y: 3,
+        };
+        let rect = crate::pdf::PixelRect {
+            left: 20,
+            top: 30,
+            right: 60,
+            bottom: 70,
+        };
+        for native in [true, false] {
+            placement.native_cell = native.then_some((10, 10));
+            placement.columns = if native { 4 } else { 8 };
+            let projected =
+                super::project_match_rect(&rect, placement, 3, (35, 45), viewport, (10, 10))
+                    .unwrap();
+            assert_eq!((projected.source.right, projected.source.bottom), (35, 45));
+            assert_eq!(
+                (projected.x, projected.y, projected.width, projected.height),
+                if native {
+                    (20, 23, 15, 15)
+                } else {
+                    (30, 20, 30, 15)
+                }
+            );
+            assert_eq!(
+                super::visible_match_points(&[rect], placement, 3, 35, 45, viewport, (10, 10)),
+                Some(((27, 37), (27, 37)))
+            );
+        }
+        assert!(
+            super::project_match_rect(&rect, placement, 3, (10, 20), viewport, (10, 10)).is_none()
+        );
+    }
+
+    #[test]
     fn visible_match_targets_only_displayed_glyphs() {
         use crate::pdf::PixelRect;
 
@@ -11152,7 +9196,6 @@ mod tests {
                 height: 10.0,
                 word: None,
                 inverse_search: None,
-                source_snapshot: None,
                 best_guess: false,
                 warning: None,
             },
@@ -11249,20 +9292,24 @@ mod tests {
 
         // Picker Ctrl-d / Ctrl-u paging
         assert_eq!(
-            link_picker_navigation_index(
+            picker_navigation_index(
                 2,
                 20,
                 KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
                 5,
+                true,
+                ListEdge::Wrap
             ),
             Some(7)
         );
         assert_eq!(
-            link_picker_navigation_index(
+            picker_navigation_index(
                 7,
                 20,
                 KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
                 5,
+                true,
+                ListEdge::Wrap
             ),
             Some(2)
         );
@@ -11699,5 +9746,228 @@ mod tests {
         )
         .unwrap();
         assert_eq!((app.tab().page, app.tab().scroll_y), (1, 34));
+    }
+
+    #[test]
+    fn watcher_failed_fingerprint_jump_alphabet_and_path_prefix_boundaries_hold() {
+        use std::path::Path;
+        use std::time::Duration;
+        // B4: failed fingerprint is not retried until disk metadata changes again.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut watcher = super::session::FileWatcher::new(file.path()).unwrap();
+        std::fs::write(file.path(), b"corrupt-zibble").unwrap();
+        let fp = crate::synctex::DocumentRevision::read(file.path()).unwrap();
+        let start = Instant::now();
+        let _ = watcher.observe(fp, start);
+        let broken_fp = watcher.observe(fp, start + Duration::from_millis(500));
+        assert_eq!(broken_fp, Some(fp));
+        watcher.mark_failed(fp);
+        assert!(
+            watcher
+                .observe(fp, start + Duration::from_secs(2))
+                .is_none()
+        );
+
+        // B5: 48 distinct continuation classes across >= 2 matches leaves 1 symbol; must not spin.
+        let (app, viewport, _) = continuous_app();
+        let key = app.page_key(0, viewport);
+        let classes = "asdfghjklqwertyuiopzxcvbnm!@#$%^&*()[]{};:,.?/\\|";
+        let matches: Vec<crate::pdf::VisibleMatch> = classes
+            .chars()
+            .take(classes.chars().count() - 1)
+            .map(|c| crate::pdf::VisibleMatch {
+                key,
+                char_index: 0,
+                rects: Vec::new(),
+                hit: (0, 0),
+                anchor: (0, 0),
+                next_char: Some(c),
+            })
+            .collect();
+        assert!(super::App::assign_jump_labels(&matches).is_none());
+
+        // B14 + L8: sibling home prefix and root HOME="/" are never stripped; "../" ignores parent name.
+        assert_eq!(
+            super::picker::shorten_path_with_home(
+                "/synth/quuxle/doc.pdf",
+                Some(Path::new("/synth/quux"))
+            ),
+            "/synth/quuxle/doc.pdf"
+        );
+        assert_eq!(
+            super::picker::shorten_path_with_home("/synth/quux.pdf", Some(Path::new("/"))),
+            "/synth/quux.pdf"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let parent_dir = root.path().join("zibbleparent");
+        let child_dir = parent_dir.join("nested");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(child_dir.join("quux.pdf"), b"%PDF-1.4\n").unwrap();
+        let mut browser = crate::browser::BrowserState::with_recents(child_dir, Vec::new());
+        browser.filter = "zibbleparent".into();
+        browser.rebuild_filter();
+        assert!(
+            browser
+                .filtered_indices
+                .iter()
+                .all(|&i| browser.entries[i].name != "../")
+        );
+
+        // L6: empty visible-match reply clears label_loading so input_wait returns to idle cadence.
+        let (mut label_app, label_vp, label_file) = continuous_app();
+        label_app.pending.clear();
+        label_app.canvas_viewport = Some(label_vp);
+        let label_rev = crate::synctex::DocumentRevision::read(label_file.path()).unwrap();
+        label_app.label_query = Some("zqxj".into());
+        label_app.label_loading = true;
+        label_app.label_request_id = 2;
+        assert_eq!(label_app.input_wait(), std::time::Duration::from_millis(10));
+        label_app
+            .receive_visible_matches(
+                super::INITIAL_DOCUMENT_ID,
+                1,
+                label_rev,
+                Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert!(!label_app.label_loading);
+        assert!(label_app.input_wait() >= std::time::Duration::from_millis(50));
+
+        // H1: older prefetched desired_key bumping generation clears stale pending keys and re-requests them.
+        {
+            let _native = crate::pdf::pdfium_test_lock();
+            let pdf_path = root.path().join("two.pdf");
+            let objs = [
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+            ];
+            let mut pdf = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::new();
+            for (idx, obj) in objs.iter().enumerate() {
+                offs.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n{obj}\nendobj\n", idx + 1).as_bytes());
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+            for off in offs {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            std::fs::write(&pdf_path, pdf).unwrap();
+            let worker =
+                crate::pdf::RenderWorker::spawn(super::INITIAL_DOCUMENT_ID, pdf_path.clone(), None);
+            let (pages, outline, rev) = worker.wait_until_ready().unwrap();
+            let cfg: crate::config::Config =
+                toml::from_str("[viewer]\ncontinuous_scroll = true\nprefetch_pages = 0\n").unwrap();
+            let mut live = super::App::new(
+                worker,
+                pages,
+                0,
+                pdf_path,
+                FileWatcher::from_revision(rev),
+                (outline, rev.pdf),
+                super::AppDefaults::from_config(&cfg, None),
+            );
+            live.canvas_viewport = Some(label_vp);
+            live.view_generation = 1;
+            live.generation = 2;
+            live.worker.begin_generation(2);
+            let key0 = live.page_key(0, label_vp);
+            let key1 = live.page_key(1, label_vp);
+            live.desired_key = Some(key0);
+            live.pending.insert(key0, false);
+            live.pending.insert(key1, false);
+            live.pending_scale = Some((key1, super::FitMode::Width, 100));
+            let mut stale_prefetch =
+                std::sync::Arc::into_inner(continuous_frame(key0, rev, false)).unwrap();
+            stale_prefetch.generation = 1;
+            live.receive_frame(stale_prefetch, &mut Vec::new()).unwrap();
+            assert_eq!(live.generation, 3);
+            assert!(live.pending.contains_key(&key1));
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            let mut got_key1 = false;
+            while Instant::now() < deadline && !got_key1 {
+                if let Ok(crate::pdf::WorkerMessage::Frame(f)) = live.worker.try_recv() {
+                    if f.key == key1 && f.generation == 3 {
+                        got_key1 = true;
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            assert!(got_key1);
+
+            // B12: Opening/switching tabs rolls back uncommitted search_picker preview on the outgoing tab.
+            live.session.tabs[0].page = 1;
+            let mut sp = super::SearchPickerState::new(1);
+            sp.preview_origin = Some(super::ViewPosition::top(0));
+            live.search_picker = Some(sp);
+            live.restore_active_picker_preview();
+            assert_eq!(live.session.tabs[0].page, 0);
+            assert!(
+                live.search_picker
+                    .as_ref()
+                    .unwrap()
+                    .preview_origin
+                    .is_none()
+            );
+        }
+
+        // B11: Kitty lowercase + SHIFT normalizes in picker navigation and filter editing.
+        let shift_g = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            super::picker::picker_navigation_index(
+                0,
+                5,
+                shift_g,
+                3,
+                true,
+                super::picker::ListEdge::Clamp,
+            ),
+            Some(4)
+        );
+        let mut filter_buf = String::from("q");
+        assert!(super::picker::edit_picker_filter(&mut filter_buf, shift_g));
+        assert_eq!(filter_buf, "qG");
+
+        // P1 + P5: Out-of-window prefetches are pruned from pending; duplicate frames reuse Arc<Frame>;
+        // active render errors clear pending_vertical_scroll and smooth_scroll_remaining.
+        let (mut multi, multi_vp, _) = continuous_app();
+        multi.canvas_viewport = Some(multi_vp);
+        multi.pending.clear();
+        multi.viewer.prefetch_pages = 1;
+        let far_key = multi.page_key(9, multi_vp);
+        multi.pending.insert(far_key, true);
+        multi.sync_worker_view_window(0);
+        assert!(!multi.pending.contains_key(&far_key));
+        assert!(multi.input_wait() >= std::time::Duration::from_millis(50));
+
+        let k0 = multi.page_key(0, multi_vp);
+        multi.view_generation = 1;
+        multi.generation = 1;
+        let f_a = std::sync::Arc::into_inner(continuous_frame(k0, label_rev, false)).unwrap();
+        let f_b = std::sync::Arc::into_inner(continuous_frame(k0, label_rev, false)).unwrap();
+        multi.receive_frame(f_a, &mut Vec::new()).unwrap();
+        let ptr_a = std::sync::Arc::clone(multi.tab().cache.get(&k0).unwrap());
+        multi.receive_frame(f_b, &mut Vec::new()).unwrap();
+        let ptr_b = std::sync::Arc::clone(multi.tab().cache.get(&k0).unwrap());
+        assert!(std::sync::Arc::ptr_eq(&ptr_a, &ptr_b));
+
+        multi.pending_vertical_scroll = 12;
+        multi.smooth_scroll_remaining = 8;
+        multi
+            .receive_render_error(k0, multi.view_generation, "zibble", &mut Vec::new())
+            .unwrap();
+        assert_eq!(multi.pending_vertical_scroll, 0);
+        assert_eq!(multi.smooth_scroll_remaining, 0);
     }
 }

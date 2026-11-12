@@ -33,6 +33,16 @@ pub struct Badge<'a> {
     pub background: [u8; 3],
 }
 
+pub struct Overlay {
+    pub col: u16,
+    pub row: u16,
+    pub columns: u16,
+    pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    pub rgba: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 pub struct BadgeLayout {
     pub width: u32,
@@ -212,6 +222,95 @@ fn blank_overlay(viewport: Viewport) -> io::Result<Vec<u8>> {
     Ok(vec![0; pixel_count(viewport)?])
 }
 
+pub fn cropped_overlay(
+    font: &mut FlashFont,
+    viewport: Viewport,
+    rects: &[Rect],
+    badges: &[Badge<'_>],
+) -> io::Result<Option<Overlay>> {
+    pixel_count(viewport)?;
+    let width = u32::from(viewport.pixel_width);
+    let height = u32::from(viewport.pixel_height);
+    let (cw, ch) = viewport.cell_size();
+    let mut left = width;
+    let mut top = height;
+    let mut right = 0;
+    let mut bottom = 0;
+    for (x, y, w, h) in rects.iter().map(|r| (r.x, r.y, r.width, r.height)).chain(
+        badges
+            .iter()
+            .map(|b| (b.x, b.y, b.layout.width, b.layout.height)),
+    ) {
+        let x1 = x.saturating_add(w).min(width);
+        let y1 = y.saturating_add(h).min(height);
+        if x < x1 && y < y1 {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x1);
+            bottom = bottom.max(y1);
+        }
+    }
+    if left >= right || top >= bottom {
+        return Ok(None);
+    }
+    let col = (left / cw).min(u32::from(viewport.columns - 1)) as u16;
+    let row = (top / ch).min(u32::from(viewport.rows - 1)) as u16;
+    let end_col = right.div_ceil(cw).min(u32::from(viewport.columns)) as u16;
+    let end_row = bottom.div_ceil(ch).min(u32::from(viewport.rows)) as u16;
+    let x = u32::from(col) * cw;
+    let y = u32::from(row) * ch;
+    right = if end_col == viewport.columns {
+        width
+    } else {
+        u32::from(end_col) * cw
+    };
+    bottom = if end_row == viewport.rows {
+        height
+    } else {
+        u32::from(end_row) * ch
+    };
+    let cropped = Viewport {
+        columns: end_col - col,
+        rows: end_row - row,
+        pixel_width: (right - x) as u16,
+        pixel_height: (bottom - y) as u16,
+        ..viewport
+    };
+    let rects: Vec<_> = rects
+        .iter()
+        .filter(|r| r.x < right && r.y < bottom && r.width > 0 && r.height > 0)
+        .map(|r| Rect {
+            x: r.x.saturating_sub(x),
+            y: r.y.saturating_sub(y),
+            width: r.width,
+            height: r.height,
+            color: r.color,
+        })
+        .collect();
+    let badges: Vec<_> = badges
+        .iter()
+        .filter(|b| b.x < right && b.y < bottom && b.layout.width > 0 && b.layout.height > 0)
+        .map(|b| Badge {
+            x: b.x.saturating_sub(x),
+            y: b.y.saturating_sub(y),
+            layout: b.layout,
+            text: b.text,
+            foreground: b.foreground,
+            background: b.background,
+        })
+        .collect();
+    let rgba = overlay(font, cropped, &rects, &badges)?;
+    Ok(Some(Overlay {
+        col,
+        row,
+        columns: cropped.columns,
+        rows: cropped.rows,
+        pixel_width: cropped.pixel_width,
+        pixel_height: cropped.pixel_height,
+        rgba,
+    }))
+}
+
 pub fn overlay(
     font: &mut FlashFont,
     viewport: Viewport,
@@ -307,33 +406,34 @@ fn decompress(frame: &Frame) -> io::Result<Vec<u8>> {
                 .ok()
                 .and_then(|h| w.checked_mul(h))
         })
-        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_mul(3))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame dimensions overflow"))?;
     let decoder = ZlibDecoder::new(frame.compressed_rgba.as_slice());
-    let mut rgba = Vec::with_capacity(expected);
-    decoder.take(expected as u64 + 1).read_to_end(&mut rgba)?;
-    if rgba.len() != expected {
+    let mut rgb = Vec::with_capacity(expected);
+    decoder.take(expected as u64 + 1).read_to_end(&mut rgb)?;
+    if rgb.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "cached frame has invalid RGBA length",
+            "cached frame has invalid RGB length",
         ));
     }
-    Ok(rgba)
+    Ok(rgb)
 }
 
 fn compose(
     viewport: Viewport,
     pages: &[Page<'_>],
-    overlay: Option<&[u8]>,
+    overlay: Option<&Overlay>,
     background: [u8; 3],
 ) -> io::Result<Vec<u8>> {
     let expected = pixel_count(viewport)?;
     if let Some(overlay) = overlay
-        && overlay.len() != expected
+        && overlay.rgba.len()
+            != usize::from(overlay.pixel_width) * usize::from(overlay.pixel_height) * 4
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "overlay dimensions do not match viewport",
+            "overlay dimensions do not match RGBA length",
         ));
     }
     let width = u32::from(viewport.pixel_width);
@@ -343,11 +443,10 @@ fn compose(
         pixel[..3].copy_from_slice(&background);
         pixel[3] = 255;
     }
-    let cell_w = (width / u32::from(viewport.columns.max(1))).max(1);
-    let cell_h = (height / u32::from(viewport.rows.max(1))).max(1);
+    let (cell_w, cell_h) = viewport.cell_size();
     for page in pages {
         let frame = page.frame;
-        let rgba = decompress(frame)?;
+        let rgb = decompress(frame)?;
         let crop = page.placement.crop.unwrap_or(crate::kitty::Crop {
             x: 0,
             y: 0,
@@ -380,28 +479,29 @@ fn compose(
             if y >= height {
                 break;
             }
-            let sy = sy0 + (u64::from(dy) * u64::from(sy1 - sy0) / u64::from(dst_h.max(1))) as u32;
+            let sy = sy0 + (u64::from(dy) * u64::from(sy1 - sy0) / u64::from(dst_h)) as u32;
             for dx in 0..dst_w {
                 let x = dst_x.saturating_add(dx);
                 if x >= width {
                     break;
                 }
-                let sx =
-                    sx0 + (u64::from(dx) * u64::from(sx1 - sx0) / u64::from(dst_w.max(1))) as u32;
-                let source = ((sy * frame.width + sx) * 4) as usize;
+                let sx = sx0 + (u64::from(dx) * u64::from(sx1 - sx0) / u64::from(dst_w)) as u32;
+                let source = ((sy * frame.width + sx) * 3) as usize;
                 let target = ((y * width + x) * 4) as usize;
-                output[target..target + 4].copy_from_slice(&rgba[source..source + 4]);
+                output[target..target + 3].copy_from_slice(&rgb[source..source + 3]);
+                output[target + 3] = 255;
             }
         }
     }
     if let Some(overlay) = overlay {
-        for (dst, src) in output
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(overlay.as_chunks::<4>().0)
-        {
-            blend(dst, src);
+        let x = u32::from(overlay.col) * cell_w;
+        let y = u32::from(overlay.row) * cell_h;
+        for dy in 0..u32::from(overlay.pixel_height).min(height.saturating_sub(y)) {
+            for dx in 0..u32::from(overlay.pixel_width).min(width.saturating_sub(x)) {
+                let dst = (((y + dy) * width + x + dx) * 4) as usize;
+                let src = ((dy * u32::from(overlay.pixel_width) + dx) * 4) as usize;
+                blend(&mut output[dst..dst + 4], &overlay.rgba[src..src + 4]);
+            }
         }
     }
     Ok(output)
@@ -413,21 +513,11 @@ pub fn save(
     path: &Path,
     viewport: Viewport,
     pages: &[Page<'_>],
-    overlay: Option<&[u8]>,
+    overlay: Option<&Overlay>,
     background: [u8; 3],
 ) -> io::Result<()> {
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "screenshot output path must be absolute",
-        ));
-    }
-    if path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("screenshot output already exists: {}", path.display()),
-        ));
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    crate::ipc::validate_screenshot_path(path)?;
     let rgba = compose(viewport, pages, overlay, background)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -447,6 +537,7 @@ pub fn save(
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&candidate)
         {
             Ok(file) => break (candidate, file),
@@ -486,11 +577,149 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn cropped_overlay_preserves_viewport_pixels_and_cell_origin() {
+        let viewport = Viewport {
+            columns: 20,
+            rows: 8,
+            pixel_width: 160,
+            pixel_height: 96,
+            top: 3,
+            status_row: 11,
+        };
+        let mut font = FlashFont::load("monospace").unwrap();
+        let rects = [Rect {
+            x: 35,
+            y: 28,
+            width: 19,
+            height: 7,
+            color: [20, 40, 80, 96],
+        }];
+        let badges = [Badge {
+            x: 54,
+            y: 25,
+            layout: font.badge_layout("qz", 10).unwrap(),
+            text: "qz",
+            foreground: [240, 220, 200],
+            background: [80, 30, 20],
+        }];
+        let full = overlay(&mut font, viewport, &rects, &badges).unwrap();
+        let cropped = cropped_overlay(&mut font, viewport, &rects, &badges)
+            .unwrap()
+            .unwrap();
+        let right = (54 + badges[0].layout.width).max(54).div_ceil(8) * 8;
+        let bottom = (25 + badges[0].layout.height).max(35).div_ceil(12) * 12;
+        assert_eq!((cropped.col, cropped.row), (4, 2));
+        assert_eq!(
+            (
+                u32::from(cropped.pixel_width),
+                u32::from(cropped.pixel_height)
+            ),
+            (right - 32, bottom - 24)
+        );
+        assert!(cropped.rgba.len() < full.len() / 4);
+        let composed = compose(viewport, &[], Some(&cropped), [5, 10, 15]).unwrap();
+        for (index, source) in full.as_chunks::<4>().0.iter().enumerate() {
+            let mut expected = [5, 10, 15, 255];
+            blend(&mut expected, source);
+            assert_eq!(&composed[index * 4..index * 4 + 4], &expected);
+        }
+    }
+
+    #[test]
+    fn cropped_overlay_clips_viewport_edges_and_skips_invisible_rects() {
+        let viewport = Viewport {
+            columns: 480,
+            rows: 135,
+            pixel_width: 3840,
+            pixel_height: 2160,
+            top: 0,
+            status_row: 135,
+        };
+        let mut font = FlashFont::load("monospace").unwrap();
+        let rects = [
+            Rect {
+                x: 3837,
+                y: 2157,
+                width: 100,
+                height: 100,
+                color: [1, 2, 3, 255],
+            },
+            Rect {
+                x: 4000,
+                y: 20,
+                width: 10,
+                height: 10,
+                color: [1, 2, 3, 255],
+            },
+        ];
+        let zero_badge = [Badge {
+            x: 0,
+            y: 0,
+            layout: BadgeLayout {
+                width: 0,
+                height: 10,
+                glyph_size: 10,
+                origin_x: 0,
+                baseline: 0,
+            },
+            text: "a",
+            foreground: [1, 2, 3],
+            background: [4, 5, 6],
+        }];
+        let cropped = cropped_overlay(&mut font, viewport, &rects, &zero_badge)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (cropped.col, cropped.row, cropped.columns, cropped.rows),
+            (479, 134, 1, 1)
+        );
+        assert_eq!((cropped.pixel_width, cropped.pixel_height), (8, 16));
+        assert_eq!(cropped.rgba.len(), 8 * 16 * 4);
+        assert!(
+            cropped_overlay(&mut font, viewport, &rects[1..], &zero_badge)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cropped_overlay(&mut font, viewport, &[], &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compose_rejects_invalid_cropped_overlay_length() {
+        let viewport = Viewport {
+            columns: 2,
+            rows: 2,
+            pixel_width: 16,
+            pixel_height: 32,
+            top: 0,
+            status_row: 2,
+        };
+        let overlay = Overlay {
+            col: 1,
+            row: 1,
+            columns: 1,
+            rows: 1,
+            pixel_width: 8,
+            pixel_height: 16,
+            rgba: vec![0; 4],
+        };
+        assert_eq!(
+            compose(viewport, &[], Some(&overlay), [0; 3])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn screenshot_uses_page_crop_and_viewport_origin() {
         let mut source = Vec::new();
         for y in 0..4u8 {
             for x in 0..4u8 {
-                source.extend_from_slice(&[x * 40, y * 40, 0, 255]);
+                source.extend_from_slice(&[x * 40, y * 40, 0]);
             }
         }
         let compressed_rgba = crate::kitty::compress_rgba(&source).unwrap();
@@ -559,10 +788,16 @@ mod tests {
                 placement,
                 row: 0,
             }],
-            Some(&[0; 4 * 4 * 4]),
+            None,
             [0, 0, 0],
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let mut reader =
             png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
                 .read_info()
@@ -577,6 +812,38 @@ mod tests {
         assert_eq!(&pixels[4 * 4 + 4..4 * 4 + 8], &[80, 40, 0, 255]);
         assert_eq!(&pixels[2 * 4 * 4..2 * 4 * 4 + 4], &[40, 80, 0, 255]);
         assert_eq!(&pixels[3 * 4 * 4..3 * 4 * 4 + 4], &[0, 0, 0, 255]);
+
+        let mut bad_frame = Frame {
+            compressed_rgba: crate::kitty::compress_rgba(&[0; 64]).unwrap(),
+            key: frame.key,
+            revision: frame.revision,
+            width: 4,
+            height: 4,
+            page_width_pt: 4.0,
+            page_height_pt: 4.0,
+            content_bounds: [0.0, 0.0, 1.0, 1.0],
+            render_elapsed: Duration::ZERO,
+            dark_mode_elapsed: None,
+            highlight_elapsed: None,
+            compression_elapsed: Duration::ZERO,
+            generation: 0,
+            links: Vec::new(),
+            flash: None,
+        };
+        assert!(
+            compose(
+                viewport,
+                &[Page {
+                    frame: &bad_frame,
+                    placement,
+                    row: 0,
+                }],
+                None,
+                [0, 0, 0]
+            )
+            .is_err()
+        );
+        bad_frame.compressed_rgba.clear();
     }
 
     #[test]

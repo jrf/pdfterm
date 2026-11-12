@@ -137,26 +137,12 @@ impl Config {
             .into_iter()
             .flatten()
         {
-            if value.is_empty() {
-                continue;
+            if let Some(selected) = prefixed_session_socket(name, value)? {
+                endpoints.push((value, selected));
             }
-            let path = Path::new(value);
-            let file = path
-                .file_name()
-                .ok_or_else(|| io::Error::other("socket path has no filename"))?;
-            let selected = path.with_file_name(format!("{name}-{}", file.to_string_lossy()));
-            if selected.as_os_str().as_encoded_bytes().len() > 103 {
-                return Err(io::Error::other(
-                    "named session socket path exceeds 103 bytes",
-                ));
-            }
-            endpoints.push((value, selected));
         }
         for (value, selected) in endpoints {
-            *value = selected
-                .into_os_string()
-                .into_string()
-                .map_err(|_| io::Error::other("socket path is not UTF-8"))?;
+            *value = selected;
         }
         self.session = Some(name.to_owned());
         Ok(())
@@ -207,16 +193,56 @@ impl Config {
     }
 }
 
+pub(crate) fn prefixed_session_socket(name: &str, value: &str) -> io::Result<Option<String>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let path = Path::new(value);
+    let file = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("socket path has no filename"))?;
+    let selected = path.with_file_name(format!("{name}-{}", file.to_string_lossy()));
+    if selected.as_os_str().as_encoded_bytes().len() > 103 {
+        return Err(io::Error::other(
+            "named session socket path exceeds 103 bytes",
+        ));
+    }
+    selected
+        .into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| io::Error::other("socket path is not UTF-8"))
+}
+
 pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
-pub(crate) fn config_root() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    absolute_env_dir(env::var_os("HOME"))
+}
+
+pub(crate) fn xdg_dir(env_key: &str, home_suffix: &str) -> Option<PathBuf> {
+    resolve_xdg_dir(env::var_os(env_key), env::var_os("HOME"), home_suffix)
+}
+
+fn absolute_env_dir(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base)
+        .filter(|path| path.is_absolute())
+}
+
+fn resolve_xdg_dir(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    home_suffix: &str,
+) -> Option<PathBuf> {
+    absolute_env_dir(xdg).or_else(|| absolute_env_dir(home).map(|base| base.join(home_suffix)))
+}
+
+pub(crate) fn config_root() -> Option<PathBuf> {
+    xdg_dir("XDG_CONFIG_HOME", ".config")
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
@@ -545,5 +571,21 @@ mod tests {
         ] {
             assert!(config.select_session(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn resolve_xdg_dir_ignores_empty_and_relative_home_or_xdg() {
+        assert_eq!(
+            super::resolve_xdg_dir(Some("".into()), Some("".into()), ".config"),
+            None
+        );
+        assert_eq!(
+            super::resolve_xdg_dir(Some("rel/cfg".into()), Some("rel/home".into()), ".config"),
+            None
+        );
+        assert_eq!(
+            super::resolve_xdg_dir(Some("".into()), Some("/synth/zibble".into()), ".config"),
+            Some(std::path::PathBuf::from("/synth/zibble/.config"))
+        );
     }
 }

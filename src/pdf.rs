@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,8 +11,8 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, select_biased, unbounded
 use pdfium_render::prelude::{
     PdfAction, PdfBookmark, PdfDestination, PdfDestinationViewSettings, PdfDocument, PdfLink,
     PdfMatrix, PdfPage, PdfPageObject, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPageText,
-    PdfPageTextChar, PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig, Pdfium,
-    PdfiumError,
+    PdfPageTextChar, PdfPageTextChars, PdfPageTextRenderMode, PdfPoints, PdfRect, PdfRenderConfig,
+    Pdfium, PdfiumError,
 };
 
 use crate::synctex::{
@@ -96,6 +97,9 @@ impl FitMode {
         target_width: u32,
         target_height: u32,
     ) -> (u32, u32) {
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return (1, 1);
+        }
         let mut scale = match self {
             Self::Page | Self::Width => target_width as f32 / width,
             Self::Height => target_height as f32 / height,
@@ -110,24 +114,25 @@ impl FitMode {
         if self == Self::Page && height * scale > target_height as f32 {
             scale = target_height as f32 / height;
         }
-        if self == Self::Content {
-            // Content can be a single tiny mark. Bound the full-page bitmap,
-            // not just the fitted object, before converting dimensions to i32.
-            const MAX_PIXELS: f32 = 16_777_216.0;
-            const MAX_DIMENSION: f32 = 32_768.0;
-            scale = scale
-                .min((MAX_PIXELS / (width * height)).sqrt())
-                .min(MAX_DIMENSION / width.max(height));
-        }
+        const MAX_PIXELS: u64 = 16_777_216;
+        const MAX_DIMENSION: u32 = 32_768;
+        scale = scale
+            .min((MAX_PIXELS as f32 / (width * height)).sqrt())
+            .min(MAX_DIMENSION as f32 / width.max(height));
         let pixels = |size: f32| {
             (if self == Self::Content {
                 size.floor()
             } else {
                 size.round()
             })
-            .max(1.0) as u32
+            .clamp(1.0, MAX_DIMENSION as f32) as u32
         };
-        (pixels(width * scale), pixels(height * scale))
+        let (mut raster_width, mut raster_height) = (pixels(width * scale), pixels(height * scale));
+        if u64::from(raster_width) * u64::from(raster_height) > MAX_PIXELS {
+            raster_width = (width * scale).floor().clamp(1.0, MAX_DIMENSION as f32) as u32;
+            raster_height = (height * scale).floor().clamp(1.0, MAX_DIMENSION as f32) as u32;
+        }
+        (raster_width, raster_height)
     }
 }
 
@@ -141,24 +146,38 @@ fn build_fit_config(
     page: &PdfPage,
     content: [f32; 4],
 ) -> PdfRenderConfig {
-    match fit {
-        FitMode::Page => base_config
-            .set_target_width(target_width)
-            .set_maximum_width(target_width)
-            .set_maximum_height(target_height),
-        FitMode::Width => base_config.set_target_width(target_width),
-        FitMode::Height => base_config.set_target_height(target_height),
-        FitMode::Content => {
-            let (width, height) = fit.raster_size(
-                page.width().value,
-                page.height().value,
-                content,
-                target_width as u32,
-                target_height as u32,
-            );
-            base_config.set_target_size(width as i32, height as i32)
-        }
-    }
+    let (width, height) = fit.raster_size(
+        page.width().value,
+        page.height().value,
+        content,
+        target_width.max(1) as u32,
+        target_height.max(1) as u32,
+    );
+    base_config.set_target_size(width as i32, height as i32)
+}
+
+fn frame_render_config(
+    key: RenderKey,
+    page: &PdfPage,
+    geometry: &mut CachedPageGeometry,
+) -> (PdfRenderConfig, [f32; 4]) {
+    let zoom = i32::from(key.zoom.max(1));
+    let target_width = (i32::from(key.width) * zoom / 100).max(1);
+    let target_height = (i32::from(key.height) * zoom / 100).max(1);
+    let content = if key.fit == FitMode::Content {
+        cached_page_content_bounds(page, geometry)
+    } else {
+        [0.0, 0.0, 1.0, 1.0]
+    };
+    let config = build_fit_config(
+        base_render_config(),
+        key.fit,
+        target_width,
+        target_height,
+        page,
+        content,
+    );
+    (config, content)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -425,6 +444,11 @@ pub enum WorkerMessage {
         revision: DocumentRevision,
         error: String,
     },
+    RenderError {
+        key: RenderKey,
+        generation: u64,
+        error: String,
+    },
     Frame(Frame),
     Error(String),
 }
@@ -484,7 +508,65 @@ enum WorkerTask {
     Command(WorkerCommand),
     IndexLinkPage(LinkIndexJob),
     SearchPage(SearchJob),
-    Render(RenderRequest),
+    Render(RenderRequest, bool),
+}
+
+type TexFontCache = HashMap<String, [Option<bool>; 128]>;
+
+struct LoadedDocument<'a> {
+    document: PdfDocument<'a>,
+    revision: DocumentRevision,
+    text_cache: Vec<Option<CachedPageText>>,
+    font_cache: TexFontCache,
+    page_cache: HashMap<u32, CachedPageGeometry>,
+    search_highlights: Option<SearchHighlights>,
+    flash_highlight: Option<(u32, ForwardHighlight)>,
+}
+
+impl<'a> LoadedDocument<'a> {
+    fn new(document: PdfDocument<'a>, revision: DocumentRevision, pages: u32) -> Self {
+        Self {
+            document,
+            revision,
+            text_cache: empty_text_cache(pages),
+            font_cache: HashMap::new(),
+            page_cache: HashMap::new(),
+            search_highlights: None,
+            flash_highlight: None,
+        }
+    }
+}
+
+struct CachedBaseRaster {
+    key: RenderKey,
+    revision: DocumentRevision,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+impl CachedBaseRaster {
+    fn matches(&self, key: RenderKey, revision: DocumentRevision) -> bool {
+        self.revision == revision
+            && (
+                self.key.document_id,
+                self.key.page,
+                self.key.width,
+                self.key.height,
+                self.key.zoom,
+                self.key.fit,
+                self.key.invert,
+            ) == (
+                key.document_id,
+                key.page,
+                key.width,
+                key.height,
+                key.zoom,
+                key.fit,
+                key.invert,
+            )
+            && (!key.invert || self.key.dark_mode_style == key.dark_mode_style)
+    }
 }
 
 struct SearchJob {
@@ -493,7 +575,7 @@ struct SearchJob {
     needle: String,
     next_page: u32,
     total_pages: u32,
-    matches: Vec<SearchPageMatch>,
+    pending_matches: Vec<SearchPageMatch>,
     total_occurrences: u32,
     highlights: HashMap<u32, Vec<SearchRect>>,
     last_progress: Instant,
@@ -526,12 +608,38 @@ pub struct VisibleMatch {
     pub anchor: (u32, u32),
     pub next_char: Option<char>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct CachedPageText {
     raw: String,
     normalized: String,
     source_index_by_byte: Vec<usize>,
-    visible: Option<(String, Vec<(usize, usize)>)>,
+    full_text_initialized: bool,
+    visible: Option<VisiblePageText>,
+}
+
+#[derive(Clone, Debug)]
+struct VisiblePageText {
+    normalized: String,
+    source_index_by_byte: Vec<usize>,
+    glyphs: Vec<VisibleGlyph>,
+}
+
+#[derive(Clone, Debug)]
+struct VisibleGlyph {
+    source_index: usize,
+    value: char,
+    bounds: [Option<PdfRect>; 2],
+}
+
+#[derive(Default)]
+struct CachedPageGeometry {
+    content_bounds: Option<[f32; 4]>,
+    links: Option<Vec<CachedPageLink>>,
+}
+
+struct CachedPageLink {
+    bounds: PdfRect,
+    target: Option<LinkTarget>,
 }
 struct WorkerChannels {
     priority_rx: Receiver<RenderRequest>,
@@ -540,13 +648,19 @@ struct WorkerChannels {
     message_tx: Sender<WorkerMessage>,
 }
 
+struct WorkerState {
+    latest_generation: AtomicU64,
+    min_valid_generation: AtomicU64,
+    prefetch_bounds: AtomicU64,
+    visible_generation: AtomicU64,
+}
+
 pub struct RenderWorker {
     priority_tx: Sender<RenderRequest>,
     prefetch_tx: Sender<RenderRequest>,
     command_tx: Sender<WorkerCommand>,
     message_rx: Receiver<WorkerMessage>,
-    latest_generation: Arc<AtomicU64>,
-    visible_generation: Arc<AtomicU64>,
+    state: Arc<WorkerState>,
 }
 
 impl RenderWorker {
@@ -555,10 +669,13 @@ impl RenderWorker {
         let (prefetch_tx, prefetch_rx) = unbounded();
         let (command_tx, command_rx) = unbounded();
         let (message_tx, message_rx) = unbounded();
-        let latest_generation = Arc::new(AtomicU64::new(0));
-        let worker_generation = Arc::clone(&latest_generation);
-        let visible_generation = Arc::new(AtomicU64::new(0));
-        let worker_visible_generation = Arc::clone(&visible_generation);
+        let state = Arc::new(WorkerState {
+            latest_generation: AtomicU64::new(0),
+            min_valid_generation: AtomicU64::new(0),
+            prefetch_bounds: AtomicU64::new(u64::from(u32::MAX) << 32),
+            visible_generation: AtomicU64::new(0),
+        });
+        let worker_state = Arc::clone(&state);
 
         thread::spawn(move || {
             run_worker(
@@ -571,8 +688,7 @@ impl RenderWorker {
                     command_rx,
                     message_tx,
                 },
-                worker_generation,
-                worker_visible_generation,
+                worker_state,
             );
         });
 
@@ -581,8 +697,7 @@ impl RenderWorker {
             prefetch_tx,
             command_tx,
             message_rx,
-            latest_generation,
-            visible_generation,
+            state,
         }
     }
 
@@ -594,18 +709,7 @@ impl RenderWorker {
                 revision,
             }) => Ok((pages, outline, revision)),
             Ok(WorkerMessage::Error(error)) => Err(error),
-            Ok(
-                WorkerMessage::Opened { .. }
-                | WorkerMessage::OpenError { .. }
-                | WorkerMessage::LinkIndexProgress { .. }
-                | WorkerMessage::Text { .. }
-                | WorkerMessage::SearchProgress { .. }
-                | WorkerMessage::SearchResults { .. }
-                | WorkerMessage::VisibleMatchesError { .. }
-                | WorkerMessage::VisibleMatches { .. }
-                | WorkerMessage::PagePoint { .. }
-                | WorkerMessage::Frame(_),
-            ) => Err("renderer sent a frame before initialization".into()),
+            Ok(_) => Err("renderer sent a frame before initialization".into()),
             Err(_) => Err("renderer stopped during initialization".into()),
         }
     }
@@ -621,18 +725,32 @@ impl RenderWorker {
     }
 
     pub fn begin_generation(&self, generation: u64) {
-        self.latest_generation.store(generation, Ordering::Release);
+        self.state
+            .latest_generation
+            .store(generation, Ordering::Release);
+    }
+
+    pub fn invalidate_view(&self, min_valid_generation: u64) {
+        self.state
+            .min_valid_generation
+            .store(min_valid_generation, Ordering::Release);
+    }
+
+    pub fn set_view_state(&self, min_valid_generation: u64, min_page: u32, max_page: u32) {
+        self.invalidate_view(min_valid_generation);
+        self.state.prefetch_bounds.store(
+            u64::from(min_page) | (u64::from(max_page) << 32),
+            Ordering::Release,
+        );
     }
 
     pub fn open(&self, document_id: DocumentId, path: PathBuf) -> Result<(), String> {
-        self.visible_generation.fetch_add(1, Ordering::AcqRel);
         self.command_tx
             .send(WorkerCommand::Open { document_id, path })
             .map_err(|_| "renderer stopped".into())
     }
 
     pub fn close(&self, document_id: DocumentId) {
-        self.visible_generation.fetch_add(1, Ordering::AcqRel);
         let _ = self.command_tx.send(WorkerCommand::Close(document_id));
     }
 
@@ -698,6 +816,7 @@ impl RenderWorker {
         keys: Vec<(RenderKey, u32, u32)>,
     ) -> Result<(), String> {
         let generation = self
+            .state
             .visible_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
@@ -713,7 +832,7 @@ impl RenderWorker {
             .map_err(|_| "renderer stopped".into())
     }
     pub fn cancel_visible(&self) {
-        self.visible_generation.fetch_add(1, Ordering::AcqRel);
+        self.state.visible_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn cancel_search(&self, document_id: DocumentId, request_id: u64) {
@@ -735,13 +854,48 @@ impl RenderWorker {
     }
 }
 
+fn base_render_config() -> PdfRenderConfig {
+    PdfRenderConfig::new()
+        .set_reverse_byte_order(true)
+        .use_lcd_text_rendering(true)
+        .force_half_tone(false)
+        .use_print_quality(false)
+}
+
+fn open_pdf_document<'a>(
+    pdfium: &'a Pdfium,
+    path: &Path,
+    wrap_revision_error: bool,
+) -> Result<(PdfDocument<'a>, DocumentRevision, u32, Vec<OutlineItem>), String> {
+    let wrap = |error: String| format!("could not open {}: {error}", path.display());
+    let map_rev = |error: std::io::Error| {
+        let text = error.to_string();
+        if wrap_revision_error {
+            wrap(text)
+        } else {
+            text
+        }
+    };
+    let revision = DocumentRevision::read(path).map_err(map_rev)?;
+    let document = pdfium
+        .load_pdf_from_file(path, None)
+        .map_err(|error| wrap(error.to_string()))?;
+    let pages = u32::try_from(document.pages().len())
+        .map_err(|_| "PDFium returned a negative page count".to_string())?;
+    if pages == 0 {
+        return Err(format!("{} has no pages", path.display()));
+    }
+    let outline = extract_outline(&document);
+    revision.check(path).map_err(map_rev)?;
+    Ok((document, revision, pages, outline))
+}
+
 fn run_worker(
     path: PathBuf,
     initial_document_id: DocumentId,
     pdfium_library: Option<&Path>,
     channels: WorkerChannels,
-    latest_generation: Arc<AtomicU64>,
-    visible_generation: Arc<AtomicU64>,
+    state: Arc<WorkerState>,
 ) {
     let WorkerChannels {
         priority_rx,
@@ -749,164 +903,132 @@ fn run_worker(
         command_rx,
         message_tx,
     } = channels;
+    let send = |msg: WorkerMessage| {
+        message_tx
+            .send(msg)
+            .map_err(|_| "viewer stopped".to_string())
+    };
     let result = (|| -> Result<(), String> {
         let pdfium = load_pdfium(pdfium_library)?;
-        let revision = DocumentRevision::read(&path).map_err(|error| error.to_string())?;
-        let document = pdfium
-            .load_pdf_from_file(&path, None)
-            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-        let pages = u32::try_from(document.pages().len())
-            .map_err(|_| "PDFium returned a negative page count".to_string())?;
-        if pages == 0 {
-            return Err(format!("{} has no pages", path.display()));
-        }
-        let outline = extract_outline(&document);
-        revision.check(&path).map_err(|error| error.to_string())?;
-        message_tx
-            .send(WorkerMessage::Ready {
-                pages,
-                outline,
-                revision,
-            })
-            .map_err(|_| "viewer stopped".to_string())?;
-        let mut documents = HashMap::from([(initial_document_id, document)]);
-        let mut revisions = HashMap::from([(initial_document_id, revision)]);
-        let mut text_cache: HashMap<DocumentId, Vec<Option<CachedPageText>>> =
-            HashMap::from([(initial_document_id, empty_text_cache(pages))]);
-        let mut search_jobs = VecDeque::new();
-        let mut link_index_jobs = VecDeque::new();
-        let mut search_highlights: HashMap<DocumentId, SearchHighlights> = HashMap::new();
-        let mut flash_highlights: HashMap<DocumentId, (u32, ForwardHighlight)> = HashMap::new();
-        let mut deferred_render: Option<RenderRequest> = None;
+        let (document, revision, pages, outline) = open_pdf_document(&pdfium, &path, false)?;
+        send(WorkerMessage::Ready {
+            pages,
+            outline,
+            revision,
+        })?;
+        let mut documents = HashMap::from([(
+            initial_document_id,
+            LoadedDocument::new(document, revision, pages),
+        )]);
+        let mut search_jobs: VecDeque<SearchJob> = VecDeque::new();
+        let mut link_index_jobs: VecDeque<LinkIndexJob> = VecDeque::new();
+        let mut deferred_render: Option<(RenderRequest, bool)> = None;
+        let mut base_cache: Option<CachedBaseRaster> = None;
+
+        let is_current = |req: &RenderRequest, is_prefetch: bool| -> bool {
+            if is_prefetch {
+                if req.generation < state.min_valid_generation.load(Ordering::Acquire) {
+                    return false;
+                }
+                let bounds = state.prefetch_bounds.load(Ordering::Acquire);
+                req.key.page >= bounds as u32 && req.key.page <= (bounds >> 32) as u32
+            } else {
+                req.generation == state.latest_generation.load(Ordering::Acquire)
+            }
+        };
 
         loop {
-            let task = match command_rx.try_recv() {
-                Ok(command) => WorkerTask::Command(command),
-                Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
-                    if let Some(request) = deferred_render.take() {
-                        WorkerTask::Render(request)
-                    } else {
-                        match priority_rx.try_recv() {
-                            Ok(request) => WorkerTask::Render(request),
-                            Err(TryRecvError::Disconnected) => break,
-                            Err(TryRecvError::Empty) => {
-                                if let Some(job) = link_index_jobs.pop_front() {
-                                    WorkerTask::IndexLinkPage(job)
-                                } else if let Some(job) = search_jobs.pop_front() {
-                                    WorkerTask::SearchPage(job)
-                                } else {
-                                    match prefetch_rx.try_recv() {
-                                        Ok(request) => WorkerTask::Render(request),
-                                        Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
-                                            select_biased! {
-                                                recv(command_rx) -> command => match command {
-                                                    Ok(command) => WorkerTask::Command(command),
-                                                    Err(_) => break,
-                                                },
-                                                recv(priority_rx) -> request => match request {
-                                                    Ok(request) => WorkerTask::Render(request),
-                                                    Err(_) => break,
-                                                },
-                                                recv(prefetch_rx) -> request => match request {
-                                                    Ok(request) => WorkerTask::Render(request),
-                                                    Err(_) => break,
-                                                },
-                                            }
-                                        }
-                                    }
-                                }
+            let task = if let Ok(command) = command_rx.try_recv() {
+                WorkerTask::Command(command)
+            } else if let Some((req, is_prefetch)) = deferred_render.take() {
+                WorkerTask::Render(req, is_prefetch)
+            } else {
+                match priority_rx.try_recv() {
+                    Ok(req) => WorkerTask::Render(req, false),
+                    Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {
+                        if let Some(job) = link_index_jobs.pop_front() {
+                            WorkerTask::IndexLinkPage(job)
+                        } else if let Some(job) = search_jobs.pop_front() {
+                            WorkerTask::SearchPage(job)
+                        } else if let Ok(req) = prefetch_rx.try_recv() {
+                            WorkerTask::Render(req, true)
+                        } else {
+                            select_biased! {
+                                recv(command_rx) -> cmd => match cmd {
+                                    Ok(c) => WorkerTask::Command(c),
+                                    Err(_) => break,
+                                },
+                                recv(priority_rx) -> req => match req {
+                                    Ok(r) => WorkerTask::Render(r, false),
+                                    Err(_) => break,
+                                },
+                                recv(prefetch_rx) -> req => match req {
+                                    Ok(r) => WorkerTask::Render(r, true),
+                                    Err(_) => break,
+                                },
                             }
                         }
                     }
                 }
             };
 
-            let request = match task {
+            let (request, is_prefetch) = match task {
                 WorkerTask::Command(WorkerCommand::Open {
                     document_id,
                     path: new_path,
                 }) => {
-                    let opened = (|| {
-                        let revision =
-                            DocumentRevision::read(&new_path).map_err(|error| error.to_string())?;
-                        let document = pdfium
-                            .load_pdf_from_file(&new_path, None)
-                            .map_err(|error| error.to_string())?;
-                        revision
-                            .check(&new_path)
-                            .map_err(|error| error.to_string())?;
-                        Ok::<_, String>((document, revision))
-                    })();
-                    match opened {
-                        Ok((replacement, revision)) => {
-                            let pages = u32::try_from(replacement.pages().len()).map_err(|_| {
-                                "PDFium returned a negative page count while opening a document"
-                                    .to_string()
-                            })?;
-                            if pages == 0 {
-                                message_tx
-                                    .send(WorkerMessage::OpenError {
-                                        document_id,
-                                        error: format!("{} has no pages", new_path.display()),
-                                    })
-                                    .map_err(|_| "viewer stopped".to_string())?;
-                            } else {
-                                let outline = extract_outline(&replacement);
-                                documents.insert(document_id, replacement);
-                                revisions.insert(document_id, revision);
-                                text_cache.insert(document_id, empty_text_cache(pages));
-                                search_jobs.retain(|job| job.document_id != document_id);
-                                link_index_jobs.retain(|job| job.document_id != document_id);
-                                search_highlights.remove(&document_id);
-                                flash_highlights.remove(&document_id);
-                                message_tx
-                                    .send(WorkerMessage::Opened {
-                                        document_id,
-                                        pages,
-                                        outline,
-                                        revision,
-                                    })
-                                    .map_err(|_| "viewer stopped".to_string())?;
+                    match open_pdf_document(&pdfium, &new_path, true) {
+                        Ok((replacement, revision, pages, outline)) => {
+                            documents.insert(
+                                document_id,
+                                LoadedDocument::new(replacement, revision, pages),
+                            );
+                            search_jobs.retain(|job| job.document_id != document_id);
+                            link_index_jobs.retain(|job| job.document_id != document_id);
+                            if base_cache
+                                .as_ref()
+                                .is_some_and(|c| c.key.document_id == document_id)
+                            {
+                                base_cache = None;
                             }
+                            send(WorkerMessage::Opened {
+                                document_id,
+                                pages,
+                                outline,
+                                revision,
+                            })?;
                         }
-                        Err(error) => {
-                            message_tx
-                                .send(WorkerMessage::OpenError {
-                                    document_id,
-                                    error: format!(
-                                        "could not open {}: {error}",
-                                        new_path.display()
-                                    ),
-                                })
-                                .map_err(|_| "viewer stopped".to_string())?;
-                        }
+                        Err(error) => send(WorkerMessage::OpenError { document_id, error })?,
                     }
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::Close(document_id)) => {
                     documents.remove(&document_id);
-                    revisions.remove(&document_id);
-                    text_cache.remove(&document_id);
                     search_jobs.retain(|job| job.document_id != document_id);
                     link_index_jobs.retain(|job| job.document_id != document_id);
-                    search_highlights.remove(&document_id);
-                    flash_highlights.remove(&document_id);
+                    if base_cache
+                        .as_ref()
+                        .is_some_and(|c| c.key.document_id == document_id)
+                    {
+                        base_cache = None;
+                    }
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::ExtractText { document_id, page }) => {
-                    if let (Some(document), Some(cache)) = (
-                        documents.get(&document_id),
-                        text_cache.get_mut(&document_id),
-                    ) {
-                        let content = cached_page_text(document, page, cache)
-                            .map_or_else(String::new, |text| text.raw.clone());
-                        message_tx
-                            .send(WorkerMessage::Text {
-                                document_id,
-                                page,
-                                content,
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?;
+                    if let Some(loaded) = documents.get_mut(&document_id) {
+                        let content = cached_page_text(
+                            &loaded.document,
+                            page,
+                            &mut loaded.text_cache,
+                            &mut loaded.font_cache,
+                        )
+                        .map_or_else(String::new, |text| text.raw.clone());
+                        send(WorkerMessage::Text {
+                            document_id,
+                            page,
+                            content,
+                        })?;
                     }
                     continue;
                 }
@@ -918,60 +1040,55 @@ fn run_worker(
                     keys,
                     generation,
                 }) => {
-                    if generation != visible_generation.load(Ordering::Acquire) {
+                    if generation != state.visible_generation.load(Ordering::Acquire) {
                         continue;
                     }
-                    if revisions.get(&document_id) != Some(&revision) {
-                        if !documents.contains_key(&document_id) {
-                            message_tx
-                                .send(WorkerMessage::VisibleMatchesError {
-                                    document_id,
-                                    request_id,
-                                    revision,
-                                    error: "visible-match document is closed".into(),
-                                })
-                                .map_err(|_| "viewer stopped".to_string())?;
-                        }
-                        continue;
-                    }
-                    let result = (|| -> Result<Option<Vec<VisibleMatch>>, String> {
-                        let document = documents
-                            .get(&document_id)
-                            .ok_or("visible-match document is closed")?;
-                        let cache = text_cache
-                            .get_mut(&document_id)
-                            .ok_or("visible-match document text cache is unavailable")?;
-                        find_visible_matches(
-                            document,
+                    let Some(loaded) = documents.get_mut(&document_id) else {
+                        send(WorkerMessage::VisibleMatchesError {
                             document_id,
-                            &query,
-                            &keys,
-                            cache,
-                            generation,
-                            &visible_generation,
-                        )
-                    })();
-                    if generation != visible_generation.load(Ordering::Acquire) {
+                            request_id,
+                            revision,
+                            error: "visible-match document is closed".into(),
+                        })?;
+                        continue;
+                    };
+                    if loaded.revision != revision {
+                        send(WorkerMessage::VisibleMatches {
+                            document_id,
+                            request_id,
+                            revision,
+                            matches: Vec::new(),
+                        })?;
+                        continue;
+                    }
+                    let result = find_visible_matches(
+                        &loaded.document,
+                        document_id,
+                        &query,
+                        &keys,
+                        &mut loaded.text_cache,
+                        &mut loaded.page_cache,
+                        &mut loaded.font_cache,
+                        generation,
+                        &state.visible_generation,
+                    );
+                    if generation != state.visible_generation.load(Ordering::Acquire) {
                         continue;
                     }
                     match result {
-                        Ok(Some(matches)) => message_tx
-                            .send(WorkerMessage::VisibleMatches {
-                                document_id,
-                                request_id,
-                                revision,
-                                matches,
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?,
+                        Ok(Some(matches)) => send(WorkerMessage::VisibleMatches {
+                            document_id,
+                            request_id,
+                            revision,
+                            matches,
+                        })?,
                         Ok(None) => {}
-                        Err(error) => message_tx
-                            .send(WorkerMessage::VisibleMatchesError {
-                                document_id,
-                                request_id,
-                                revision,
-                                error,
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?,
+                        Err(error) => send(WorkerMessage::VisibleMatchesError {
+                            document_id,
+                            request_id,
+                            revision,
+                            error,
+                        })?,
                     }
                     continue;
                 }
@@ -986,36 +1103,22 @@ fn run_worker(
                 }) => {
                     let result =
                         (|| -> Result<ResolvedClick, String> {
-                            if revisions.get(&document_id) != Some(&revision) {
+                            let loaded = documents
+                                .get_mut(&document_id)
+                                .ok_or("hit-test document is closed")?;
+                            if loaded.revision != revision {
                                 return Err("hit-test document revision is no longer loaded".into());
                             }
-                            let document = documents
-                                .get(&document_id)
-                                .ok_or("hit-test document is closed")?;
                             let page_index = i32::try_from(page).map_err(|e| e.to_string())?;
-                            let rendered = document
+                            let rendered = loaded
+                                .document
                                 .pages()
                                 .get(page_index)
                                 .map_err(|e| e.to_string())?;
-                            let zoom = i32::from(key.zoom.max(1));
-                            let target_width = (i32::from(key.width) * zoom / 100).max(1);
-                            let target_height = (i32::from(key.height) * zoom / 100).max(1);
-                            let base_config = PdfRenderConfig::new()
-                                .set_reverse_byte_order(true)
-                                .use_lcd_text_rendering(true)
-                                .force_half_tone(false)
-                                .use_print_quality(false);
-                            let config = build_fit_config(
-                                base_config,
-                                key.fit,
-                                target_width,
-                                target_height,
+                            let (config, _) = frame_render_config(
+                                key,
                                 &rendered,
-                                if key.fit == FitMode::Content {
-                                    page_content_bounds(&rendered)
-                                } else {
-                                    [0.0, 0.0, 1.0, 1.0]
-                                },
+                                loaded.page_cache.entry(page).or_default(),
                             );
                             let (pdf_x, pdf_y) = rendered
                                 .pixels_to_points(x as i32, y as i32, &config)
@@ -1031,18 +1134,21 @@ fn run_worker(
                                     pdf_x.value,
                                     pdf_y.value,
                                 )?,
-                                text: clicked_text(&rendered, pdf_x.value, pdf_y.value),
+                                text: clicked_text(
+                                    &rendered,
+                                    pdf_x.value,
+                                    pdf_y.value,
+                                    &mut loaded.font_cache,
+                                ),
                             })
                         })();
-                    message_tx
-                        .send(WorkerMessage::PagePoint {
-                            document_id,
-                            page,
-                            request_id,
-                            revision,
-                            result,
-                        })
-                        .map_err(|_| "viewer stopped".to_string())?;
+                    send(WorkerMessage::PagePoint {
+                        document_id,
+                        page,
+                        request_id,
+                        revision,
+                        result,
+                    })?;
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::Flash {
@@ -1051,18 +1157,15 @@ fn run_worker(
                     rect,
                     word,
                 }) => {
-                    // Forward-search flash state: the app re-issues the render
-                    // (and the clear) around this store, so nothing else to do.
-                    // Translate original source coordinates before PDF-space text
-                    // refinement; rendering applies the crop/rotation afterwards.
-                    let Some(document) = documents.get(&document_id) else {
+                    let Some(loaded) = documents.get_mut(&document_id) else {
                         continue;
                     };
                     let result = (|| -> Result<(SearchRect, bool), String> {
                         let page_index = i32::try_from(page).map_err(|_| {
                             format!("page {} exceeds PDFium's index range", page + 1)
                         })?;
-                        let target = document
+                        let target = loaded
+                            .document
                             .pages()
                             .get(page_index)
                             .map_err(|e| e.to_string())?;
@@ -1071,34 +1174,41 @@ fn run_worker(
                         let Some(word) = word else {
                             return Ok((coarse, false));
                         };
-                        let cache = text_cache
-                            .get_mut(&document_id)
-                            .ok_or("missing PDF text cache")?;
-                        let cached = cached_page_text(document, page, cache)
-                            .ok_or("could not extract PDF text for word highlighting")?;
-                        let refined = forward_word_rect(&target, cached, &word, coarse)?;
+                        let cached = cached_page_text(
+                            &loaded.document,
+                            page,
+                            &mut loaded.text_cache,
+                            &mut loaded.font_cache,
+                        )
+                        .ok_or("could not extract PDF text for word highlighting")?;
+                        let refined = forward_word_rect(
+                            &target,
+                            cached,
+                            &word,
+                            coarse,
+                            &mut loaded.font_cache,
+                        )?;
                         Ok((refined.unwrap_or(coarse), refined.is_some()))
                     })();
                     let (rect, word_precise, error) = match result {
                         Ok((rect, precise)) => (rect, precise, None),
                         Err(error) => (rect, false, Some(Arc::<str>::from(error))),
                     };
-                    flash_highlights.insert(
-                        document_id,
-                        (
-                            page,
-                            ForwardHighlight {
-                                rect,
-                                pixel_bounds: None,
-                                word_precise,
-                                error,
-                            },
-                        ),
-                    );
+                    loaded.flash_highlight = Some((
+                        page,
+                        ForwardHighlight {
+                            rect,
+                            pixel_bounds: None,
+                            word_precise,
+                            error,
+                        },
+                    ));
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::ClearFlash { document_id }) => {
-                    flash_highlights.remove(&document_id);
+                    if let Some(loaded) = documents.get_mut(&document_id) {
+                        loaded.flash_highlight = None;
+                    }
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::Search {
@@ -1107,33 +1217,32 @@ fn run_worker(
                     query,
                 }) => {
                     search_jobs.retain(|job| job.document_id != document_id);
-                    search_highlights.remove(&document_id);
                     let needle = normalize_search_text(&query);
-                    if !needle.is_empty()
-                        && let Some(cache) = text_cache.get(&document_id)
-                    {
-                        let total_pages = u32::try_from(cache.len()).unwrap_or(u32::MAX);
-                        search_jobs.push_front(SearchJob {
-                            document_id,
-                            request_id,
-                            needle,
-                            next_page: 0,
-                            total_pages,
-                            matches: Vec::new(),
-                            total_occurrences: 0,
-                            highlights: HashMap::new(),
-                            last_progress: Instant::now(),
-                        });
-                        message_tx
-                            .send(WorkerMessage::SearchProgress {
+                    if let Some(loaded) = documents.get_mut(&document_id) {
+                        loaded.search_highlights = None;
+                        if !needle.is_empty() {
+                            let total_pages =
+                                u32::try_from(loaded.text_cache.len()).unwrap_or(u32::MAX);
+                            search_jobs.push_front(SearchJob {
+                                document_id,
+                                request_id,
+                                needle,
+                                next_page: 0,
+                                total_pages,
+                                pending_matches: Vec::new(),
+                                total_occurrences: 0,
+                                highlights: HashMap::new(),
+                                last_progress: Instant::now(),
+                            });
+                            send(WorkerMessage::SearchProgress {
                                 document_id,
                                 request_id,
                                 scanned: 0,
                                 total: total_pages,
                                 matches: Vec::new(),
                                 total_occurrences: 0,
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?;
+                            })?;
+                        }
                     }
                     continue;
                 }
@@ -1144,11 +1253,13 @@ fn run_worker(
                     search_jobs.retain(|job| {
                         job.document_id != document_id || job.request_id != request_id
                     });
-                    if search_highlights
-                        .get(&document_id)
-                        .is_some_and(|highlights| highlights.request_id == request_id)
+                    if let Some(loaded) = documents.get_mut(&document_id)
+                        && loaded
+                            .search_highlights
+                            .as_ref()
+                            .is_some_and(|highlights| highlights.request_id == request_id)
                     {
-                        search_highlights.remove(&document_id);
+                        loaded.search_highlights = None;
                     }
                     continue;
                 }
@@ -1157,20 +1268,19 @@ fn run_worker(
                     request_id,
                 }) => {
                     link_index_jobs.retain(|job| job.document_id != document_id);
-                    let Some(document) = documents.get(&document_id) else {
+                    let Some(loaded) = documents.get(&document_id) else {
                         continue;
                     };
-                    let total_pages = u32::try_from(document.pages().len()).unwrap_or(u32::MAX);
-                    message_tx
-                        .send(WorkerMessage::LinkIndexProgress {
-                            document_id,
-                            request_id,
-                            links: Vec::new(),
-                            scanned: 0,
-                            total: total_pages,
-                            complete: total_pages == 0,
-                        })
-                        .map_err(|_| "viewer stopped".to_string())?;
+                    let total_pages =
+                        u32::try_from(loaded.document.pages().len()).unwrap_or(u32::MAX);
+                    send(WorkerMessage::LinkIndexProgress {
+                        document_id,
+                        request_id,
+                        links: Vec::new(),
+                        scanned: 0,
+                        total: total_pages,
+                        complete: total_pages == 0,
+                    })?;
                     if total_pages > 0 {
                         link_index_jobs.push_front(LinkIndexJob {
                             document_id,
@@ -1184,35 +1294,41 @@ fn run_worker(
                     continue;
                 }
                 WorkerTask::IndexLinkPage(mut job) => {
-                    let Some(document) = documents.get(&job.document_id) else {
-                        continue;
-                    };
-                    let Some(cache) = text_cache.get_mut(&job.document_id) else {
+                    let Some(loaded) = documents.get_mut(&job.document_id) else {
                         continue;
                     };
                     if let Ok(page_index) = i32::try_from(job.next_page)
-                        && let Ok(page) = document.pages().get(page_index)
+                        && let Ok(page) = loaded.document.pages().get(page_index)
                     {
-                        job.pending_links.extend(extract_document_links(
-                            document,
-                            &page,
-                            job.next_page,
-                            cache,
-                        ));
+                        let annotations = loaded
+                            .page_cache
+                            .entry(job.next_page)
+                            .or_default()
+                            .links
+                            .get_or_insert_with(|| {
+                                extract_page_link_annotations(&loaded.document, &page)
+                            });
+                        job.pending_links
+                            .extend(extract_document_links_with_annotations(
+                                &loaded.document,
+                                &page,
+                                job.next_page,
+                                &mut loaded.text_cache,
+                                &mut loaded.font_cache,
+                                annotations,
+                            ));
                     }
                     job.next_page = job.next_page.saturating_add(1);
                     let complete = job.next_page >= job.total_pages;
                     if complete || job.last_progress.elapsed() >= LINK_INDEX_PROGRESS_INTERVAL {
-                        message_tx
-                            .send(WorkerMessage::LinkIndexProgress {
-                                document_id: job.document_id,
-                                request_id: job.request_id,
-                                links: std::mem::take(&mut job.pending_links),
-                                scanned: job.next_page,
-                                total: job.total_pages,
-                                complete,
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?;
+                        send(WorkerMessage::LinkIndexProgress {
+                            document_id: job.document_id,
+                            request_id: job.request_id,
+                            links: std::mem::take(&mut job.pending_links),
+                            scanned: job.next_page,
+                            total: job.total_pages,
+                            complete,
+                        })?;
                         job.last_progress = Instant::now();
                     }
                     if !complete {
@@ -1221,16 +1337,18 @@ fn run_worker(
                     continue;
                 }
                 WorkerTask::SearchPage(mut job) => {
-                    let Some(document) = documents.get(&job.document_id) else {
+                    let Some(loaded) = documents.get_mut(&job.document_id) else {
                         continue;
                     };
-                    let Some(cache) = text_cache.get_mut(&job.document_id) else {
-                        continue;
-                    };
-                    let (occurrences, rectangles, context) =
-                        search_page(document, job.next_page, cache, &job.needle);
+                    let (occurrences, rectangles, context) = search_page(
+                        &loaded.document,
+                        job.next_page,
+                        &mut loaded.text_cache,
+                        &mut loaded.font_cache,
+                        &job.needle,
+                    );
                     if occurrences > 0 {
-                        job.matches.push(SearchPageMatch {
+                        job.pending_matches.push(SearchPageMatch {
                             page: job.next_page,
                             occurrences,
                             context,
@@ -1241,127 +1359,155 @@ fn run_worker(
                     job.next_page = job.next_page.saturating_add(1);
 
                     if job.next_page >= job.total_pages {
-                        search_highlights.insert(
-                            job.document_id,
-                            SearchHighlights {
-                                request_id: job.request_id,
-                                pages: job.highlights,
-                            },
-                        );
-                        message_tx
-                            .send(WorkerMessage::SearchResults {
-                                document_id: job.document_id,
-                                request_id: job.request_id,
-                                matches: job.matches,
-                                total_occurrences: job.total_occurrences,
-                            })
-                            .map_err(|_| "viewer stopped".to_string())?;
+                        loaded.search_highlights = Some(SearchHighlights {
+                            request_id: job.request_id,
+                            pages: job.highlights,
+                        });
+                        send(WorkerMessage::SearchResults {
+                            document_id: job.document_id,
+                            request_id: job.request_id,
+                            matches: job.pending_matches,
+                            total_occurrences: job.total_occurrences,
+                        })?;
                     } else {
                         if job.last_progress.elapsed() >= SEARCH_PROGRESS_INTERVAL {
-                            message_tx
-                                .send(WorkerMessage::SearchProgress {
-                                    document_id: job.document_id,
-                                    request_id: job.request_id,
-                                    scanned: job.next_page,
-                                    total: job.total_pages,
-                                    matches: job.matches.clone(),
-                                    total_occurrences: job.total_occurrences,
-                                })
-                                .map_err(|_| "viewer stopped".to_string())?;
+                            send(WorkerMessage::SearchProgress {
+                                document_id: job.document_id,
+                                request_id: job.request_id,
+                                scanned: job.next_page,
+                                total: job.total_pages,
+                                matches: std::mem::take(&mut job.pending_matches),
+                                total_occurrences: job.total_occurrences,
+                            })?;
                             job.last_progress = Instant::now();
                         }
                         search_jobs.push_back(job);
                     }
                     continue;
                 }
-                WorkerTask::Render(request) => {
+                WorkerTask::Render(req, prefetch) => {
                     if !command_rx.is_empty() {
-                        deferred_render = Some(request);
+                        deferred_render = Some((req, prefetch));
                         continue;
                     }
-                    request
+                    (req, prefetch)
                 }
             };
 
-            if request.generation != latest_generation.load(Ordering::Acquire) {
+            if !is_current(&request, is_prefetch) {
                 continue;
             }
+            let report_error = |verb: &str, error: &dyn std::fmt::Display| -> Result<(), String> {
+                if !is_current(&request, is_prefetch) {
+                    return Ok(());
+                }
+                send(WorkerMessage::RenderError {
+                    key: request.key,
+                    generation: request.generation,
+                    error: format!("could not {verb} page {}: {error}", request.key.page + 1),
+                })
+            };
 
             let Ok(page_index) = i32::try_from(request.key.page) else {
+                report_error("load", &"page index out of range")?;
                 continue;
             };
-            let Some(document) = documents.get(&request.key.document_id) else {
+            let Some(loaded) = documents.get_mut(&request.key.document_id) else {
+                report_error("load", &"document is closed")?;
                 continue;
             };
-            let Ok(page) = document.pages().get(page_index) else {
-                continue;
+            let page = match loaded.document.pages().get(page_index) {
+                Ok(page) => page,
+                Err(error) => {
+                    report_error("load", &error)?;
+                    continue;
+                }
             };
-            let zoom = i32::from(request.key.zoom.max(1));
-            let target_width = i32::from(request.key.width) * zoom / 100;
-            let target_height = i32::from(request.key.height) * zoom / 100;
-            let target_width = target_width.max(1);
-            let target_height = target_height.max(1);
-            let base_config = PdfRenderConfig::new()
-                .set_reverse_byte_order(true)
-                .use_lcd_text_rendering(true)
-                .force_half_tone(false)
-                .use_print_quality(false);
-            let content_bounds = if request.key.fit == FitMode::Content {
-                page_content_bounds(&page)
-            } else {
-                [0.0, 0.0, 1.0, 1.0]
-            };
-            let config = build_fit_config(
-                base_config,
-                request.key.fit,
-                target_width,
-                target_height,
+            let (config, content_bounds) = frame_render_config(
+                request.key,
                 &page,
-                content_bounds,
+                loaded.page_cache.entry(request.key.page).or_default(),
             );
-            let render_started = Instant::now();
-            let bitmap = page.render_with_config(&config).map_err(|error| {
-                format!("could not render page {}: {error}", request.key.page + 1)
-            })?;
-            let render_elapsed = render_started.elapsed();
+            let mut uncached_rgba = None;
+            let (width, height, render_elapsed, dark_mode_elapsed) = if let Some(cached) =
+                base_cache
+                    .as_ref()
+                    .filter(|cached| cached.matches(request.key, loaded.revision))
+            {
+                (cached.width, cached.height, Duration::ZERO, None)
+            } else {
+                let render_started = Instant::now();
+                let bitmap = match page.render_with_config(&config) {
+                    Ok(bitmap) => bitmap,
+                    Err(error) => {
+                        report_error("render", &error)?;
+                        continue;
+                    }
+                };
+                let render_elapsed = render_started.elapsed();
+                let (width, height) = (bitmap.width() as u32, bitmap.height() as u32);
+                let mut raw_rgba = bitmap.as_raw_bytes();
+                drop(bitmap);
+                if !is_current(&request, is_prefetch) {
+                    continue;
+                }
+                let dark_mode_elapsed = request.key.invert.then(|| {
+                    let started = Instant::now();
+                    apply_dark_mode(
+                        &page,
+                        &config,
+                        width,
+                        height,
+                        &mut raw_rgba,
+                        request.key.dark_mode_style,
+                    );
+                    started.elapsed()
+                });
+                if !is_current(&request, is_prefetch) {
+                    continue;
+                }
+                if !is_prefetch && (width as usize).saturating_mul(height as usize) <= 16_777_216 {
+                    base_cache = Some(CachedBaseRaster {
+                        key: request.key,
+                        revision: loaded.revision,
+                        width,
+                        height,
+                        rgba: raw_rgba,
+                    });
+                } else {
+                    uncached_rgba = Some(raw_rgba);
+                }
+                (width, height, render_elapsed, dark_mode_elapsed)
+            };
 
-            let width = bitmap.width() as u32;
-            let height = bitmap.height() as u32;
-            let mut raw_rgba = bitmap.as_raw_bytes();
-            let dark_mode_elapsed = request.key.invert.then(|| {
-                let started = Instant::now();
-                apply_dark_mode(
-                    &page,
-                    &config,
-                    width,
-                    height,
-                    &mut raw_rgba,
-                    request.key.dark_mode_style,
-                );
-                started.elapsed()
-            });
             let search_rectangles = (request.key.search_request_id != 0)
                 .then(|| {
-                    search_highlights
-                        .get(&request.key.document_id)
+                    loaded
+                        .search_highlights
+                        .as_ref()
                         .filter(|highlights| highlights.request_id == request.key.search_request_id)
                         .and_then(|highlights| highlights.pages.get(&request.key.page))
                 })
                 .flatten();
-            let links = extract_page_links(document, &page, &config, width, height);
+            let annotations = loaded
+                .page_cache
+                .entry(request.key.page)
+                .or_default()
+                .links
+                .get_or_insert_with(|| extract_page_link_annotations(&loaded.document, &page));
+            let (links, dark_mode_link_rectangles) = project_page_links(
+                &page,
+                &config,
+                width,
+                height,
+                annotations,
+                request.key.invert,
+            );
             let selected_link_rectangles =
                 selected_page_link_rectangles(&links, request.key.selected_link_ordinal);
-            let dark_mode_link_rectangles = if request.key.invert {
-                if request.key.link_mode {
-                    links.iter().map(|link| link.rect).collect()
-                } else {
-                    extract_page_link_rectangles(&page, &config, width, height)
-                }
-            } else {
-                Vec::new()
-            };
-            let flash = flash_highlights
-                .get(&request.key.document_id)
+            let flash = loaded
+                .flash_highlight
+                .as_ref()
                 .filter(|(page, _)| *page == request.key.page)
                 .map(|(_, highlight)| {
                     let mut highlight = highlight.clone();
@@ -1379,16 +1525,25 @@ fn run_worker(
                 .as_ref()
                 .filter(|highlight| highlight.error.is_none())
                 .map(|highlight| &highlight.rect);
-            let highlight_elapsed = (search_rectangles.is_some()
+            let has_overlays = search_rectangles.is_some()
                 || (request.key.link_mode && !links.is_empty())
                 || !selected_link_rectangles.is_empty()
                 || !dark_mode_link_rectangles.is_empty()
-                || flash_rectangle.is_some())
-            .then(|| {
+                || flash_rectangle.is_some();
+            let mut overlay_rgba = has_overlays.then(|| {
+                uncached_rgba.take().unwrap_or_else(|| {
+                    base_cache
+                        .as_ref()
+                        .expect("cached base raster")
+                        .rgba
+                        .clone()
+                })
+            });
+            let highlight_elapsed = overlay_rgba.as_mut().map(|raw_rgba| {
                 let started = Instant::now();
                 if !dark_mode_link_rectangles.is_empty() {
                     apply_dark_mode_link_contrast(
-                        &mut raw_rgba,
+                        raw_rgba,
                         width,
                         height,
                         &dark_mode_link_rectangles,
@@ -1402,14 +1557,14 @@ fn run_worker(
                         &config,
                         width,
                         height,
-                        &mut raw_rgba,
+                        raw_rgba,
                         rectangles,
                         request.key.search_highlight,
                     );
                 }
                 if request.key.link_mode && !links.is_empty() {
                     apply_link_highlights(
-                        &mut raw_rgba,
+                        raw_rgba,
                         width,
                         height,
                         &links,
@@ -1419,7 +1574,7 @@ fn run_worker(
                 }
                 if !selected_link_rectangles.is_empty() {
                     apply_selected_link_highlights(
-                        &mut raw_rgba,
+                        raw_rgba,
                         width,
                         height,
                         &selected_link_rectangles,
@@ -1432,42 +1587,52 @@ fn run_worker(
                         &config,
                         width,
                         height,
-                        &mut raw_rgba,
+                        raw_rgba,
                         std::slice::from_ref(rect),
                         [255, 0, 0],
                     );
                 }
                 started.elapsed()
             });
+            if !is_current(&request, is_prefetch) {
+                continue;
+            }
+            let rgba_bytes = overlay_rgba
+                .as_deref()
+                .or(uncached_rgba.as_deref())
+                .unwrap_or_else(|| &base_cache.as_ref().expect("cached base raster").rgba);
             let compression_started = Instant::now();
-            let compressed_rgba = crate::kitty::compress_rgba(&raw_rgba).map_err(|error| {
-                format!("could not compress page {}: {error}", request.key.page + 1)
-            })?;
+            let compressed_rgba =
+                match crate::kitty::compress_rgba_as_rgb(rgba_bytes, width, height) {
+                    Ok(compressed) => compressed,
+                    Err(error) => {
+                        report_error("compress", &error)?;
+                        continue;
+                    }
+                };
             let compression_elapsed = compression_started.elapsed();
 
-            if request.generation != latest_generation.load(Ordering::Acquire) {
+            if !is_current(&request, is_prefetch) {
                 continue;
             }
 
-            message_tx
-                .send(WorkerMessage::Frame(Frame {
-                    key: request.key,
-                    revision: revisions[&request.key.document_id],
-                    width,
-                    height,
-                    page_width_pt: page.width().value,
-                    page_height_pt: page.height().value,
-                    content_bounds,
-                    compressed_rgba,
-                    render_elapsed,
-                    dark_mode_elapsed,
-                    highlight_elapsed,
-                    compression_elapsed,
-                    generation: request.generation,
-                    links,
-                    flash,
-                }))
-                .map_err(|_| "viewer stopped".to_string())?;
+            send(WorkerMessage::Frame(Frame {
+                key: request.key,
+                revision: loaded.revision,
+                width,
+                height,
+                page_width_pt: page.width().value,
+                page_height_pt: page.height().value,
+                content_bounds,
+                compressed_rgba,
+                render_elapsed,
+                dark_mode_elapsed,
+                highlight_elapsed,
+                compression_elapsed,
+                generation: request.generation,
+                links,
+                flash,
+            }))?;
         }
 
         Ok(())
@@ -1921,12 +2086,8 @@ fn blend_channel(transformed: u8, original: u8, mask_ratio: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-/// Type 1 TeX math fonts (`CMEX10`, `CMMI10`, `CMSY10`, `MSAM10`, `MSBM10`, `stmary10`, and
-/// their Latin Modern / TX / PX counterparts) have incomplete or missing `ToUnicode` CMaps in
-/// `pdfTeX`'s built-in `TeX-*-builtin-0` tables, so PDFium exposes raw 1-byte character codes
-/// (`0x00..=0x7F`) for unmapped slots.
-fn tex_math_font_unicode(font_name: &str, code: u32) -> Option<u32> {
-    let raw_base = font_name
+fn strip_tex_subset_prefix(font_name: &str) -> &str {
+    font_name
         .split_once('+')
         .filter(|(prefix, _)| {
             prefix.len() == 6
@@ -1934,7 +2095,15 @@ fn tex_math_font_unicode(font_name: &str, code: u32) -> Option<u32> {
                     .bytes()
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
         })
-        .map_or(font_name, |(_, rest)| rest);
+        .map_or(font_name, |(_, rest)| rest)
+}
+
+/// Type 1 TeX math fonts (`CMEX10`, `CMMI10`, `CMSY10`, `MSAM10`, `MSBM10`, `stmary10`, and
+/// their Latin Modern / TX / PX counterparts) have incomplete or missing `ToUnicode` CMaps in
+/// `pdfTeX`'s built-in `TeX-*-builtin-0` tables, so PDFium exposes raw 1-byte character codes
+/// (`0x00..=0x7F`) for unmapped slots.
+fn tex_math_font_unicode(font_name: &str, code: u32) -> Option<u32> {
+    let raw_base = strip_tex_subset_prefix(font_name);
     let mut lower_buf = [0u8; 64];
     if raw_base.len() > lower_buf.len() || !raw_base.is_ascii() {
         return None;
@@ -2001,6 +2170,7 @@ fn tex_math_font_unicode(font_name: &str, code: u32) -> Option<u32> {
             0x2a => Some(0x21c0), // \rightharpoonup
             0x2b => Some(0x21c1), // \rightharpoondown
             0x2d => Some(0x297d), // \hookleftarrow right hook (\rhook)
+            0x2c => Some(0x297c), // \hookrightarrow left hook (\lhook)
             _ => None,
         };
     }
@@ -2150,103 +2320,167 @@ fn tex_math_font_unicode(font_name: &str, code: u32) -> Option<u32> {
     None
 }
 
-fn is_embedded_tex_type1_char(character: &PdfPageTextChar<'_>, font_name: &str, code: u32) -> bool {
-    let Ok(text_object) = character.text_object() else {
-        return false;
-    };
-    let font = text_object.font();
-    if !matches!(font.is_embedded(), Ok(true)) {
-        return false;
-    }
-    let Ok(data) = font.data() else {
-        return false;
-    };
+fn tex_type1_slots(data: &[u8], font_name: &str) -> Option<[bool; 128]> {
     let body = if data.starts_with(b"\x80\x01") && data.len() > 6 {
         &data[6..]
     } else {
-        &data[..]
+        data
     };
     if !(body.starts_with(b"%!PS-AdobeFont") || body.starts_with(b"%!FontType1")) {
-        return false;
+        return None;
     }
     let header_end = body
         .windows(5)
         .position(|w| w == b"eexec")
         .unwrap_or(body.len());
-    let Ok(header) = std::str::from_utf8(&body[..header_end]) else {
-        return false;
-    };
+    let header = String::from_utf8_lossy(&body[..header_end]);
     if !header.contains("/Encoding 256 array") {
-        return false;
+        return None;
     }
-    let base = font_name
-        .split_once('+')
-        .map_or(font_name, |(_, rest)| rest)
-        .to_ascii_lowercase();
-    if !(base.starts_with("lm") || base.starts_with("mlm") || base.starts_with("vlm")) {
-        let dup_space = format!("dup {code} /");
-        let dup_tight = format!("dup {code}/");
-        if !header.contains(&dup_space) && !header.contains(&dup_tight) {
-            return false;
+    let base = strip_tex_subset_prefix(font_name).to_ascii_lowercase();
+    if base.starts_with("lm") || base.starts_with("mlm") || base.starts_with("vlm") {
+        return Some([true; 128]);
+    }
+    // Other families require an explicit encoding entry for each recovered slot.
+    let mut slots = [false; 128];
+    for part in header.split("dup ").skip(1) {
+        let digits = part.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0
+            && let Some(rest) = part[digits..].trim_ascii_start().strip_prefix('/')
+            && !rest.starts_with(".notdef")
+            && let Ok(code) = part[..digits].parse::<usize>()
+            && let Some(slot) = slots.get_mut(code)
+        {
+            *slot = true;
         }
     }
-    true
+    Some(slots)
 }
 
-fn pdf_char_unicode(character: &PdfPageTextChar<'_>) -> u32 {
+fn is_embedded_tex_type1_char(
+    character: &PdfPageTextChar<'_>,
+    font_name: &str,
+    code: u32,
+    cache: &mut TexFontCache,
+) -> bool {
+    let Some(idx) = usize::try_from(code).ok().filter(|&i| i < 128) else {
+        return false;
+    };
+    if let Some(&Some(present)) = cache.get(font_name).and_then(|slots| slots.get(idx)) {
+        return present;
+    }
+    let Ok(text_object) = character.text_object() else {
+        return false;
+    };
+    let font = text_object.font();
+    let slots = match font.is_embedded() {
+        Ok(false) => None,
+        Ok(true) => {
+            let Ok(data) = font.data() else {
+                return false;
+            };
+            tex_type1_slots(&data, font_name)
+        }
+        Err(_) => return false,
+    };
+    let entry = cache.entry(font_name.to_owned()).or_insert([None; 128]);
+    let Some(slots) = slots else {
+        entry.fill(Some(false));
+        return false;
+    };
+    for (dst, &present) in entry.iter_mut().zip(&slots) {
+        if present {
+            *dst = Some(true);
+        }
+    }
+    let recovered = slots[idx];
+    if !recovered && entry[idx].is_none() {
+        entry[idx] = Some(false);
+    }
+    recovered
+}
+
+fn unscaled_glyph_box(character: &PdfPageTextChar<'_>) -> Option<(f32, f32, f32, f32)> {
+    let bounds = character.tight_bounds().ok()?;
+    let (origin_x, origin_y) = character.origin().ok()?;
+    let matrix = character.matrix().ok()?;
+    let (a, b, c, d) = (matrix.a(), matrix.b(), matrix.c(), matrix.d());
+    let norm = a * a + b * b + c * c + d * d;
+    let det = a * d - b * c;
+    let det_abs = a.abs() * d.abs() - b.abs() * c.abs();
+    if norm <= 1e-8 || det.abs() <= 1e-4 * norm {
+        return None;
+    }
+    let (dx, dy) = (bounds.width().value, bounds.height().value);
+    let mx = (bounds.left().value + bounds.right().value) * 0.5 - origin_x.value;
+    let my = (bounds.bottom().value + bounds.top().value) * 0.5 - origin_y.value;
+    let center_y = (-b * mx + a * my) / det;
+    if det_abs.abs() <= 0.05 * norm {
+        // Near odd multiples of 45°, aspect ratio is ill-conditioned, but
+        // (dx + dy) / (2 * (|c| + |d|)) still upper-bounds half the glyph height.
+        let denom = 2.0 * (c.abs() + d.abs());
+        if denom <= 1e-4 * norm.sqrt() {
+            return None;
+        }
+        let half_span = (dx + dy) / denom;
+        return Some((0.0, 0.0, center_y - half_span, center_y + half_span));
+    }
+    let width = (d.abs() * dx - c.abs() * dy) / det_abs;
+    let height = (a.abs() * dy - b.abs() * dx) / det_abs;
+    let span = width.max(height);
+    if span <= 0.0 || width < -1e-2 * span || height < -1e-2 * span {
+        return None;
+    }
+    let (width, height) = (width.max(0.0), height.max(0.0));
+    Some((
+        width,
+        height,
+        center_y - height * 0.5,
+        center_y + height * 0.5,
+    ))
+}
+
+// Recover unmapped Type 1 slots and the known broken TeX high surrogate.
+fn pdf_char_unicode(character: &PdfPageTextChar<'_>, cache: &mut TexFontCache) -> u32 {
     let code = character.unicode_value();
     if matches!(code, 0x00..=0x7f | 0xd875) && matches!(character.is_generated(), Ok(false)) {
         let font_name = character.font_name();
-        if code == 0x2c
-            && tex_math_font_unicode(&font_name, 0x2d) == Some(0x297d)
-            && is_embedded_tex_type1_char(character, &font_name, code)
-            && let (Ok(bounds), Ok(origin_y)) = (character.tight_bounds(), character.origin_y())
-            && bounds.bottom().value > origin_y.value
-        {
-            return 0x297c; // \hookrightarrow left hook (\lhook, raised above baseline)
-        }
         if let Some(mapped) = tex_math_font_unicode(&font_name, code) {
-            if code <= 0x7f && !is_embedded_tex_type1_char(character, &font_name, code) {
+            if code <= 0x7f && !is_embedded_tex_type1_char(character, &font_name, code, cache) {
                 return code;
             }
             if matches!(mapped, 0x21bc..=0x21c1) {
-                let Ok(bounds) = character.tight_bounds() else {
+                let Some((width, height, _, _)) = unscaled_glyph_box(character) else {
                     return code;
                 };
-                if bounds.width().value <= bounds.height().value * 2.0 {
+                if width <= height * 2.0 {
                     return code;
                 }
             }
-            if mapped == 0x297d {
-                let (Ok(bounds), Ok(origin_y)) = (character.tight_bounds(), character.origin_y())
-                else {
+            if matches!(mapped, 0x297c | 0x297d) {
+                let Some((_, _, bottom, _)) = unscaled_glyph_box(character) else {
                     return code;
                 };
-                if bounds.bottom().value <= origin_y.value {
+                if bottom <= 0.0 {
                     return code;
                 }
             }
             if code == 0x26 && mapped == 0x2199 {
-                let Ok(bounds) = character.tight_bounds() else {
+                let Some((width, height, _, _)) = unscaled_glyph_box(character) else {
                     return code;
                 };
-                if bounds.height().value <= bounds.width().value * 1.2 {
+                if height <= width * 1.2 {
                     return code;
                 }
             }
             // In CMEX10, ToUnicode-decoded '[', '\\', ']', '^' (0x5b..=0x5e) share codes
-            // with raw display-style operators (\bigcup, \bigcap, \biguplus, \bigwedge).
-            // In PDF page coordinates (y upward, top > bottom), display operators hang
-            // entirely below origin_y (B 56 -1400 1054 0) with wide aspect ratio.
+            // with raw display-style operators (\bigcup, \bigcap, \biguplus, \bigwedge),
+            // which hang below the baseline (B 56 -1400 1054 0) with wide aspect ratio.
             if matches!(code, 0x5b..=0x5e) && matches!(mapped, 0x222a | 0x2229 | 0x228e | 0x2227) {
-                let (Ok(bounds), Ok(origin_y)) = (character.tight_bounds(), character.origin_y())
-                else {
+                let Some((width, height, bottom, top)) = unscaled_glyph_box(character) else {
                     return code;
                 };
-                if bounds.bottom().value >= origin_y.value
-                    || bounds.top().value > origin_y.value + bounds.height().value * 0.05
-                    || bounds.width().value <= bounds.height().value * 0.5
-                {
+                if bottom >= 0.0 || top > height * 0.05 || width <= height * 0.5 {
                     return code;
                 }
             }
@@ -2257,7 +2491,12 @@ fn pdf_char_unicode(character: &PdfPageTextChar<'_>) -> u32 {
 }
 
 /// Keep a small text neighborhood around the clicked glyph, not the entire page.
-fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)>, String> {
+fn clicked_text(
+    page: &PdfPage,
+    x: f32,
+    y: f32,
+    font_cache: &mut TexFontCache,
+) -> Result<Option<(String, usize)>, String> {
     let text = page.text().map_err(|error| error.to_string())?;
     let chars = text.chars();
     let x = PdfPoints::new(x);
@@ -2273,13 +2512,18 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
     let is_word_code = |code: u32, check: fn(char) -> bool| {
         matches!(code, 0xd800..=0xdfff) || char::from_u32(code).is_some_and(check)
     };
-    if !is_word_code(pdf_char_unicode(&character), char::is_alphanumeric)
-        && let Ok(bounds) = character.tight_bounds()
+    if !is_word_code(
+        pdf_char_unicode(&character, font_cache),
+        char::is_alphanumeric,
+    ) && let Ok(bounds) = character.tight_bounds()
         && bounds.contains(x, y)
     {
         let mut area = bounds.width().value * bounds.height().value;
         for candidate in chars.iter() {
-            if !is_word_code(pdf_char_unicode(&candidate), char::is_alphabetic) {
+            if !is_word_code(
+                pdf_char_unicode(&candidate, font_cache),
+                char::is_alphabetic,
+            ) {
                 continue;
             }
             if let Ok(bounds) = candidate.tight_bounds()
@@ -2295,7 +2539,7 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
     }
     unicode_context(chars.len(), character.index(), |index| {
         let character = chars.get(index).map_err(|error| error.to_string())?;
-        let code = pdf_char_unicode(&character);
+        let code = pdf_char_unicode(&character, font_cache);
         if code == 0x0338
             && let Ok(b1) = character.tight_bounds()
         {
@@ -2313,14 +2557,6 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
                 return Ok(0x20d2);
             }
         }
-        if code == 0x297c
-            && !index
-                .checked_add(1)
-                .and_then(|i| chars.get(i).ok())
-                .is_some_and(|next| pdf_char_unicode(&next) == 0x2192)
-        {
-            return Ok(0x2c);
-        }
         if matches!(code, 0x21bd | 0x21c0)
             && let Ok(b1) = character.tight_bounds()
         {
@@ -2329,7 +2565,7 @@ fn clicked_text(page: &PdfPage, x: f32, y: f32) -> Result<Option<(String, usize)
                 .flatten()
             {
                 if let Ok(other) = chars.get(neighbor)
-                    && pdf_char_unicode(&other) == (code ^ 0x21bd ^ 0x21c0)
+                    && pdf_char_unicode(&other, font_cache) == (code ^ 0x21bd ^ 0x21c0)
                     && let Ok(b2) = other.tight_bounds()
                 {
                     let overlap = b1.right().value.min(b2.right().value)
@@ -2364,7 +2600,6 @@ pub fn synctex_edit_batch(
     settings: &crate::config::ViewerSettings,
     input: impl std::io::BufRead,
     mut output: impl std::io::Write,
-    source_snapshot: Option<&Path>,
     best_guess: bool,
 ) -> Result<(), String> {
     #[derive(serde::Deserialize)]
@@ -2380,7 +2615,7 @@ pub fn synctex_edit_batch(
         .load_pdf_from_file(pdf, None)
         .map_err(|error| format!("could not open {}: {error}", pdf.display()))?;
     let mut cached_page: Option<(u32, PdfPage<'_>)> = None;
-    let mut cached_snapshot: Option<crate::source_snapshot::SourceSnapshot> = None;
+    let mut font_cache = HashMap::new();
     let mut cached_synctex = crate::synctex::SyncTeXCache::default();
     for (line_number, line) in input.lines().enumerate() {
         let input_line = line.as_ref().ok().cloned();
@@ -2407,27 +2642,17 @@ pub fn synctex_edit_batch(
             if pdf_x < left || pdf_x > right || pdf_y < bottom || pdf_y > top {
                 return Err("point is outside the visible PDF page".into());
             }
-            let (context, offset) = match clicked_text(page, pdf_x, pdf_y) {
+            let (context, offset) = match clicked_text(page, pdf_x, pdf_y, &mut font_cache) {
                 Ok(Some(context)) => context,
                 Ok(None) => return Err("PDFium found no text near point".into()),
                 Err(error) => return Err(format!("PDFium text hit-test failed: {error}")),
             };
-            if let Some(snapshot_path) = source_snapshot
-                && cached_snapshot.is_none()
-            {
-                let pdf = std::path::absolute(pdf).map_err(|error| error.to_string())?;
-                cached_snapshot = Some(
-                    crate::source_snapshot::SourceSnapshot::load(snapshot_path, &pdf)
-                        .map_err(|error| error.to_string())?,
-                );
-            }
             let resolution = crate::synctex::resolve_inverse_with_cache(
                 pdf,
                 coordinates.inverse_point(point.page, pdf_x, pdf_y)?,
                 settings.word_precision.then_some((&context, offset)),
                 settings.source_context_lines as u32,
                 &crate::process::Operation::new(std::time::Duration::from_secs(30)),
-                cached_snapshot.as_ref(),
                 best_guess,
                 Some(&mut cached_synctex),
             )
@@ -2534,12 +2759,15 @@ fn overlapping_match_ranges_cancellable(
     Some(ranges)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_visible_matches(
     document: &PdfDocument,
     document_id: DocumentId,
     query: &str,
     keys: &[(RenderKey, u32, u32)],
     cache: &mut [Option<CachedPageText>],
+    page_cache: &mut HashMap<u32, CachedPageGeometry>,
+    font_cache: &mut TexFontCache,
     generation: u64,
     latest_generation: &AtomicU64,
 ) -> Result<Option<Vec<VisibleMatch>>, String> {
@@ -2576,24 +2804,15 @@ fn find_visible_matches(
                 u64::from(key.page) + 1
             )
         })?;
-        let zoom = i32::from(key.zoom.max(1));
-        let target_width = (i32::from(key.width) * zoom / 100).max(1);
-        let target_height = (i32::from(key.height) * zoom / 100).max(1);
-        let config = build_fit_config(
-            PdfRenderConfig::new(),
-            key.fit,
-            target_width,
-            target_height,
+        let (config, _) = frame_render_config(key, &page, page_cache.entry(key.page).or_default());
+        let Some(cached) = cached_visible_page_text(
             &page,
-            if key.fit == FitMode::Content {
-                page_content_bounds(&page)
-            } else {
-                [0.0, 0.0, 1.0, 1.0]
-            },
-        );
-        let Some(cached) =
-            cached_visible_page_text(document, key.page, cache, generation, latest_generation)
-        else {
+            key.page,
+            cache,
+            font_cache,
+            generation,
+            latest_generation,
+        ) else {
             if generation != latest_generation.load(Ordering::Acquire) {
                 return Ok(None);
             }
@@ -2602,19 +2821,17 @@ fn find_visible_matches(
                 u64::from(key.page) + 1
             ));
         };
-        let Some((normalized, source_index_by_byte)) = cached.visible.as_ref() else {
-            continue;
-        };
-        let Some(occurrences) = overlapping_match_ranges_cancellable(normalized, &needle, || {
-            generation == latest_generation.load(Ordering::Acquire)
-        }) else {
+        let source_index_by_byte = &cached.source_index_by_byte;
+        let Some(occurrences) =
+            overlapping_match_ranges_cancellable(&cached.normalized, &needle, || {
+                generation == latest_generation.load(Ordering::Acquire)
+            })
+        else {
             return Ok(None);
         };
         if occurrences.is_empty() {
             continue;
         }
-        let text = page.text().map_err(|error| error.to_string())?;
-        let chars = text.chars();
         for (start, end) in occurrences {
             if generation != latest_generation.load(Ordering::Acquire) {
                 return Ok(None);
@@ -2622,54 +2839,29 @@ fn find_visible_matches(
             let Some(source_ranges) = source_index_by_byte.get(start..end) else {
                 continue;
             };
-            let Some(&(first, _)) = source_ranges.first() else {
+            let Some(&first) = source_ranges.first() else {
                 continue;
             };
             let mut rects = Vec::new();
             let mut visible = true;
             let mut previous = None;
-            for &(glyph_start, glyph_end) in source_ranges {
+            for &glyph_index in source_ranges {
                 if generation != latest_generation.load(Ordering::Acquire) {
                     return Ok(None);
                 }
-                let glyph_range = (glyph_start, glyph_end);
-                if previous == Some(glyph_range) {
+                if previous == Some(glyph_index) {
                     continue;
                 }
-                previous = Some(glyph_range);
-                if chars
-                    .get(glyph_start)
-                    .ok()
-                    .and_then(|character| char::from_u32(pdf_char_unicode(&character)))
-                    .is_some_and(char::is_whitespace)
-                {
+                previous = Some(glyph_index);
+                let glyph = &cached.glyphs[glyph_index];
+                if glyph.value.is_whitespace() {
                     continue;
                 }
                 let previous_rect_count = rects.len();
-                for index in glyph_start..glyph_end {
+                for &bounds in glyph.bounds.iter().flatten() {
                     if generation != latest_generation.load(Ordering::Acquire) {
                         return Ok(None);
                     }
-                    let Ok(character) = chars.get(index) else {
-                        continue;
-                    };
-                    if char::from_u32(pdf_char_unicode(&character)).is_some_and(char::is_whitespace)
-                    {
-                        continue;
-                    }
-                    let Ok(render_mode) = character.render_mode() else {
-                        continue;
-                    };
-                    if !text_mode_has_visible_paint(
-                        render_mode,
-                        || character.fill_color().ok().map(|color| color.alpha()),
-                        || character.stroke_color().ok().map(|color| color.alpha()),
-                    ) {
-                        continue;
-                    }
-                    let Ok(bounds) = character.tight_bounds() else {
-                        continue;
-                    };
                     let Some(rect) =
                         page_rect_to_pixels(&page, &config, frame_width, frame_height, bounds)
                     else {
@@ -2679,7 +2871,7 @@ fn find_visible_matches(
                         rects.push(rect);
                     }
                 }
-                if rects.len() == previous_rect_count && glyph_start != glyph_end {
+                if rects.len() == previous_rect_count {
                     visible = false;
                     break;
                 }
@@ -2690,20 +2882,13 @@ fn find_visible_matches(
             let Some(first_rect) = rects.first() else {
                 continue;
             };
-            let last_range = *source_ranges
+            let last_glyph = *source_ranges
                 .last()
                 .expect("non-empty occurrence source range");
             let next_char = source_index_by_byte
                 .get(end)
-                .filter(|next_range| **next_range != last_range)
-                .and_then(|&(start, stop)| {
-                    source_range_char(start, stop, |index| {
-                        chars
-                            .get(index)
-                            .ok()
-                            .map(|character| pdf_char_unicode(&character))
-                    })
-                })
+                .filter(|next_glyph| **next_glyph != last_glyph)
+                .map(|&index| cached.glyphs[index].value)
                 .filter(|character| character.is_alphanumeric() || *character == '_');
             let Some(last_rect) = rects.last() else {
                 continue;
@@ -2718,7 +2903,7 @@ fn find_visible_matches(
             let anchor = center(last_rect);
             matches.push(VisibleMatch {
                 key,
-                char_index: first,
+                char_index: cached.glyphs[first].source_index,
                 rects,
                 hit,
                 anchor,
@@ -2733,181 +2918,197 @@ fn empty_text_cache(pages: u32) -> Vec<Option<CachedPageText>> {
     (0..pages).map(|_| None).collect()
 }
 
+fn init_cached_page_text(
+    slot: &mut CachedPageText,
+    text: &PdfPageText,
+    font_cache: &mut TexFontCache,
+) {
+    let chars = text.chars();
+    let (normalized, source_index_by_byte) = normalize_search_characters(
+        decoded_pdf_characters(&chars, font_cache, || true, |_, _| {})
+            .map(|(start, _, value)| (start, value)),
+    );
+    slot.raw = text.all();
+    slot.normalized = normalized;
+    slot.source_index_by_byte = source_index_by_byte;
+    slot.full_text_initialized = true;
+}
+
 fn cached_page_text<'a>(
     document: &PdfDocument,
     page: u32,
     cache: &'a mut [Option<CachedPageText>],
+    font_cache: &mut TexFontCache,
 ) -> Option<&'a CachedPageText> {
-    let index = usize::try_from(page).ok()?;
-    let slot = cache.get_mut(index)?;
-    if slot.is_none() {
-        let page_index = i32::try_from(page).ok()?;
-        let page = document.pages().get(page_index).ok()?;
-        let text = page.text().ok()?;
-        let raw = text.all();
-        let chars = text.chars();
-        let mut next_index = 0;
-        let (normalized, source_index_by_byte) =
-            normalize_search_characters(chars.iter().filter_map(|character| {
-                let index = character.index();
-                if index < next_index {
-                    return None;
-                }
-                let first = pdf_char_unicode(&character);
-                let end = index
-                    + if (0xd800..=0xdbff).contains(&first) {
-                        2
-                    } else {
-                        1
-                    };
-                let value = source_range_char(index, end, |unit| {
-                    if unit == index {
-                        Some(first)
-                    } else {
-                        chars
-                            .get(unit)
-                            .ok()
-                            .map(|character| pdf_char_unicode(&character))
-                    }
-                })?;
-                next_index = end;
-                Some((index, value))
-            }));
-        *slot = Some(CachedPageText {
-            raw,
-            normalized,
-            source_index_by_byte,
-            visible: None,
-        });
-    }
-    slot.as_ref()
+    cached_page_text_with_loaded(document, page, None, None, cache, font_cache)
 }
-fn cached_visible_page_text<'a>(
+
+fn cached_page_text_with_loaded<'a>(
     document: &PdfDocument,
     page: u32,
+    loaded_page: Option<&PdfPage>,
+    loaded_text: Option<&PdfPageText>,
     cache: &'a mut [Option<CachedPageText>],
-    generation: u64,
-    latest_generation: &AtomicU64,
+    font_cache: &mut TexFontCache,
 ) -> Option<&'a CachedPageText> {
     let index = usize::try_from(page).ok()?;
-    cached_page_text(document, page, cache)?;
-    let slot = cache.get_mut(index)?.as_mut()?;
-    if slot.visible.is_none() {
-        let page_index = i32::try_from(page).ok()?;
-        let pdf_page = document.pages().get(page_index).ok()?;
-        let (clip_left, clip_bottom, clip_right, clip_top) = effective_page_bounds(&pdf_page)?;
-        let text = pdf_page.text().ok()?;
-        let chars = text.chars();
-        let mut visible_characters = Vec::new();
-        let mut index = 0;
-        while index < chars.len() {
-            if generation != latest_generation.load(Ordering::Acquire) {
-                return None;
-            }
-            let Ok(character) = chars.get(index) else {
-                index += 1;
-                continue;
-            };
-            let first = pdf_char_unicode(&character);
-            let mut width = 1;
-            let scalar = if (0xd800..=0xdbff).contains(&first) && index + 1 < chars.len() {
-                let second = pdf_char_unicode(&chars.get(index + 1).ok()?);
-                if (0xdc00..=0xdfff).contains(&second) {
-                    width = 2;
-                    0x10000 + ((first - 0xd800) << 10) + second - 0xdc00
-                } else {
-                    first
-                }
-            } else {
-                first
-            };
-            let end = index + width;
-            let Some(value) = char::from_u32(scalar) else {
-                index = end;
-                continue;
-            };
-            if value.is_whitespace() {
-                // PDFium also inserts whitespace without a text object. Keep those
-                // separators, but not invisible or transparent painted spaces.
-                let visible = character.render_mode().map_or(true, |mode| {
-                    text_mode_has_visible_paint(
-                        mode,
-                        || character.fill_color().ok().map(|color| color.alpha()),
-                        || character.stroke_color().ok().map(|color| color.alpha()),
-                    )
-                });
-                if visible {
-                    visible_characters.push(((index, end), value));
-                }
-                index = end;
-                continue;
-            }
-            let mut has_visible_glyph = false;
-            for glyph_index in index..end {
-                let Ok(glyph) = chars.get(glyph_index) else {
-                    continue;
-                };
-                let Ok(render_mode) = glyph.render_mode() else {
-                    continue;
-                };
-                if !text_mode_has_visible_paint(
-                    render_mode,
-                    || glyph.fill_color().ok().map(|color| color.alpha()),
-                    || glyph.stroke_color().ok().map(|color| color.alpha()),
-                ) {
-                    continue;
-                }
-                let Ok(bounds) = glyph.tight_bounds() else {
-                    continue;
-                };
-                if bounds.right().value > clip_left
-                    && bounds.left().value < clip_right
-                    && bounds.top().value > clip_bottom
-                    && bounds.bottom().value < clip_top
-                {
-                    has_visible_glyph = true;
-                    break;
-                }
-            }
-            if has_visible_glyph {
-                visible_characters.push(((index, end), value));
-            }
-            index = end;
+    let slot = cache
+        .get_mut(index)?
+        .get_or_insert_with(CachedPageText::default);
+    if !slot.full_text_initialized {
+        if let Some(text) = loaded_text {
+            init_cached_page_text(slot, text, font_cache);
+        } else if let Some(pdf_page) = loaded_page {
+            let text = pdf_page.text().ok()?;
+            init_cached_page_text(slot, &text, font_cache);
+        } else {
+            let page_index = i32::try_from(page).ok()?;
+            let pdf_page = document.pages().get(page_index).ok()?;
+            let text = pdf_page.text().ok()?;
+            init_cached_page_text(slot, &text, font_cache);
         }
-        if generation != latest_generation.load(Ordering::Acquire) {
-            return None;
-        }
-        slot.visible = Some(normalize_search_characters(visible_characters));
     }
     Some(slot)
+}
+
+fn cached_visible_page_text<'a>(
+    pdf_page: &PdfPage,
+    page: u32,
+    cache: &'a mut [Option<CachedPageText>],
+    font_cache: &mut TexFontCache,
+    generation: u64,
+    latest_generation: &AtomicU64,
+) -> Option<&'a VisiblePageText> {
+    let index = usize::try_from(page).ok()?;
+    let slot = cache
+        .get_mut(index)?
+        .get_or_insert_with(CachedPageText::default);
+    if slot.visible.is_none() {
+        slot.visible =
+            extract_visible_page_text(pdf_page, font_cache, generation, latest_generation);
+    }
+    slot.visible.as_ref()
+}
+
+fn extract_visible_page_text(
+    page: &PdfPage,
+    font_cache: &mut TexFontCache,
+    generation: u64,
+    latest_generation: &AtomicU64,
+) -> Option<VisiblePageText> {
+    let (clip_left, clip_bottom, clip_right, clip_top) = effective_page_bounds(page)?;
+    let text = page.text().ok()?;
+    let chars = text.chars();
+    let mut glyphs = Vec::new();
+    let (normalized, source_index_by_byte) = normalize_search_characters(
+        decoded_pdf_characters(
+            &chars,
+            font_cache,
+            || generation == latest_generation.load(Ordering::Acquire),
+            |_, _| {},
+        )
+        .filter_map(|(start, end, value)| {
+            let mut bounds = [None; 2];
+            if value.is_whitespace() {
+                // PDFium inserts separators without a text object. Painted spaces
+                // still obey the same transparency/render-mode rules as glyphs.
+                let character = chars.get(start).ok()?;
+                if !char_has_visible_paint(&character, true) {
+                    return None;
+                }
+            } else {
+                for index in start..end {
+                    if generation != latest_generation.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    let Ok(character) = chars.get(index) else {
+                        continue;
+                    };
+                    if !char_has_visible_paint(&character, false) {
+                        continue;
+                    }
+                    if let Ok(rect) = character.tight_bounds() {
+                        bounds[index - start] = Some(rect);
+                    }
+                }
+                if !bounds.iter().flatten().any(|bounds| {
+                    bounds.right().value > clip_left
+                        && bounds.left().value < clip_right
+                        && bounds.top().value > clip_bottom
+                        && bounds.bottom().value < clip_top
+                }) {
+                    return None;
+                }
+            }
+            let index = glyphs.len();
+            glyphs.push(VisibleGlyph {
+                source_index: start,
+                value,
+                bounds,
+            });
+            Some((index, value))
+        }),
+    );
+    if generation != latest_generation.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(VisiblePageText {
+        normalized,
+        source_index_by_byte,
+        glyphs,
+    })
+}
+
+fn cached_page_content_bounds(page: &PdfPage, cache: &mut CachedPageGeometry) -> [f32; 4] {
+    *cache
+        .content_bounds
+        .get_or_insert_with(|| page_content_bounds(page))
+}
+
+fn search_rect(bounds: PdfRect) -> SearchRect {
+    SearchRect {
+        left: bounds.left().value,
+        right: bounds.right().value,
+        top: bounds.top().value,
+        bottom: bounds.bottom().value,
+    }
+}
+
+fn bounds_probe_config(page: &PdfPage) -> Option<(PdfRenderConfig, i32, i32)> {
+    const WIDTH: i32 = 100_000;
+    let (w, h) = (page.width().value, page.height().value);
+    if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let scaled_h = (h * WIDTH as f32 / w).round();
+    if !scaled_h.is_finite() || !(1.0..=i32::MAX as f32).contains(&scaled_h) {
+        return None;
+    }
+    Some((
+        PdfRenderConfig::new().set_target_width(WIDTH),
+        WIDTH,
+        scaled_h as i32,
+    ))
 }
 
 /// Measure all page objects, not just text, in the same rotated/cropped device
 /// coordinates used by rendering and hit-testing. Empty pages retain page fit.
 fn page_content_bounds(page: &PdfPage) -> [f32; 4] {
-    const WIDTH: i32 = 100_000;
-    let height = (page.height().value * WIDTH as f32 / page.width().value).round() as i32;
-    let config = PdfRenderConfig::new().set_target_width(WIDTH);
+    let Some((config, width, height)) = bounds_probe_config(page) else {
+        return [0.0, 0.0, 1.0, 1.0];
+    };
     let mut content = [1.0_f32, 1.0, 0.0, 0.0];
     for object in page.objects().iter() {
         let Ok(bounds) = object.bounds() else {
             continue;
         };
-        let bounds = bounds.to_rect();
-        let Some((left, right, top, bottom)) = page_rect_pixel_bounds(
-            page,
-            &config,
-            SearchRect {
-                left: bounds.left().value,
-                right: bounds.right().value,
-                top: bounds.top().value,
-                bottom: bounds.bottom().value,
-            },
-        ) else {
+        let Some((left, right, top, bottom)) =
+            page_rect_pixel_bounds(page, &config, search_rect(bounds.to_rect()))
+        else {
             continue;
         };
-        let left = (left as f32 / WIDTH as f32).clamp(0.0, 1.0);
-        let right = (right as f32 / WIDTH as f32).clamp(0.0, 1.0);
+        let left = (left as f32 / width as f32).clamp(0.0, 1.0);
+        let right = (right as f32 / width as f32).clamp(0.0, 1.0);
         let top = (top as f32 / height as f32).clamp(0.0, 1.0);
         let bottom = (bottom as f32 / height as f32).clamp(0.0, 1.0);
         if left < right && top < bottom {
@@ -2925,19 +3126,8 @@ fn page_content_bounds(page: &PdfPage) -> [f32; 4] {
 }
 
 fn effective_page_bounds(page: &PdfPage) -> Option<(f32, f32, f32, f32)> {
-    const WIDTH: i32 = 100_000;
-    let page_width = page.width().value;
-    let page_height = page.height().value;
-    if !page_width.is_finite() || !page_height.is_finite() || page_width <= 0.0 {
-        return None;
-    }
-    let scaled_height = (page_height * WIDTH as f32 / page_width).round();
-    if !scaled_height.is_finite() || !(1.0..=i32::MAX as f32).contains(&scaled_height) {
-        return None;
-    }
-    let height = scaled_height as i32;
-    let config = PdfRenderConfig::new().set_target_width(WIDTH);
-    let points: Vec<_> = [(0, 0), (WIDTH, 0), (0, height), (WIDTH, height)]
+    let (config, width, height) = bounds_probe_config(page)?;
+    let points: Vec<_> = [(0, 0), (width, 0), (0, height), (width, height)]
         .into_iter()
         .map(|(x, y)| page.pixels_to_points(x, y, &config).ok())
         .collect::<Option<_>>()?;
@@ -2960,6 +3150,20 @@ fn effective_page_bounds(page: &PdfPage) -> Option<(f32, f32, f32, f32)> {
     (left.is_finite() && right.is_finite() && bottom.is_finite() && top.is_finite())
         .then_some((left, bottom, right, top))
 }
+
+fn char_has_visible_paint(
+    character: &pdfium_render::prelude::PdfPageTextChar<'_>,
+    whitespace_default: bool,
+) -> bool {
+    character.render_mode().map_or(whitespace_default, |mode| {
+        text_mode_has_visible_paint(
+            mode,
+            || character.fill_color().ok().map(|color| color.alpha()),
+            || character.stroke_color().ok().map(|color| color.alpha()),
+        )
+    })
+}
+
 fn text_mode_has_visible_paint(
     mode: PdfPageTextRenderMode,
     fill_alpha: impl FnOnce() -> Option<u8>,
@@ -3044,6 +3248,49 @@ fn source_range_char(
     char::from_u32(scalar)
 }
 
+// Decode PDFium's scalar/UTF-16 representations once per extraction, caching
+// parsed Type 1 slot tables by font name across the loaded document.
+fn decoded_pdf_characters<'a>(
+    chars: &'a PdfPageTextChars<'_>,
+    font_cache: &'a mut TexFontCache,
+    mut is_current: impl FnMut() -> bool + 'a,
+    mut on_invalid: impl FnMut(usize, u32) + 'a,
+) -> impl Iterator<Item = (usize, usize, char)> + 'a {
+    let len = chars.len();
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while index < len {
+            if !is_current() {
+                return None;
+            }
+            let start = index;
+            index += 1;
+            let Ok(character) = chars.get(start) else {
+                continue;
+            };
+            let first = pdf_char_unicode(&character, font_cache);
+            let second = if (0xd800..=0xdbff).contains(&first) && index < len {
+                chars
+                    .get(index)
+                    .ok()
+                    .map(|character| pdf_char_unicode(&character, font_cache))
+            } else {
+                None
+            };
+            if second.is_some_and(|unit| (0xdc00..=0xdfff).contains(&unit)) {
+                index += 1;
+            }
+            if let Some(value) = source_range_char(start, index, |unit| {
+                if unit == start { Some(first) } else { second }
+            }) {
+                return Some((start, index, value));
+            }
+            on_invalid(start, first);
+        }
+        None
+    })
+}
+
 fn push_normalized_character<T: Copy>(
     normalized: &mut String,
     source_index_by_byte: &mut Vec<T>,
@@ -3102,74 +3349,51 @@ fn forward_context_score(text: &str, hint: &ForwardWord) -> Option<u32> {
 /// Beamer can keep future overlay text in the PDF at coordinates well outside
 /// the page. PDFium extracts those glyphs, so raw page text is not evidence
 /// that the words are visible on the current overlay.
-fn visible_forward_text(page: &PdfPage) -> Result<(String, Vec<usize>), String> {
+fn visible_forward_text(
+    page: &PdfPage,
+    font_cache: &mut TexFontCache,
+) -> Result<(String, Vec<usize>), String> {
     let bounds =
         effective_page_bounds(page).ok_or("could not determine visible PDF page bounds")?;
-    painted_forward_text(page, bounds)
+    painted_forward_text(page, bounds, font_cache)
 }
 
 fn painted_forward_text(
     page: &PdfPage,
     (clip_left, clip_bottom, clip_right, clip_top): (f32, f32, f32, f32),
+    font_cache: &mut TexFontCache,
 ) -> Result<(String, Vec<usize>), String> {
     let text = page
         .text()
         .map_err(|error| format!("could not extract visible PDF text: {error}"))?;
     let chars = text.chars();
-    let mut next_index = 0;
     let mut unicode_error = None;
-    let normalized = normalize_search_characters(chars.iter().filter_map(|character| {
-        let index = character.index();
-        if index < next_index {
-            return None;
-        }
-        let first = pdf_char_unicode(&character);
-        let end = index
-            + if (0xd800..=0xdbff).contains(&first) {
-                2
-            } else {
-                1
-            };
-        let Some(value) = source_range_char(index, end, |unit| {
-            if unit == index {
-                Some(first)
-            } else {
-                chars
-                    .get(unit)
-                    .ok()
-                    .map(|character| pdf_char_unicode(&character))
+    let normalized = normalize_search_characters(
+        decoded_pdf_characters(
+            &chars,
+            font_cache,
+            || true,
+            |index, first| {
+                unicode_error.get_or_insert_with(|| {
+                    format!("invalid PDF Unicode value {first:#x} at character {index}")
+                });
+            },
+        )
+        .filter_map(|(index, _, value)| {
+            let character = chars.get(index).ok()?;
+            if value.is_whitespace() {
+                return char_has_visible_paint(&character, true)
+                    .then_some((character.index(), value));
             }
-        }) else {
-            unicode_error.get_or_insert_with(|| {
-                format!("invalid PDF Unicode value {first:#x} at character {index}")
-            });
-            return None;
-        };
-        next_index = end;
-        if value.is_whitespace() {
-            let visible = character.render_mode().map_or(true, |mode| {
-                text_mode_has_visible_paint(
-                    mode,
-                    || character.fill_color().ok().map(|color| color.alpha()),
-                    || character.stroke_color().ok().map(|color| color.alpha()),
-                )
-            });
-            return visible.then_some((character.index(), value));
-        }
-        let bounds = character.tight_bounds().ok()?;
-        let within_crop = bounds.right().value > clip_left
-            && bounds.left().value < clip_right
-            && bounds.top().value > clip_bottom
-            && bounds.bottom().value < clip_top;
-        let painted = character.render_mode().ok().is_some_and(|mode| {
-            text_mode_has_visible_paint(
-                mode,
-                || character.fill_color().ok().map(|color| color.alpha()),
-                || character.stroke_color().ok().map(|color| color.alpha()),
-            )
-        });
-        (within_crop && painted).then_some((character.index(), value))
-    }));
+            let bounds = character.tight_bounds().ok()?;
+            let within_crop = bounds.right().value > clip_left
+                && bounds.left().value < clip_right
+                && bounds.top().value > clip_bottom
+                && bounds.bottom().value < clip_top;
+            (within_crop && char_has_visible_paint(&character, false))
+                .then_some((character.index(), value))
+        }),
+    );
     match unicode_error {
         Some(error) => Err(error),
         None => Ok(normalized),
@@ -3198,13 +3422,14 @@ fn forward_overlay_page(
     if !later_pages.is_empty() && !page_hint.words.is_empty() {
         // An unreadable page never overrides the initial result. Preserve the
         // original first-plus-63-later-page scan bound.
-        let visible = |page: u32| {
+        let mut font_cache = HashMap::new();
+        let mut visible = |page: u32| {
             let index = page.checked_sub(1)?;
             if index >= pages {
                 return None;
             }
             let page = document.pages().get(i32::try_from(index).ok()?).ok()?;
-            visible_forward_text(&page).ok()
+            visible_forward_text(&page, &mut font_cache).ok()
         };
         selected_text = visible(first);
         let first_score = selected_text
@@ -3285,6 +3510,7 @@ fn forward_word_occurrence(
     source_index_by_byte: &[usize],
     start: usize,
     word: &str,
+    font_cache: &mut TexFontCache,
 ) -> Option<ForwardWordOccurrence> {
     let end = start + word.len();
     let first = *source_index_by_byte.get(start)?;
@@ -3302,14 +3528,14 @@ fn forward_word_occurrence(
             return None;
         }
         if value as u32 > 0xffff
-            && (0xd800..=0xdbff).contains(&pdf_char_unicode(&chars.get(next).ok()?))
+            && (0xd800..=0xdbff).contains(&pdf_char_unicode(&chars.get(next).ok()?, font_cache))
         {
             let stop = next + 2;
             let decoded = source_range_char(next, stop, |index| {
                 chars
                     .get(index)
                     .ok()
-                    .map(|character| pdf_char_unicode(&character))
+                    .map(|character| pdf_char_unicode(&character, font_cache))
             })?;
             if !decoded.to_lowercase().eq(std::iter::once(value)) {
                 return None;
@@ -3325,15 +3551,9 @@ fn forward_word_occurrence(
     if rectangles.next().is_some() {
         return None;
     }
-    let bounds = segment.bounds();
     Some(ForwardWordOccurrence {
         first,
-        rect: SearchRect {
-            left: bounds.left().value,
-            right: bounds.right().value,
-            top: bounds.top().value,
-            bottom: bounds.bottom().value,
-        },
+        rect: search_rect(segment.bounds()),
     })
 }
 
@@ -3354,6 +3574,7 @@ fn forward_word_rect(
     cached: &CachedPageText,
     hint: &ForwardWord,
     region: SearchRect,
+    font_cache: &mut TexFontCache,
 ) -> Result<Option<SearchRect>, String> {
     let tokens = words(&cached.normalized);
     let text = page.text().map_err(|e| e.to_string())?;
@@ -3375,7 +3596,7 @@ fn forward_word_rect(
             continue;
         }
         let Some(occurrence) =
-            forward_word_occurrence(&text, &cached.source_index_by_byte, start, word)
+            forward_word_occurrence(&text, &cached.source_index_by_byte, start, word, font_cache)
         else {
             continue;
         };
@@ -3418,16 +3639,8 @@ fn forward_word_rect(
     Ok(best.filter(|_| !tied).map(|(_, rect)| rect))
 }
 
-fn search_page(
-    document: &PdfDocument,
-    page: u32,
-    cache: &mut [Option<CachedPageText>],
-    needle: &str,
-) -> (u32, Vec<SearchRect>, String) {
-    let Some(cached) = cached_page_text(document, page, cache) else {
-        return (0, Vec::new(), String::new());
-    };
-    let source_ranges: Vec<_> = cached
+fn search_page_ranges(cached: &CachedPageText, needle: &str) -> Vec<(usize, usize)> {
+    cached
         .normalized
         .match_indices(needle)
         .filter_map(|(start, _)| {
@@ -3436,36 +3649,65 @@ fn search_page(
             let last = *cached.source_index_by_byte.get(end.checked_sub(1)?)?;
             Some((first, last.saturating_sub(first).saturating_add(1)))
         })
-        .collect();
-    let occurrences = u32::try_from(source_ranges.len()).unwrap_or(u32::MAX);
-    if source_ranges.is_empty() {
+        .collect()
+}
+
+fn search_page_segments(text: &PdfPageText, source_ranges: &[(usize, usize)]) -> Vec<SearchRect> {
+    let mut rectangles = Vec::new();
+    for &(start, count) in source_ranges {
+        let segments = text.segments_subset(start, count);
+        rectangles.extend(segments.iter().map(|s| search_rect(s.bounds())));
+    }
+    rectangles
+}
+
+fn finish_search_page(
+    slot: &CachedPageText,
+    ranges: &[(usize, usize)],
+    text: Option<&PdfPageText>,
+) -> (u32, Vec<SearchRect>, String) {
+    let occurrences = u32::try_from(ranges.len()).unwrap_or(u32::MAX);
+    let rects = text.map_or_else(Vec::new, |t| search_page_segments(t, ranges));
+    (occurrences, rects, search_match_context(slot, ranges[0]))
+}
+
+fn search_page(
+    document: &PdfDocument,
+    page: u32,
+    cache: &mut [Option<CachedPageText>],
+    font_cache: &mut TexFontCache,
+    needle: &str,
+) -> (u32, Vec<SearchRect>, String) {
+    let Some(entry) = usize::try_from(page).ok().and_then(|i| cache.get_mut(i)) else {
+        return (0, Vec::new(), String::new());
+    };
+    if let Some(cached) = entry.as_ref().filter(|slot| slot.full_text_initialized) {
+        let ranges = search_page_ranges(cached, needle);
+        if ranges.is_empty() {
+            return (0, Vec::new(), String::new());
+        }
+        let pdf_page = i32::try_from(page)
+            .ok()
+            .and_then(|i| document.pages().get(i).ok());
+        let text = pdf_page.as_ref().and_then(|p| p.text().ok());
+        return finish_search_page(cached, &ranges, text.as_ref());
+    }
+    let Some(pdf_page) = i32::try_from(page)
+        .ok()
+        .and_then(|i| document.pages().get(i).ok())
+    else {
+        return (0, Vec::new(), String::new());
+    };
+    let Ok(text) = pdf_page.text() else {
+        return (0, Vec::new(), String::new());
+    };
+    let slot = entry.get_or_insert_with(CachedPageText::default);
+    init_cached_page_text(slot, &text, font_cache);
+    let ranges = search_page_ranges(slot, needle);
+    if ranges.is_empty() {
         return (0, Vec::new(), String::new());
     }
-    let context = search_match_context(cached, source_ranges[0]);
-
-    let Ok(page_index) = i32::try_from(page) else {
-        return (occurrences, Vec::new(), context);
-    };
-    let Ok(page) = document.pages().get(page_index) else {
-        return (occurrences, Vec::new(), context);
-    };
-    let Ok(text) = page.text() else {
-        return (occurrences, Vec::new(), context);
-    };
-    let mut rectangles = Vec::new();
-    for (start, count) in source_ranges {
-        let segments = text.segments_subset(start, count);
-        rectangles.extend(segments.iter().map(|segment| {
-            let bounds = segment.bounds();
-            SearchRect {
-                bottom: bounds.bottom().value,
-                left: bounds.left().value,
-                top: bounds.top().value,
-                right: bounds.right().value,
-            }
-        }));
-    }
-    (occurrences, rectangles, context)
+    finish_search_page(slot, &ranges, Some(&text))
 }
 
 fn search_match_context(cached: &CachedPageText, range: (usize, usize)) -> String {
@@ -3499,29 +3741,13 @@ fn apply_search_highlights(
     color: [u8; 3],
 ) {
     for rectangle in rectangles {
-        let Some((min_x, max_x, min_y, max_y)) = page_rect_pixel_bounds(page, config, *rectangle)
-        else {
-            continue;
-        };
-        let left = min_x.saturating_sub(1).clamp(0, width as i32) as u32;
-        let right = max_x.saturating_add(2).clamp(0, width as i32) as u32;
-        let top = min_y.saturating_sub(1).clamp(0, height as i32) as u32;
-        let bottom = max_y.saturating_add(2).clamp(0, height as i32) as u32;
-        blend_highlight_rectangle(
-            rgba,
-            width,
-            height,
-            PixelRect {
-                left,
-                top,
-                right,
-                bottom,
-            },
-            color,
-        );
+        if let Some(rect) = padded_pixel_rect(page, config, width, height, *rectangle) {
+            blend_highlight_rectangle(rgba, width, height, rect, color);
+        }
     }
 }
 
+#[cfg(test)]
 fn extract_page_links(
     document: &PdfDocument,
     page: &PdfPage,
@@ -3529,18 +3755,28 @@ fn extract_page_links(
     width: u32,
     height: u32,
 ) -> Vec<PageLink> {
-    let mut page_text = None;
-    let mut links: Vec<_> = page
-        .links()
+    let annotations = extract_page_link_annotations(document, page);
+    extract_page_links_with_annotations(page, config, width, height, &annotations, None)
+}
+
+fn extract_page_links_with_annotations(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+    annotations: &[CachedPageLink],
+    loaded_text: Option<&PdfPageText>,
+) -> Vec<PageLink> {
+    let mut lazy_text = None;
+    let mut links: Vec<_> = annotations
         .iter()
-        .filter_map(|link| {
-            let target = resolve_link_target(document, &link)?;
-            let bounds = link.rect().ok()?;
-            let rect = page_rect_to_pixels(page, config, width, height, bounds)?;
-            let label = page_text
-                .get_or_insert_with(|| page.text().ok())
-                .as_ref()
-                .map(|text| link_text_label(&text.inside_rect(bounds)))
+        .filter_map(|annotation| {
+            let target = annotation.target.as_ref()?.clone();
+            let rect = page_rect_to_pixels(page, config, width, height, annotation.bounds)?;
+            let text =
+                loaded_text.or_else(|| lazy_text.get_or_insert_with(|| page.text().ok()).as_ref());
+            let label = text
+                .map(|text| link_text_label(&text.inside_rect(annotation.bounds)))
                 .filter(|label| !label.is_empty())
                 .unwrap_or_else(|| link_target_label(&target));
             Some(PageLink {
@@ -3554,38 +3790,111 @@ fn extract_page_links(
     links
 }
 
-fn extract_page_link_rectangles(
-    page: &PdfPage,
-    config: &PdfRenderConfig,
-    width: u32,
-    height: u32,
-) -> Vec<PageLinkRect> {
+const DESTINATION_RATIO_SIZE: i32 = 10_000;
+
+fn extract_page_link_annotations<'a>(
+    document: &PdfDocument<'a>,
+    page: &PdfPage<'_>,
+) -> Vec<CachedPageLink> {
+    let config =
+        PdfRenderConfig::new().set_fixed_size(DESTINATION_RATIO_SIZE, DESTINATION_RATIO_SIZE);
+    let mut target_pages: HashMap<u32, Option<PdfPage<'a>>> = HashMap::new();
     page.links()
         .iter()
         .filter_map(|link| {
-            let bounds = link.rect().ok()?;
-            page_rect_to_pixels(page, config, width, height, bounds)
+            Some(CachedPageLink {
+                bounds: link.rect().ok()?,
+                target: resolve_link_target(document, &link, &config, &mut target_pages),
+            })
         })
         .collect()
 }
 
+fn project_page_links(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+    annotations: &[CachedPageLink],
+    include_contrast_rectangles: bool,
+) -> (Vec<PageLink>, Vec<PageLinkRect>) {
+    let mut links = Vec::new();
+    let mut rectangles = Vec::new();
+    for annotation in annotations {
+        let Some(rect) = page_rect_to_pixels(page, config, width, height, annotation.bounds) else {
+            continue;
+        };
+        if include_contrast_rectangles {
+            rectangles.push(rect);
+        }
+        if let Some(target) = &annotation.target {
+            links.push(PageLink {
+                rect,
+                label: String::new(),
+                target: target.clone(),
+            });
+        }
+    }
+    sort_page_links_reading_order(&mut links);
+    (links, rectangles)
+}
+
+#[cfg(test)]
 fn extract_document_links(
     document: &PdfDocument,
     page: &PdfPage,
     source_page: u32,
     text_cache: &mut [Option<CachedPageText>],
+    font_cache: &mut TexFontCache,
 ) -> Vec<DocumentLink> {
+    let annotations = extract_page_link_annotations(document, page);
+    extract_document_links_with_annotations(
+        document,
+        page,
+        source_page,
+        text_cache,
+        font_cache,
+        &annotations,
+    )
+}
+
+fn extract_document_links_with_annotations(
+    document: &PdfDocument,
+    page: &PdfPage,
+    source_page: u32,
+    text_cache: &mut [Option<CachedPageText>],
+    font_cache: &mut TexFontCache,
+    annotations: &[CachedPageLink],
+) -> Vec<DocumentLink> {
+    if annotations.is_empty() {
+        return Vec::new();
+    }
     const INDEX_WIDTH: u32 = 1_000;
     let config = PdfRenderConfig::new().set_target_width(i32::try_from(INDEX_WIDTH).unwrap());
     let page_width = page.width().value.max(1.0);
     let index_height =
         ((INDEX_WIDTH as f32 * page.height().value / page_width).ceil() as u32).max(1);
-    let links = extract_page_links(document, page, &config, INDEX_WIDTH, index_height);
+    let page_text = page.text().ok();
+    let links = extract_page_links_with_annotations(
+        page,
+        &config,
+        INDEX_WIDTH,
+        index_height,
+        annotations,
+        page_text.as_ref(),
+    );
     if links.is_empty() {
         return Vec::new();
     }
-    let source_text = cached_page_text(document, source_page, text_cache)
-        .map(|text| normalize_context_text(&text.raw));
+    let source_text = cached_page_text_with_loaded(
+        document,
+        source_page,
+        Some(page),
+        page_text.as_ref(),
+        text_cache,
+        font_cache,
+    )
+    .map(|text| normalize_context_text(&text.raw));
     let mut target_texts = HashMap::<u32, Option<String>>::new();
     let mut label_occurrences = HashMap::<String, usize>::new();
     coalesce_document_link_fragments(links, source_text.as_deref())
@@ -3601,7 +3910,7 @@ fn extract_document_links(
                 LinkTarget::Internal { page, .. } => {
                     citation_number(&link.label).and_then(|number| {
                         let target_text = target_texts.entry(*page).or_insert_with(|| {
-                            cached_page_text(document, *page, text_cache)
+                            cached_page_text(document, *page, text_cache, font_cache)
                                 .map(|text| normalize_context_text(&text.raw))
                         });
                         target_text
@@ -3660,15 +3969,42 @@ fn selected_page_link_rectangles(
 }
 
 fn page_link_group_indices(links: &[PageLink]) -> Vec<Vec<usize>> {
+    let bits = |v: Option<f32>| v.map(|x| if x == 0.0 { 0 } else { x.to_bits() });
+    let is_sorted = links.windows(2).all(|w| w[0].rect.top <= w[1].rect.top);
+    let max_top_gap = links
+        .iter()
+        .map(|l| l.rect.bottom.saturating_sub(l.rect.top).max(1))
+        .max()
+        .unwrap_or(1)
+        .saturating_mul(2)
+        .max(2);
     let mut groups: Vec<Vec<usize>> = Vec::with_capacity(links.len());
+    let mut by_target = HashMap::with_capacity(links.len());
     for (index, link) in links.iter().enumerate() {
-        if let Some(group) = groups.iter_mut().rev().find(|group| {
-            let previous = &links[*group.last().expect("link group is not empty")];
-            previous.target == link.target && link_fragments_are_adjacent(previous.rect, link.rect)
+        let key = match &link.target {
+            LinkTarget::Internal {
+                page,
+                top_ratio,
+                left_ratio,
+            } => (false, *page, bits(*top_ratio), bits(*left_ratio), ""),
+            LinkTarget::Uri(uri) => (true, 0, None, None, uri.as_str()),
+        };
+        let target_groups: &mut Vec<usize> = by_target.entry(key).or_default();
+        if is_sorted {
+            target_groups.retain(|&group_index| {
+                let prev = &links[*groups[group_index].last().expect("link group is not empty")];
+                link.rect.top.saturating_sub(prev.rect.top) <= max_top_gap
+            });
+        }
+        if let Some(&group_index) = target_groups.iter().rev().find(|&&group_index| {
+            let previous = &links[*groups[group_index].last().expect("link group is not empty")];
+            link_fragments_are_adjacent(previous.rect, link.rect)
         }) {
-            group.push(index);
+            groups[group_index].push(index);
         } else {
+            let group_index = groups.len();
             groups.push(vec![index]);
+            target_groups.push(group_index);
         }
     }
     groups
@@ -3779,57 +4115,33 @@ fn context_window(
     before: usize,
     after: usize,
 ) -> String {
-    let start_slice = text.get(..range.start).unwrap_or("");
-    let mut rev_chars = start_slice.char_indices().rev();
-    let mut start_byte = range.start;
-    for _ in 0..before {
-        let Some((idx, _)) = rev_chars.next() else {
-            start_byte = 0;
-            break;
-        };
-        start_byte = idx;
-    }
-    if start_byte > 0 {
-        for (idx, ch) in rev_chars {
-            if ch.is_whitespace() {
-                break;
-            }
-            start_byte = idx;
+    let mut rev = text.get(..range.start).unwrap_or("").char_indices().rev();
+    let mut start = (0..before)
+        .try_fold(range.start, |_, _| rev.next().map(|(i, _)| i))
+        .unwrap_or(0);
+    if start > 0 {
+        for (i, _) in rev.take_while(|(_, c)| !c.is_whitespace()) {
+            start = i;
         }
     }
-
-    let end_slice = text.get(range.end..).unwrap_or("");
-    let mut fwd_chars = end_slice.char_indices();
-    let mut end_rel = 0;
-    let mut reached_end = false;
-    for _ in 0..after {
-        let Some((idx, ch)) = fwd_chars.next() else {
-            end_rel = end_slice.len();
-            reached_end = true;
-            break;
-        };
-        end_rel = idx + ch.len_utf8();
-    }
-    if !reached_end {
-        for (idx, ch) in fwd_chars {
-            if ch.is_whitespace() {
-                break;
+    let suffix = text.get(range.end..).unwrap_or("");
+    let mut fwd = suffix.char_indices();
+    let end_rel = match (0..after).try_fold(0, |_, _| fwd.next().map(|(i, c)| i + c.len_utf8())) {
+        Some(mut rel) => {
+            for (i, c) in fwd.take_while(|(_, c)| !c.is_whitespace()) {
+                rel = i + c.len_utf8();
             }
-            end_rel = idx + ch.len_utf8();
+            rel
         }
-    }
-    let end_byte = (range.end + end_rel).min(text.len());
-
-    let trimmed = text.get(start_byte..end_byte).unwrap_or("").trim();
-    let mut context = String::with_capacity(trimmed.len() + 6);
-    if start_byte > 0 {
-        context.push('…');
-    }
-    context.push_str(trimmed);
-    if end_byte < text.len() {
-        context.push('…');
-    }
-    context
+        None => suffix.len(),
+    };
+    let end = (range.end + end_rel).min(text.len());
+    let trimmed = text.get(start..end).unwrap_or("").trim();
+    format!(
+        "{}{trimmed}{}",
+        if start > 0 { "…" } else { "" },
+        if end < text.len() { "…" } else { "" }
+    )
 }
 
 fn next_bracketed_number(text: &str, start: usize) -> Option<usize> {
@@ -3875,26 +4187,47 @@ fn link_target_label(target: &LinkTarget) -> String {
     }
 }
 
-fn resolve_link_target(document: &PdfDocument, link: &PdfLink<'_>) -> Option<LinkTarget> {
+fn resolve_link_target<'a>(
+    document: &PdfDocument<'a>,
+    link: &PdfLink<'_>,
+    config: &PdfRenderConfig,
+    target_pages: &mut HashMap<u32, Option<PdfPage<'a>>>,
+) -> Option<LinkTarget> {
     if let Some(destination) = link.destination() {
-        return resolve_internal_destination(document, destination);
+        return resolve_internal_destination(document, destination, config, target_pages);
     }
     match link.action()? {
         PdfAction::LocalDestination(action) => {
-            resolve_internal_destination(document, action.destination().ok()?)
+            resolve_internal_destination(document, action.destination().ok()?, config, target_pages)
         }
         PdfAction::Uri(action) => action.uri().ok().map(LinkTarget::Uri),
         _ => None,
     }
 }
 
-fn resolve_internal_destination(
-    document: &PdfDocument,
+fn resolve_internal_destination<'a>(
+    document: &PdfDocument<'a>,
     destination: PdfDestination<'_>,
+    config: &PdfRenderConfig,
+    target_pages: &mut HashMap<u32, Option<PdfPage<'a>>>,
 ) -> Option<LinkTarget> {
     let page_index = destination.page_index().ok()?;
     let page = u32::try_from(page_index).ok()?;
-    let (target_x, target_y) = match destination.view_settings().ok() {
+    let view = destination.view_settings().ok();
+    if matches!(
+        view,
+        Some(
+            PdfDestinationViewSettings::FitPageToWindow
+                | PdfDestinationViewSettings::FitBoundsToWindow
+        )
+    ) {
+        return Some(LinkTarget::Internal {
+            page,
+            top_ratio: Some(0.0),
+            left_ratio: None,
+        });
+    }
+    let (target_x, target_y) = match view {
         Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, y, _)) => (x, y),
         Some(PdfDestinationViewSettings::FitPageHorizontallyToWindow(y))
         | Some(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(y)) => (None, y),
@@ -3906,17 +4239,20 @@ fn resolve_internal_destination(
         _ => (None, None),
     };
     let target_page = (target_x.is_some() || target_y.is_some())
-        .then(|| document.pages().get(page_index).ok())
+        .then(|| {
+            target_pages
+                .entry(page)
+                .or_insert_with(|| document.pages().get(page_index).ok())
+                .as_ref()
+        })
         .flatten();
     let (left_ratio, top_ratio) = target_page
-        .as_ref()
         .and_then(|page| {
             // A fixed square maps both rendered axes directly to normalized positions,
             // including page rotation and the visible crop/media-box origin.
-            const SIZE: i32 = 10_000;
-            let config = PdfRenderConfig::new().set_fixed_size(SIZE, SIZE);
-            let (left, top) = page_destination_position(page, &config, target_x, target_y)?;
-            let ratio = |position: i32| (position as f32 / SIZE as f32).clamp(0.0, 1.0);
+            let (left, top) = page_destination_position(page, config, target_x, target_y)?;
+            let ratio =
+                |position: i32| (position as f32 / DESTINATION_RATIO_SIZE as f32).clamp(0.0, 1.0);
             Some((left.map(ratio), top.map(ratio)))
         })
         .unwrap_or((None, None));
@@ -3986,6 +4322,22 @@ fn page_rect_pixel_bounds(
     Some((left, right, top, bottom))
 }
 
+fn padded_pixel_rect(
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+    width: u32,
+    height: u32,
+    bounds: SearchRect,
+) -> Option<PixelRect> {
+    let (left, right, top, bottom) = page_rect_pixel_bounds(page, config, bounds)?;
+    Some(PixelRect {
+        left: left.saturating_sub(1).clamp(0, width as i32) as u32,
+        right: right.saturating_add(2).clamp(0, width as i32) as u32,
+        top: top.saturating_sub(1).clamp(0, height as i32) as u32,
+        bottom: bottom.saturating_add(2).clamp(0, height as i32) as u32,
+    })
+}
+
 fn page_rect_to_pixels(
     page: &PdfPage,
     config: &PdfRenderConfig,
@@ -3993,22 +4345,18 @@ fn page_rect_to_pixels(
     height: u32,
     bounds: PdfRect,
 ) -> Option<PixelRect> {
-    let (left, right, top, bottom) = page_rect_pixel_bounds(
-        page,
-        config,
-        SearchRect {
-            left: bounds.left().value,
-            right: bounds.right().value,
-            top: bounds.top().value,
-            bottom: bounds.bottom().value,
-        },
-    )?;
-    Some(PixelRect {
-        left: left.saturating_sub(1).clamp(0, width as i32) as u32,
-        right: right.saturating_add(2).clamp(0, width as i32) as u32,
-        top: top.saturating_sub(1).clamp(0, height as i32) as u32,
-        bottom: bottom.saturating_add(2).clamp(0, height as i32) as u32,
-    })
+    padded_pixel_rect(page, config, width, height, search_rect(bounds))
+}
+
+fn blend_outlined_rectangle(
+    rgba: &mut [u8],
+    (width, height): (u32, u32),
+    rect: PixelRect,
+    color: [u8; 3],
+    (fill_alpha, border, border_alpha): (u16, u32, u16),
+) {
+    blend_rectangle(rgba, width, height, rect, color, fill_alpha);
+    blend_rectangle_border(rgba, width, height, rect, border, color, border_alpha);
 }
 
 fn apply_link_highlights(
@@ -4034,8 +4382,13 @@ fn apply_link_highlights(
                 DARK_LINK_BORDER_ALPHA,
             );
         } else {
-            blend_rectangle(rgba, width, height, rect, color, LINK_HIGHLIGHT_ALPHA);
-            blend_rectangle_border(rgba, width, height, rect, 2, color, LINK_BORDER_ALPHA);
+            blend_outlined_rectangle(
+                rgba,
+                (width, height),
+                rect,
+                color,
+                (LINK_HIGHLIGHT_ALPHA, 2, LINK_BORDER_ALPHA),
+            );
         }
     }
 }
@@ -4048,22 +4401,12 @@ fn apply_selected_link_highlights(
     color: [u8; 3],
 ) {
     for &rect in rectangles {
-        blend_rectangle(
+        blend_outlined_rectangle(
             rgba,
-            width,
-            height,
+            (width, height),
             rect,
             color,
-            SELECTED_LINK_HIGHLIGHT_ALPHA,
-        );
-        blend_rectangle_border(
-            rgba,
-            width,
-            height,
-            rect,
-            3,
-            color,
-            SELECTED_LINK_BORDER_ALPHA,
+            (SELECTED_LINK_HIGHLIGHT_ALPHA, 3, SELECTED_LINK_BORDER_ALPHA),
         );
     }
 }
@@ -4107,9 +4450,6 @@ fn apply_dark_mode_link_contrast(
     style: DarkModeStyle,
     accent: [u8; 3],
 ) {
-    let Ok(stride) = usize::try_from(width).map(|width| width.saturating_mul(4)) else {
-        return;
-    };
     for rectangle in rectangles {
         let left = rectangle.left.min(width);
         let right = rectangle.right.min(width);
@@ -4147,18 +4487,10 @@ fn apply_dark_mode_link_contrast(
             continue;
         }
         for y in top..bottom {
-            let Ok(row_start) = usize::try_from(y).map(|y| y.saturating_mul(stride)) else {
+            let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
                 continue;
             };
-            for x in left..right {
-                let Ok(offset) =
-                    usize::try_from(x).map(|x| row_start.saturating_add(x.saturating_mul(4)))
-                else {
-                    continue;
-                };
-                let Some(pixel) = rgba.get_mut(offset..offset.saturating_add(4)) else {
-                    continue;
-                };
+            for pixel in rgba[row].chunks_exact_mut(4) {
                 let original = [pixel[0], pixel[1], pixel[2]];
                 if !is_blue_link_ink(original, background, background_luminance) {
                     continue;
@@ -4187,37 +4519,93 @@ fn apply_dark_mode_link_contrast(
     }
 }
 
+// Validate a row once, including a possibly truncated final pixel buffer.
+fn rectangle_row_range(
+    rgba_len: usize,
+    width: u32,
+    y: u32,
+    left: u32,
+    right: u32,
+) -> Option<std::ops::Range<usize>> {
+    if left >= right {
+        return None;
+    }
+    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
+    let base = usize::try_from(y).ok()?.checked_mul(stride)?;
+    let start = base.checked_add(usize::try_from(left).ok()?.checked_mul(4)?)?;
+    let end = base
+        .checked_add(usize::try_from(right).ok()?.checked_mul(4)?)?
+        .min(rgba_len / 4 * 4);
+    (start < end).then_some(start..end)
+}
+
+thread_local! {
+    static RECTANGLE_COLOR_BUCKETS: RefCell<RectangleColorBuckets> =
+        RefCell::new(RectangleColorBuckets::new());
+}
+
+struct RectangleColorBuckets {
+    values: Vec<(u32, [u64; 3])>,
+    touched: Vec<u16>,
+}
+
+impl RectangleColorBuckets {
+    fn new() -> Self {
+        Self {
+            values: vec![(0u32, [0u64; 3]); 32_768],
+            touched: Vec::with_capacity(32_768),
+        }
+    }
+
+    fn dominant_color(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        rectangle: PageLinkRect,
+    ) -> Option<[u8; 3]> {
+        let left = rectangle.left.min(width);
+        let right = rectangle.right.min(width);
+        let top = rectangle.top.min(height);
+        let bottom = rectangle.bottom.min(height);
+        for y in top..bottom {
+            let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
+                continue;
+            };
+            for pixel in rgba[row].chunks_exact(4) {
+                let key = (u16::from(pixel[0] >> 3) << 10)
+                    | (u16::from(pixel[1] >> 3) << 5)
+                    | u16::from(pixel[2] >> 3);
+                let entry = &mut self.values[usize::from(key)];
+                if entry.0 == 0 {
+                    self.touched.push(key);
+                }
+                entry.0 += 1;
+                for (sum, channel) in entry.1.iter_mut().zip(pixel) {
+                    *sum += u64::from(*channel);
+                }
+            }
+        }
+        let mut dominant = (0, [0; 3]);
+        for key in self.touched.drain(..) {
+            let entry = std::mem::take(&mut self.values[usize::from(key)]);
+            if entry.0 > dominant.0 {
+                dominant = entry;
+            }
+        }
+        let (count, sums) = dominant;
+        (count > 0).then(|| std::array::from_fn(|channel| (sums[channel] / u64::from(count)) as u8))
+    }
+}
+
 fn dominant_rectangle_color(
     rgba: &[u8],
     width: u32,
     height: u32,
     rectangle: PageLinkRect,
 ) -> Option<[u8; 3]> {
-    let left = rectangle.left.min(width);
-    let right = rectangle.right.min(width);
-    let top = rectangle.top.min(height);
-    let bottom = rectangle.bottom.min(height);
-    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
-    let mut colors = HashMap::<u16, (u32, [u64; 3])>::new();
-    for y in top..bottom {
-        let row_start = usize::try_from(y).ok()?.checked_mul(stride)?;
-        for x in left..right {
-            let offset = row_start.checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?;
-            let pixel = rgba.get(offset..offset.checked_add(3)?)?;
-            let key = (u16::from(pixel[0] >> 3) << 10)
-                | (u16::from(pixel[1] >> 3) << 5)
-                | u16::from(pixel[2] >> 3);
-            let entry = colors.entry(key).or_insert((0, [0; 3]));
-            entry.0 += 1;
-            for (sum, channel) in entry.1.iter_mut().zip(pixel) {
-                *sum += u64::from(*channel);
-            }
-        }
-    }
-    let (_, (count, sums)) = colors.into_iter().max_by_key(|(_, (count, _))| *count)?;
-    Some(std::array::from_fn(|channel| {
-        u8::try_from(sums[channel] / u64::from(count)).unwrap_or(u8::MAX)
-    }))
+    RECTANGLE_COLOR_BUCKETS
+        .with_borrow_mut(|buckets| buckets.dominant_color(rgba, width, height, rectangle))
 }
 
 fn darkest_blue_link_ink(
@@ -4232,14 +4620,13 @@ fn darkest_blue_link_ink(
     let right = rectangle.right.min(width);
     let top = rectangle.top.min(height);
     let bottom = rectangle.bottom.min(height);
-    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
     let mut farthest = None;
     let mut farthest_distance = 0_u32;
     for y in top..bottom {
-        let row_start = usize::try_from(y).ok()?.checked_mul(stride)?;
-        for x in left..right {
-            let offset = row_start.checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?;
-            let pixel = rgba.get(offset..offset.checked_add(3)?)?;
+        let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
+            continue;
+        };
+        for pixel in rgba[row].chunks_exact(4) {
             let pixel = [pixel[0], pixel[1], pixel[2]];
             if !is_blue_link_ink(pixel, background, background_luminance) {
                 continue;
@@ -4331,22 +4718,11 @@ fn blend_rectangle(
     if left >= right || top >= bottom {
         return;
     }
-    let Ok(stride) = usize::try_from(width).map(|width| width.saturating_mul(4)) else {
-        return;
-    };
     for y in top..bottom {
-        let Ok(row_start) = usize::try_from(y).map(|y| y.saturating_mul(stride)) else {
+        let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
             continue;
         };
-        for x in left..right {
-            let Ok(offset) =
-                usize::try_from(x).map(|x| row_start.saturating_add(x.saturating_mul(4)))
-            else {
-                continue;
-            };
-            let Some(pixel) = rgba.get_mut(offset..offset.saturating_add(4)) else {
-                continue;
-            };
+        for pixel in rgba[row].chunks_exact_mut(4) {
             for (channel, highlight) in pixel[..3].iter_mut().zip(color) {
                 let original = u16::from(*channel);
                 *channel = ((original * (255 - alpha) + u16::from(highlight) * alpha) / 255) as u8;
@@ -4356,20 +4732,29 @@ fn blend_rectangle(
 }
 
 fn load_pdfium(library: Option<&Path>) -> Result<Pdfium, String> {
+    // pdfium-render binds once per process; afterwards skip cache materialization and dlopen.
+    static BOUND: OnceLock<()> = OnceLock::new();
+    if library.is_none() && BOUND.get().is_some() {
+        return Ok(Pdfium::default());
+    }
     let path = match library {
         Some(path) => path.to_path_buf(),
         None => crate::embedded_pdfium::materialize().map_err(|error| {
             format!("could not extract embedded PDFium to the user cache: {error}")
         })?,
     };
-    match Pdfium::bind_to_library(&path) {
-        Ok(bindings) => Ok(Pdfium::new(bindings)),
-        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
-        Err(error) => Err(format!(
-            "could not load PDFium from {}: {error}",
-            path.display()
-        )),
-    }
+    let pdfium = match Pdfium::bind_to_library(&path) {
+        Ok(bindings) => Pdfium::new(bindings),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Pdfium::default(),
+        Err(error) => {
+            return Err(format!(
+                "could not load PDFium from {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let _ = BOUND.set(());
+    Ok(pdfium)
 }
 
 #[cfg(test)]
@@ -4412,12 +4797,14 @@ mod tests {
 
     fn coordinate_rgba(frame: &super::Frame) -> Vec<u8> {
         use std::io::Read;
-        let mut rgba = Vec::new();
+        let mut rgb = Vec::new();
         flate2::read::ZlibDecoder::new(frame.compressed_rgba.as_slice())
-            .read_to_end(&mut rgba)
+            .read_to_end(&mut rgb)
             .unwrap();
-        assert_eq!(rgba.len(), (frame.width * frame.height * 4) as usize);
-        rgba
+        assert_eq!(rgb.len(), (frame.width * frame.height * 3) as usize);
+        rgb.chunks_exact(3)
+            .flat_map(|px| [px[0], px[1], px[2], 255])
+            .collect()
     }
 
     #[test]
@@ -4467,8 +4854,7 @@ mod tests {
                     \\noindent MeridianBeta identifies a different source line.\\par\n\
                     \\vspace{110bp}\n\
                     \\noindent NadirGamma identifies the bottom region.\\par\n";
-        // The fixture owns its literal body and render hints; the public TeX
-        // resolver claims only compiler LINE geometry without execution tracing.
+        // Identical input bodies must retain their own native page geometry.
         let mut sources = Vec::with_capacity(cases.len());
         for (index, (rotation, crop, media)) in cases.iter().enumerate() {
             if index != 0 {
@@ -4509,7 +4895,7 @@ mod tests {
         let document = pdfium.load_pdf_from_file(&pdf, None).unwrap();
         let worker = super::RenderWorker::spawn(1, pdf.clone(), None);
         assert_eq!(worker.wait_until_ready().unwrap().0, cases.len() as u32);
-        let navigation = NavigationWorker::new();
+        let mut navigation = NavigationWorker::new();
         let revision = synctex::DocumentRevision::read(&pdf).unwrap();
         worker.begin_generation(1);
         let mut batch_input = String::new();
@@ -4553,15 +4939,17 @@ mod tests {
                 + 1;
             let request = synctex::resolve_forward(&pdf, source, line, column).unwrap();
             assert_eq!(request.page, index as u32 + 1);
-            assert!(request.word.is_none());
-            assert!(request.warning.is_some());
+            let hint = request.word.as_ref().unwrap();
+            assert_eq!(hint.words[hint.selected], "ZenithAlpha");
             if index == 0 {
                 let anchor = synctex::ForwardCandidate {
                     page: request.page,
+                    source_line: line,
                     rect: request.rect(),
                 };
                 let empty_later = synctex::ForwardCandidate {
                     page: 2,
+                    source_line: line,
                     rect: super::SearchRect {
                         left: 72.0,
                         right: 72.0,
@@ -4655,7 +5043,6 @@ mod tests {
                         radius: 4,
                         editor: Editor::None,
                         inverse_search: None,
-                        source_snapshot: None,
                         best_guess: false,
                         operation: Operation::default(),
                     })
@@ -4771,7 +5158,6 @@ mod tests {
             &crate::config::ViewerSettings::default(),
             std::io::Cursor::new(batch_input),
             &mut batch_output,
-            None,
             false,
         )
         .unwrap();
@@ -4789,6 +5175,191 @@ mod tests {
     }
 
     #[test]
+    fn inter_row_gap_click_keeps_coarse_line_when_glyph_and_synctex_rows_disagree() {
+        let _native = super::pdfium_test_lock();
+        use crate::{
+            editor::Editor,
+            navigation::{InverseTask, NavigationWorker},
+            process::Operation,
+            synctex,
+        };
+        use pdfium_render::prelude::{PdfPoints, PdfRenderConfig};
+        use std::{fmt::Write, process::Command, time::Duration};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("rows.tex");
+        let rows = [
+            "\\noindent\\fontsize{8}{10}\\selectfont Amber Quartz Copper Zenith Birch Maple.\\par",
+            "\\noindent\\fontsize{10}{12}\\selectfont Cedar Violet Indigo Silver Saffron Willow.\\par",
+        ];
+        std::fs::write(
+            &source,
+            format!(
+                "\\documentclass{{article}}\n\
+                 \\usepackage[paperwidth=360pt,paperheight=120pt,margin=24pt]{{geometry}}\n\
+                 \\pagestyle{{empty}}\n\\begin{{document}}\n{}\n{}\n\\end{{document}}\n",
+                rows[0], rows[1],
+            ),
+        )
+        .unwrap();
+        let output = crate::process::output(
+            Command::new("pdflatex")
+                .current_dir(directory.path())
+                .args([
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-synctex=1",
+                    "rows.tex",
+                ]),
+            &Operation::new(Duration::from_secs(30)),
+        )
+        .expect("pdflatex is required for real coordinate regressions");
+        assert!(output.status.success());
+        let pdf = directory.path().join("rows.pdf");
+        let source = source.canonicalize().unwrap();
+        // Original-paper points in the gap between rows, outside every glyph's
+        // layout box: PDFium's nearest glyph lies on one row while the point's
+        // SyncTeX box belongs to the other. Neither owns the click, so a word must
+        // not be claimed; moving the query into the PDFium glyph stole neighboring
+        // words at real viewer cell centers. An interior point is the control.
+        let cases = [
+            (36.0, 37.75, "Cedar", 5, None),
+            (175.0, 36.2, "Maple", 6, None),
+            (36.0, 45.0, "Cedar", 6, rows[1].find("Cedar")),
+        ];
+
+        let pdfium = super::load_pdfium(None).unwrap();
+        let document = pdfium.load_pdf_from_file(&pdf, None).unwrap();
+        let page = document.pages().get(0).unwrap();
+        let worker = super::RenderWorker::spawn(1, pdf.clone(), None);
+        assert_eq!(worker.wait_until_ready().unwrap().0, 1);
+        let mut navigation = NavigationWorker::new();
+        let revision = synctex::DocumentRevision::read(&pdf).unwrap();
+        worker.begin_generation(1);
+        let key = super::RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 800,
+            height: 600,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: false,
+            dark_mode_style: super::DarkModeStyle::new([0; 3], [255; 3]),
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [255, 255, 0],
+            selected_link_ordinal: None,
+        };
+        let config = super::build_fit_config(
+            PdfRenderConfig::new(),
+            key.fit,
+            800,
+            600,
+            &page,
+            super::page_content_bounds(&page),
+        );
+        worker
+            .render(super::RenderRequest { key, generation: 1 })
+            .unwrap();
+        coordinate_frame(&worker);
+        let mut batch_input = String::new();
+        for (request_id, &(x, y, word, line, byte)) in (1..).zip(&cases) {
+            writeln!(
+                batch_input,
+                "{}",
+                serde_json::json!({"page": 1, "x": x, "y": y})
+            )
+            .unwrap();
+            let (pixel_x, pixel_y) = page
+                .points_to_pixels(PdfPoints::new(x), PdfPoints::new(120.0 - y), &config)
+                .unwrap();
+            worker.page_point(revision, request_id, pixel_x as u32, pixel_y as u32, key);
+            let super::WorkerMessage::PagePoint { result, .. } = worker
+                .message_rx
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+            else {
+                panic!("missing inter-row inverse point");
+            };
+            let click = result.unwrap();
+            let (context, offset) = click.text.clone().unwrap().unwrap();
+            assert!(
+                context
+                    .match_indices(word)
+                    .any(|(start, _)| (start..start + word.len()).contains(&offset)),
+                "hit offset {offset} in {context:?} is not inside {word}"
+            );
+            let raw = synctex::resolve_inverse(
+                &pdf,
+                click.synctex,
+                None,
+                0,
+                &Operation::default(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(raw.location.line, line, "{word} at ({x}, {y})");
+            navigation
+                .submit(InverseTask {
+                    request_id,
+                    path: pdf.clone(),
+                    revision,
+                    page: 0,
+                    click,
+                    word_precision: true,
+                    radius: 4,
+                    editor: Editor::None,
+                    inverse_search: None,
+                    best_guess: false,
+                    operation: Operation::default(),
+                })
+                .unwrap();
+            let inverse = navigation
+                .replies
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(inverse.location.file.as_str(), source.to_str().unwrap());
+            assert_eq!(
+                (inverse.location.line, inverse.location.byte_column),
+                (line, byte.unwrap_or(0)),
+                "{word} at ({x}, {y})"
+            );
+            assert_eq!(
+                inverse.location.precise,
+                byte.is_some(),
+                "{word} at ({x}, {y})"
+            );
+        }
+        close_test_worker(&worker, revision);
+        let mut batch_output = Vec::new();
+        super::synctex_edit_batch(
+            &pdf,
+            None,
+            &crate::config::ViewerSettings::default(),
+            std::io::Cursor::new(batch_input),
+            &mut batch_output,
+            false,
+        )
+        .unwrap();
+        let records = String::from_utf8(batch_output).unwrap();
+        assert_eq!(records.lines().count(), cases.len());
+        for (record, &(_, _, word, line, byte)) in records.lines().zip(&cases) {
+            let record: serde_json::Value = serde_json::from_str(record).unwrap();
+            assert_eq!(record["pdf_word"], word, "{record}");
+            assert_eq!(record["location"]["line"], line, "{record}");
+            assert_eq!(
+                record["location"]["byte_column"],
+                byte.unwrap_or(0),
+                "{record}"
+            );
+            assert_eq!(record["location"]["precise"], byte.is_some(), "{record}");
+        }
+    }
+
+    #[test]
     fn visible_search_finds_overlapping_unicode_occurrences() {
         assert_eq!(
             super::overlapping_match_ranges_cancellable("banana", "ana", || true).unwrap(),
@@ -4799,6 +5370,122 @@ mod tests {
             [(0, 4), (2, 6)]
         );
     }
+
+    #[test]
+    fn visible_text_cache_is_independent_and_reprojects_cached_glyphs() {
+        let _native = super::pdfium_test_lock();
+        let pdf = synthetic_forward_pdf(
+            "/MediaBox [0 0 400 600]",
+            "BT /F1 12 Tf 20 300 Td (zorp suv) Tj ET\n\
+             BT /F1 12 Tf 3 Tr 20 200 Td (miv) Tj ET\n\
+             BT /F1 12 Tf 7 Tr 20 100 Td (vup) Tj ET\n\
+             BT /F1 12 Tf 0 Tr 1000 50 Td (nux) Tj ET",
+        );
+        let pdfium = super::load_pdfium(None).unwrap();
+        let document = pdfium.load_pdf_from_file(pdf.path(), None).unwrap();
+        let page = document.pages().get(0).unwrap();
+        let mut cache = super::empty_text_cache(1);
+        let mut font_cache = std::collections::HashMap::new();
+        let generation = super::AtomicU64::new(4);
+        assert!(
+            super::cached_visible_page_text(&page, 0, &mut cache, &mut font_cache, 3, &generation)
+                .is_none()
+        );
+        assert!(cache[0].as_ref().unwrap().visible.is_none());
+        let visible =
+            super::cached_visible_page_text(&page, 0, &mut cache, &mut font_cache, 4, &generation)
+                .unwrap();
+        assert_eq!(visible.normalized, "zorp 𝑠uv");
+        assert!(
+            visible
+                .glyphs
+                .iter()
+                .filter(|glyph| !glyph.value.is_whitespace())
+                .all(|glyph| glyph.bounds.iter().any(Option::is_some))
+        );
+        let glyphs = visible.glyphs.as_ptr();
+        let slot = cache[0].as_ref().unwrap();
+        assert!(!slot.full_text_initialized);
+        assert!(slot.raw.is_empty() && slot.normalized.is_empty());
+
+        let key = super::RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 400,
+            height: 600,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: false,
+            dark_mode_style: NEUTRAL_DARK_MODE,
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [255, 255, 0],
+            selected_link_ordinal: None,
+        };
+        let mut page_cache = std::collections::HashMap::new();
+        let matches = super::find_visible_matches(
+            &document,
+            1,
+            "zo",
+            &[
+                (key, 400, 600),
+                (super::RenderKey { zoom: 200, ..key }, 800, 1200),
+            ],
+            &mut cache,
+            &mut page_cache,
+            &mut font_cache,
+            4,
+            &generation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].next_char, Some('r'));
+        assert_eq!(matches[0].char_index, matches[1].char_index);
+        assert!((matches[1].rects[0].left + 1).abs_diff((matches[0].rects[0].left + 1) * 2) <= 1);
+        assert!((matches[1].rects[0].top + 1).abs_diff((matches[0].rects[0].top + 1) * 2) <= 1);
+        let supplementary = super::find_visible_matches(
+            &document,
+            1,
+            "𝑠",
+            &[(key, 400, 600)],
+            &mut cache,
+            &mut page_cache,
+            &mut font_cache,
+            4,
+            &generation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(supplementary.len(), 1);
+        assert_eq!(supplementary[0].next_char, Some('u'));
+
+        let full = super::cached_page_text(&document, 0, &mut cache, &mut font_cache).unwrap();
+        assert!(full.full_text_initialized && full.raw.contains("miv"));
+        assert_eq!(full.visible.as_ref().unwrap().glyphs.as_ptr(), glyphs);
+        assert_eq!(full.visible.as_ref().unwrap().normalized, "zorp 𝑠uv");
+    }
+
+    #[test]
+    fn type1_inspection_preserves_explicit_slots_and_header_boundary() {
+        let data = b"%!FontType1\n/Encoding 256 array\ndup 96 /.notdef put\ndup 97 /zorp put\ndup 98/vup put\neexec\ndup 99 /nux put";
+        let slots = super::tex_type1_slots(data, "ABCDEF+fixture").unwrap();
+        assert!(slots[97] && slots[98]);
+        assert!(!slots[96] && !slots[99]);
+        assert_eq!(super::tex_type1_slots(data, "AB+lmfixture"), Some(slots));
+        assert!(
+            super::tex_type1_slots(data, "ABCDEF+lmfixture")
+                .unwrap()
+                .into_iter()
+                .all(|slot| slot)
+        );
+        let mut pfb = b"\x80\x01\0\0\0\0".to_vec();
+        pfb.extend_from_slice(data);
+        assert_eq!(super::tex_type1_slots(&pfb, "ABCDEF+fixture"), Some(slots));
+        assert!(super::tex_type1_slots(b"not a font", "lmfixture").is_none());
+    }
+
     #[test]
     fn visible_source_ranges_decode_characters_without_reusing_the_next_glyph() {
         let units = [b'S' as u32, b'e' as u32, 0xd83d, 0xde00, b'!' as u32];
@@ -5000,6 +5687,7 @@ mod tests {
     fn forward_row(baseline: f32) -> crate::synctex::ForwardCandidate {
         crate::synctex::ForwardCandidate {
             page: 1,
+            source_line: 0,
             rect: super::SearchRect {
                 left: 0.0,
                 right: 390.0,
@@ -5125,18 +5813,18 @@ mod tests {
         let _native = super::pdfium_test_lock();
         let pdf = synthetic_forward_pdf(
             "/MediaBox [0 0 400 600]",
-            "BT /F1 12 Tf 20 500 Td (Rate exactly s primary baseline intervals) Tj ET\n\
-             BT /F1 12 Tf 20 400 Td (Rate at most s intervals computed with d) Tj ET\n\
-             BT /F1 12 Tf 20 300 Td (Rate exactly s direct step of the primary model) Tj ET\n\
-             BT /F1 12 Tf 20 200 Td (Rate at most s direct step of d) Tj ET\n\
-             BT /F1 12 Tf 20 100 Td (Rate exactly s secondary intervals for the bounded models) Tj ET",
+            "BT /F1 12 Tf 20 500 Td (Rung mostly s bramble turnip lanterns) Tj ET\n\
+             BT /F1 12 Tf 20 400 Td (Rung at once s lanterns tilted near d) Tj ET\n\
+             BT /F1 12 Tf 20 300 Td (Rung mostly s pebble crate of the bramble kettle) Tj ET\n\
+             BT /F1 12 Tf 20 200 Td (Rung at once s pebble crate of d) Tj ET\n\
+             BT /F1 12 Tf 20 100 Td (Rung mostly s plover lanterns for the copper widgets) Tj ET",
         );
         for (baseline, context) in [
-            (500.0, "Rate exactly s primary baseline intervals"),
-            (400.0, "Rate at most s intervals computed with"),
-            (300.0, "Rate exactly s direct step of the"),
-            (200.0, "Rate at most s direct step of"),
-            (100.0, "Rate exactly s secondary intervals for the"),
+            (500.0, "Rung mostly s bramble turnip lanterns"),
+            (400.0, "Rung at once s lanterns tilted near"),
+            (300.0, "Rung mostly s pebble crate of the"),
+            (200.0, "Rung at once s pebble crate of"),
+            (100.0, "Rung mostly s plover lanterns for the"),
         ] {
             let selection = crate::synctex::ForwardWord {
                 words: context.split_whitespace().map(str::to_owned).collect(),
@@ -5165,9 +5853,13 @@ mod tests {
             let document = pdfium.load_pdf_from_file(pdf.path(), None).unwrap();
             let page = document.pages().get(0).unwrap();
             let text = page.text().unwrap();
-            let (normalized, indexes) = super::visible_forward_text(&page).unwrap();
+            let mut font_cache = std::collections::HashMap::new();
+            let (normalized, indexes) =
+                super::visible_forward_text(&page, &mut font_cache).unwrap();
             let (start, word) = super::words(&normalized)[1];
-            let selected = super::forward_word_occurrence(&text, &indexes, start, word).unwrap();
+            let selected =
+                super::forward_word_occurrence(&text, &indexes, start, word, &mut font_cache)
+                    .unwrap();
             let segments = text.segments_subset(6, unit_count);
             let expected = segments.iter().next().unwrap().bounds();
             assert_eq!(selected.first, 6);
@@ -5208,6 +5900,85 @@ mod tests {
     }
 
     #[test]
+    fn forward_worker_word_hints_stay_in_line_and_retain_uncertain_regions() {
+        let _native = super::pdfium_test_lock();
+        let pdf = synthetic_forward_pdf(
+            "/MediaBox [0 0 400 600]",
+            "BT /F1 12 Tf 20 300 Td (alpha needle beta) Tj ET\n\
+             BT /F1 12 Tf 20 200 Td (alpha needle beta gamma needle delta) Tj ET",
+        );
+        let key = super::RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 400,
+            height: 600,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: false,
+            dark_mode_style: super::DarkModeStyle::new([0; 3], [255; 3]),
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [255, 255, 0],
+            selected_link_ordinal: None,
+        };
+        let worker = super::RenderWorker::spawn(1, pdf.path().to_path_buf(), None);
+        worker.wait_until_ready().unwrap();
+        let revision = super::DocumentRevision::read(pdf.path()).unwrap();
+        worker.begin_generation(1);
+        for (baseline, context, selected, precise) in [
+            // Better context on another line must not beat the compiler region.
+            (300.0, "gamma needle delta", 1, true),
+            // Neighbor context may distinguish two occurrences on the same line.
+            (200.0, "gamma needle delta", 1, true),
+            (200.0, "needle", 0, false),
+            (300.0, "delta", 0, false),
+            (300.0, "missing", 0, false),
+        ] {
+            let region = forward_row(baseline).rect;
+            worker.flash(
+                1,
+                0,
+                region,
+                Some(crate::synctex::ForwardWord {
+                    words: context.split_whitespace().map(str::to_owned).collect(),
+                    selected,
+                }),
+            );
+            worker
+                .render(super::RenderRequest { key, generation: 1 })
+                .unwrap();
+            let frame = coordinate_frame(&worker);
+            let flash = frame.flash.as_ref().unwrap();
+            assert!(flash.error.is_none(), "{context}: {:?}", flash.error);
+            assert_eq!(flash.word_precise, precise, "{baseline}: {context}");
+            assert!(flash.pixel_bounds.is_some());
+            if precise {
+                assert!(flash.rect.bottom > baseline - 5.0, "{flash:?}");
+                assert!(flash.rect.top < baseline + 15.0, "{flash:?}");
+                assert!(flash.rect.right - flash.rect.left < 50.0, "{flash:?}");
+                if baseline == 200.0 {
+                    assert!(flash.rect.left > 150.0, "{flash:?}");
+                } else {
+                    assert!(flash.rect.right < 150.0, "{flash:?}");
+                }
+            } else {
+                assert_eq!(
+                    flash.rect,
+                    super::SearchRect {
+                        left: region.left,
+                        right: region.right,
+                        top: baseline + 15.0,
+                        bottom: baseline - 5.0,
+                    },
+                    "{context}",
+                );
+            }
+        }
+        close_test_worker(&worker, revision);
+    }
+
+    #[test]
     fn clicked_unicode_maps_both_surrogate_halves_to_one_glyph() {
         let values = [0xe9, 0xd835, 0xdefc, b'z' as u32, 0x1d465];
         for (clicked, offset) in [0, 2, 2, 6, 7].into_iter().enumerate() {
@@ -5241,38 +6012,37 @@ mod tests {
         blend_highlight_rectangle, context_around_label, contrast_ratio, count_search_matches,
         dark_mode_pixel, darken_rgba, dominant_rectangle_color, mask_quadrilateral,
         normalize_search_text, reference_context, selected_page_link_rectangles,
-        tex_math_font_unicode,
     };
 
     const NEUTRAL_DARK_MODE: DarkModeStyle = DarkModeStyle::new([30, 30, 30], [209, 209, 209]);
 
     #[test]
     fn link_context_includes_surrounding_text() {
-        let text = "Earlier work uses sparse retrieval. A realistic limitation appears in dense retrieval [23] under distribution shift. Later work follows.";
+        let text = "Earlier crates hold copper turnips. A lopsided kettle simmers in damp gravel [23] beside bramble widgets. Later lanterns follow.";
 
         let context = context_around_label(text, "[23]", 0, 40, 20).expect("context");
 
-        assert!(context.contains("limitation appears in dense retrieval [23]"));
+        assert!(context.contains("kettle simmers in damp gravel [23]"));
         assert!(context.starts_with('…'));
         assert!(context.ends_with('…'));
     }
 
     #[test]
     fn link_context_expands_truncated_edges_to_complete_words() {
-        let text = "alpha object representation omega tail";
+        let text = "alpha turnip teakettle omega tail";
 
-        let context = context_around_label(text, "representation", 0, 4, 2).expect("context");
+        let context = context_around_label(text, "teakettle", 0, 4, 2).expect("context");
 
-        assert_eq!(context, "…object representation omega…");
+        assert_eq!(context, "…turnip teakettle omega…");
     }
 
     #[test]
     fn reference_context_stops_before_the_next_numbered_reference() {
-        let text = "[22] Prior et al. Prior work. [23] Weller et al. On theoretical limitations of retrieval. [24] Later et al. Later work.";
+        let text = "[22] Prior et al. Prior notes. [23] Zabbo et al. On lopsided teakettles of gravel. [24] Later et al. Later notes.";
 
         let context = reference_context(text, "23").expect("reference context");
 
-        assert!(context.starts_with("[23] Weller et al."), "{context:?}");
+        assert!(context.starts_with("[23] Zabbo et al."), "{context:?}");
         assert!(!context.contains("[24]"));
     }
 
@@ -5310,7 +6080,8 @@ mod tests {
         drop(page);
         let page = document.pages().get(0).unwrap();
         let mut cache = super::empty_text_cache(1);
-        let cached = super::cached_page_text(&document, 0, &mut cache).unwrap();
+        let mut font_cache = std::collections::HashMap::new();
+        let cached = super::cached_page_text(&document, 0, &mut cache, &mut font_cache).unwrap();
         let anchor = super::SearchRect {
             left: 20.0,
             right: 20.0,
@@ -5323,7 +6094,7 @@ mod tests {
                 .into(),
             selected: 2,
         };
-        let rect = super::forward_word_rect(&page, cached, &hint, anchor)
+        let rect = super::forward_word_rect(&page, cached, &hint, anchor, &mut font_cache)
             .unwrap()
             .unwrap();
         assert!(rect.left > 100.0 && rect.right < 155.0, "{rect:?}");
@@ -5332,14 +6103,14 @@ mod tests {
         // Matching only part of the context must not escape the anchored run.
         hint.words[1] = "missing".into();
         assert!(
-            super::forward_word_rect(&page, cached, &hint, anchor)
+            super::forward_word_rect(&page, cached, &hint, anchor, &mut font_cache)
                 .unwrap()
                 .is_none()
         );
         hint.words = ["anchor", "after"].map(String::from).into();
         hint.selected = 0;
         assert!(
-            super::forward_word_rect(&page, cached, &hint, anchor)
+            super::forward_word_rect(&page, cached, &hint, anchor, &mut font_cache)
                 .unwrap()
                 .is_none()
         );
@@ -5353,9 +6124,10 @@ mod tests {
             bottom: 160.0,
             ..anchor
         };
-        let wrapped = super::forward_word_rect(&page, cached, &hint, wrapped_anchor)
-            .unwrap()
-            .unwrap();
+        let wrapped =
+            super::forward_word_rect(&page, cached, &hint, wrapped_anchor, &mut font_cache)
+                .unwrap()
+                .unwrap();
         assert!(wrapped.left > 35.0 && wrapped.right < 100.0, "{wrapped:?}");
         assert!(
             wrapped.bottom >= 138.0 && wrapped.top < 155.0,
@@ -5371,6 +6143,7 @@ mod tests {
                     top: 175.0,
                     ..wrapped_anchor
                 },
+                &mut font_cache,
             )
             .unwrap()
             .is_none(),
@@ -5389,6 +6162,7 @@ mod tests {
                     bottom: 100.0,
                     ..anchor
                 },
+                &mut font_cache,
             )
             .unwrap()
             .is_none(),
@@ -5427,7 +6201,8 @@ mod tests {
         drop(page);
         let page = document.pages().get(0).unwrap();
         let mut cache = super::empty_text_cache(1);
-        let cached = super::cached_page_text(&document, 0, &mut cache).unwrap();
+        let mut font_cache = std::collections::HashMap::new();
+        let cached = super::cached_page_text(&document, 0, &mut cache, &mut font_cache).unwrap();
         let anchor = super::SearchRect {
             left: 20.0,
             right: 20.0,
@@ -5438,7 +6213,7 @@ mod tests {
             words: ["alpha", "needle", "beta"].map(String::from).into(),
             selected: 1,
         };
-        let first = super::forward_word_rect(&page, cached, &hint, anchor)
+        let first = super::forward_word_rect(&page, cached, &hint, anchor, &mut font_cache)
             .unwrap()
             .unwrap();
         assert!(first.left > 60.0 && first.right < 115.0, "{first:?}");
@@ -5447,7 +6222,7 @@ mod tests {
         // The span's start can precede the selected word by several words.
         // Context selects the second occurrence without reaching other runs.
         hint.words = ["gamma", "needle", "delta"].map(String::from).into();
-        let second = super::forward_word_rect(&page, cached, &hint, anchor)
+        let second = super::forward_word_rect(&page, cached, &hint, anchor, &mut font_cache)
             .unwrap()
             .unwrap();
         assert!(second.left > 190.0 && second.right < 245.0, "{second:?}");
@@ -5457,7 +6232,7 @@ mod tests {
         for word in ["needle", "need", "elsewhere"] {
             hint.words = vec![word.into()];
             assert!(
-                super::forward_word_rect(&page, cached, &hint, anchor)
+                super::forward_word_rect(&page, cached, &hint, anchor, &mut font_cache)
                     .unwrap()
                     .is_none(),
                 "ambiguous, partial, or unrelated-run word {word:?}"
@@ -5484,7 +6259,7 @@ mod tests {
             },
         ] {
             assert!(
-                super::forward_word_rect(&page, cached, &hint, point)
+                super::forward_word_rect(&page, cached, &hint, point, &mut font_cache)
                     .unwrap()
                     .is_none()
             );
@@ -5502,6 +6277,7 @@ mod tests {
                 bottom: 160.0,
                 ..anchor
             },
+            &mut font_cache,
         )
         .unwrap()
         .unwrap();
@@ -5577,19 +6353,26 @@ mod tests {
         drop(text_page);
 
         let mut cache = empty_text_cache(1);
-        let text = cached_page_text(&text_document, 0, &mut cache).expect("cached page text");
+        let mut font_cache = std::collections::HashMap::new();
+        let text = cached_page_text(&text_document, 0, &mut cache, &mut font_cache)
+            .expect("cached page text");
         assert_eq!(
             count_search_matches(&text.normalized, "synthetic needle"),
             2
         );
-        let (occurrences, rectangles, context) =
-            search_page(&text_document, 0, &mut cache, "synthetic needle");
+        let (occurrences, rectangles, context) = search_page(
+            &text_document,
+            0,
+            &mut cache,
+            &mut font_cache,
+            "synthetic needle",
+        );
         assert_eq!(occurrences, 2);
         assert!(!rectangles.is_empty());
         assert!(context.contains("Synthetic Needle"));
 
         let page = text_document.pages().get(0).expect("text page");
-        let cached = cached_page_text(&text_document, 0, &mut cache).unwrap();
+        let cached = cached_page_text(&text_document, 0, &mut cache, &mut font_cache).unwrap();
         let region = super::SearchRect {
             left: 0.0,
             right: 400.0,
@@ -5601,7 +6384,7 @@ mod tests {
             selected: 0,
         };
         assert!(
-            super::forward_word_rect(&page, cached, &hint, region)
+            super::forward_word_rect(&page, cached, &hint, region, &mut font_cache)
                 .unwrap()
                 .is_none()
         );
@@ -5611,7 +6394,7 @@ mod tests {
         let mut previous = 0.0;
         for selected in 0..4 {
             hint.selected = selected;
-            let rect = super::forward_word_rect(&page, cached, &hint, region)
+            let rect = super::forward_word_rect(&page, cached, &hint, region, &mut font_cache)
                 .unwrap()
                 .unwrap();
             assert!(rect.left > previous);
@@ -5624,13 +6407,13 @@ mod tests {
             left: 200.0,
             ..region
         };
-        let rect = super::forward_word_rect(&page, cached, &hint, right_half)
+        let rect = super::forward_word_rect(&page, cached, &hint, right_half, &mut font_cache)
             .unwrap()
             .unwrap();
         assert!(rect.left > 200.0);
         hint.words[0] = "need".into();
         assert!(
-            super::forward_word_rect(&page, cached, &hint, region)
+            super::forward_word_rect(&page, cached, &hint, region, &mut font_cache)
                 .unwrap()
                 .is_none()
         );
@@ -5692,8 +6475,14 @@ mod tests {
 
         let page_count = u32::try_from(link_document.pages().len()).unwrap();
         let mut link_text_cache = empty_text_cache(page_count);
-        let document_links =
-            extract_document_links(&link_document, &link_page, 6, &mut link_text_cache);
+        let mut link_font_cache = std::collections::HashMap::new();
+        let document_links = extract_document_links(
+            &link_document,
+            &link_page,
+            6,
+            &mut link_text_cache,
+            &mut link_font_cache,
+        );
         assert_eq!(document_links.len(), 2);
         assert!(document_links.iter().all(|link| link.source_page == 6));
         assert!(
@@ -5843,6 +6632,98 @@ mod tests {
     }
 
     #[test]
+    fn cached_annotations_project_targets_and_unresolved_contrast_rectangles() {
+        let _native = super::pdfium_test_lock();
+        let pdfium = super::load_pdfium(None).unwrap();
+        let document = pdfium
+            .load_pdf_from_byte_vec(
+                synthetic_link_pdf_geometry(
+                    "XYZ 200 300 null",
+                    "/Rotate 270 /CropBox [100 100 400 400]",
+                ),
+                None,
+            )
+            .unwrap();
+        let page = document.pages().get(0).unwrap();
+        let mut annotations = super::extract_page_link_annotations(&document, &page);
+        assert_eq!(annotations.len(), 2);
+        annotations.push(super::CachedPageLink {
+            bounds: annotations[0].bounds,
+            target: None,
+        });
+        for width in [400, 800] {
+            let config =
+                pdfium_render::prelude::PdfRenderConfig::new().set_target_width(width as i32);
+            let indexed = super::extract_page_links(&document, &page, &config, width, width);
+            let (links, rectangles) =
+                super::project_page_links(&page, &config, width, width, &annotations, true);
+            assert_eq!(links.len(), 2);
+            assert_eq!(rectangles.len(), 3);
+            for (link, indexed) in links.iter().zip(indexed) {
+                assert!(link.label.is_empty());
+                assert!(!indexed.label.is_empty());
+                assert_eq!(link.target, indexed.target);
+                assert_eq!(link.rect, indexed.rect);
+            }
+            let (plain, rectangles) =
+                super::project_page_links(&page, &config, width, width, &annotations, false);
+            assert_eq!(plain, links);
+            assert!(rectangles.is_empty());
+        }
+    }
+
+    #[test]
+    fn reopening_a_document_invalidates_cached_link_destinations() {
+        let _native = super::pdfium_test_lock();
+        let first = tempfile::NamedTempFile::new().unwrap();
+        let second = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(first.path(), synthetic_link_pdf("XYZ null 300 null")).unwrap();
+        std::fs::write(second.path(), synthetic_link_pdf("XYZ null 100 null")).unwrap();
+        let worker = super::RenderWorker::spawn(1, first.path().to_path_buf(), None);
+        let (_, _, mut revision) = worker.wait_until_ready().unwrap();
+        worker.begin_generation(1);
+        let key = super::RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 400,
+            height: 400,
+            zoom: 100,
+            fit: super::FitMode::Content,
+            invert: false,
+            dark_mode_style: NEUTRAL_DARK_MODE,
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [255, 255, 0],
+            selected_link_ordinal: None,
+        };
+        for top in [0.25, 0.75] {
+            worker
+                .render(super::RenderRequest { key, generation: 1 })
+                .unwrap();
+            let frame = coordinate_frame(&worker);
+            assert_eq!(frame.revision, revision);
+            assert!(frame.links.iter().all(|link| link.label.is_empty()));
+            assert!(frame.links.iter().any(|link| matches!(link.target,
+                LinkTarget::Internal { top_ratio: Some(ratio), .. } if ratio == top)));
+            if top == 0.25 {
+                worker.open(1, second.path().to_path_buf()).unwrap();
+                match worker
+                    .message_rx
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap()
+                {
+                    super::WorkerMessage::Opened {
+                        revision: loaded, ..
+                    } => revision = loaded,
+                    message => panic!("expected reopened fixture, got {message:?}"),
+                }
+            }
+        }
+        close_test_worker(&worker, revision);
+    }
+
+    #[test]
     fn internal_links_preserve_optional_rendered_destinations() {
         let _native = super::pdfium_test_lock();
         let pdfium = super::load_pdfium(None).unwrap();
@@ -5858,6 +6739,8 @@ mod tests {
                 ("XYZ 100 null null", x_position),
                 ("XYZ null 300 null", y_position),
                 ("XYZ null null null", (None, None)),
+                ("Fit", (None, Some(0.0))),
+                ("FitB", (None, Some(0.0))),
                 ("FitH 300", y_position),
                 ("FitBH 300", y_position),
                 ("FitV 100", x_position),
@@ -5870,7 +6753,7 @@ mod tests {
                 let page = document.pages().get(0).unwrap();
                 let link = page.links().get(0).unwrap();
                 assert_eq!(
-                    super::resolve_link_target(&document, &link),
+                    resolve_test_link_target(&document, &link),
                     Some(LinkTarget::Internal {
                         page: 1,
                         top_ratio,
@@ -5880,6 +6763,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn resolve_test_link_target(
+        document: &pdfium_render::prelude::PdfDocument<'_>,
+        link: &pdfium_render::prelude::PdfLink<'_>,
+    ) -> Option<LinkTarget> {
+        let config = pdfium_render::prelude::PdfRenderConfig::new()
+            .set_fixed_size(super::DESTINATION_RATIO_SIZE, super::DESTINATION_RATIO_SIZE);
+        let mut target_pages = std::collections::HashMap::new();
+        super::resolve_link_target(document, link, &config, &mut target_pages)
     }
 
     #[test]
@@ -5985,7 +6878,7 @@ mod tests {
                 left_ratio,
                 top_ratio,
                 ..
-            }) = super::resolve_link_target(&document, &link)
+            }) = resolve_test_link_target(&document, &link)
             else {
                 panic!("missing internal destination: {geometry}");
             };
@@ -6037,7 +6930,7 @@ mod tests {
             let source = document.pages().get(0).unwrap();
             let link = source.links().get(0).unwrap();
             assert_eq!(
-                super::resolve_link_target(&document, &link),
+                resolve_test_link_target(&document, &link),
                 Some(LinkTarget::Internal {
                     page: 1,
                     left_ratio: expected_left,
@@ -6106,6 +6999,43 @@ mod tests {
             dark_mode_pixel([20, 100, 200], DarkModeTransform::new(NEUTRAL_DARK_MODE));
         assert!(blue > green);
         assert!(green > red);
+    }
+
+    #[test]
+    fn rectangle_rows_clamp_truncated_buffers_and_histogram_buckets_reset() {
+        let rectangle = PageLinkRect {
+            left: 0,
+            top: 0,
+            right: 3,
+            bottom: 1,
+        };
+        let pixels = [16, 32, 48, 255, 23, 39, 55, 128, 31, 47, 63, 64];
+        let mut buckets = super::RectangleColorBuckets::new();
+        assert_eq!(
+            buckets.dominant_color(&pixels, 3, 1, rectangle),
+            Some([19, 35, 51])
+        );
+        assert_eq!(
+            buckets.dominant_color(&pixels[8..], 1, 1, rectangle),
+            Some([31, 47, 63])
+        );
+        assert_eq!(buckets.dominant_color(&[], 3, 1, rectangle), None);
+        assert!(buckets.touched.is_empty());
+
+        let rectangle = PageLinkRect {
+            left: 1,
+            top: 0,
+            right: u32::MAX,
+            bottom: u32::MAX,
+        };
+        let mut pixels = [10, 20, 30, 40, 50, 60, 70, 80, 91];
+        assert_eq!(
+            dominant_rectangle_color(&pixels, 2, 2, rectangle),
+            Some([50, 60, 70])
+        );
+        super::blend_rectangle(&mut pixels, 2, 2, rectangle, [1, 2, 3], 255);
+        assert_eq!(pixels, [10, 20, 30, 40, 1, 2, 3, 80, 91]);
+        assert_eq!(super::rectangle_row_range(pixels.len(), 2, 0, 2, 1), None);
     }
 
     #[test]
@@ -6357,7 +7287,7 @@ mod tests {
                     right: 300,
                     bottom: 30,
                 },
-                label: "(Spelke et al.,".into(),
+                label: "(Zabbo et al.,".into(),
                 target: target.clone(),
             },
             PageLink {
@@ -6367,7 +7297,7 @@ mod tests {
                     right: 300,
                     bottom: 40,
                 },
-                label: "(Wiskott and Se".into(),
+                label: "(Plover and Br".into(),
                 target: interleaved_target.clone(),
             },
             PageLink {
@@ -6387,7 +7317,7 @@ mod tests {
                     right: 80,
                     bottom: 61,
                 },
-                label: "jnowski, 2002)".into(),
+                label: "ambling, 2002)".into(),
                 target: interleaved_target,
             },
             PageLink {
@@ -6402,12 +7332,12 @@ mod tests {
             },
         ];
 
-        let source_text = "(Spelke et al., 1995) and (Wiskott and Sejnowski, 2002)";
+        let source_text = "(Zabbo et al., 1995) and (Plover and Brambling, 2002)";
         let links = coalesce_document_link_fragments(links, Some(source_text));
 
         assert_eq!(links.len(), 3);
-        assert_eq!(links[0].label, "(Spelke et al., 1995)");
-        assert_eq!(links[1].label, "(Wiskott and Sejnowski, 2002)");
+        assert_eq!(links[0].label, "(Zabbo et al., 1995)");
+        assert_eq!(links[1].label, "(Plover and Brambling, 2002)");
         assert_eq!(links[2].label, "later mention");
     }
 
@@ -6433,6 +7363,7 @@ mod tests {
 
     #[test]
     fn tex_math_font_fallbacks_map_to_unicode() {
+        use super::tex_math_font_unicode;
         for font in [
             "CMEX10",
             "ABCDEF+CMEX10",
@@ -6462,7 +7393,7 @@ mod tests {
         assert_eq!(tex_math_font_unicode("txmia", 0x28), None);
         assert_eq!(tex_math_font_unicode("CMMI10", 0x2e), None);
         assert_eq!(tex_math_font_unicode("CMMI10", 0x2f), None);
-        assert_eq!(tex_math_font_unicode("CMMI10", 0x2c), None);
+        assert_eq!(tex_math_font_unicode("CMMI10", 0x2c), Some(0x297c));
         assert_eq!(tex_math_font_unicode("CMSY10", 0x37), Some(0x237f));
         assert_eq!(tex_math_font_unicode("CMSY10", 0x71), Some(0x2a3f));
         assert_eq!(tex_math_font_unicode("MSAM10", 0x05), Some(0x22c5));
@@ -6477,6 +7408,7 @@ mod tests {
         assert_eq!(tex_math_font_unicode("MSBM10", 0x5e), None);
         assert_eq!(tex_math_font_unicode("MSBM10", 0x7a), Some(0x03dd));
         assert_eq!(tex_math_font_unicode("MSBM10", 0xd875), Some(0xd835));
+        assert_eq!(tex_math_font_unicode("stmary10", 0x00), Some(0x2190));
         assert_eq!(tex_math_font_unicode("stmary10", 0x0c), Some(0x2afd));
         assert_eq!(tex_math_font_unicode("stmary10", 0x24), Some(0x2198));
         assert_eq!(tex_math_font_unicode("stmary10", 0x25), Some(0xe025));
@@ -6491,8 +7423,207 @@ mod tests {
         assert_eq!(tex_math_font_unicode("CMEX10", 0x30), None);
     }
 
+    // Minimal synthetic Type 1 subsets with deliberately unmapped PDF slots.
+    fn synthetic_type1_pdf(fonts: &[(&str, u8, &str, Option<&str>)]) -> Vec<u8> {
+        synthetic_type1_pdf_with_contents(fonts, None)
+    }
+
+    fn synthetic_type1_pdf_with_contents(
+        fonts: &[(&str, u8, &str, Option<&str>)],
+        custom_contents: Option<&str>,
+    ) -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            String::new(),
+            String::new(),
+        ];
+        let mut resources = String::new();
+        let mut contents = String::new();
+        for (i, &(name, slot, glyph, unicode)) in fonts.iter().enumerate() {
+            let font = objects.len() + 1;
+            resources.push_str(&format!("/F{i} {font} 0 R "));
+            contents.push_str(&format!(
+                "BT /F{i} 12 Tf {} 72 Td <{slot:02x}> Tj ET\n",
+                20 + i * 25
+            ));
+            let program_name = name.split_once('+').map_or(name, |(_, base)| base);
+            let header = format!(
+                "%!PS-AdobeFont-1.0: {program_name} 1.0\n\
+                 10 dict begin\n/FontName /{program_name} def\n/FontType 1 def\n\
+                 /FontMatrix [0.001 0 0 0.001 0 0] def\n/FontBBox [0 0 500 700] def\n\
+                 /PaintType 0 def\n/Encoding 256 array\n\
+                 0 1 255 {{1 index exch /.notdef put}} for\ndup {slot} /{glyph} put\nreadonly def\n\
+                 currentdict end\ncurrentfile eexec\n"
+            );
+            let mut private = b"\0\0\0\0dup /Private 8 dict dup begin\n\
+                /RD {string currentfile exch readstring pop} executeonly def\n\
+                /ND {noaccess def} executeonly def\n/lenIV -1 def\n/Subrs 0 array def\n\
+                2 index /CharStrings 2 dict dup begin\n/.notdef 5 RD "
+                .to_vec();
+            private.extend_from_slice(&[139, 248, 136, 13, 14]);
+            let charstring: &[u8] = match glyph {
+                "wide" => &[
+                    139, 248, 136, 13, 139, 139, 21, 249, 80, 139, 5, 139, 239, 5, 9, 14,
+                ],
+                "hook" => &[
+                    139, 248, 136, 13, 139, 239, 21, 239, 139, 5, 139, 239, 5, 9, 14,
+                ],
+                _ => &[
+                    139, 248, 136, 13, 139, 139, 21, 248, 136, 139, 5, 139, 249, 80, 5, 9, 14,
+                ],
+            };
+            private.extend_from_slice(format!(" ND\n/{glyph} {} RD ", charstring.len()).as_bytes());
+            private.extend_from_slice(charstring);
+            private.extend_from_slice(
+                b" ND\nend\nend\nreadonly put\nnoaccess put\n\
+                dup /FontName get exch definefont pop\nmark currentfile closefile\n",
+            );
+            let mut cipher = 55665u16;
+            let encrypted: String = private
+                .into_iter()
+                .map(|byte| {
+                    let byte = byte ^ (cipher >> 8) as u8;
+                    cipher = u16::from(byte)
+                        .wrapping_add(cipher)
+                        .wrapping_mul(52845)
+                        .wrapping_add(22719);
+                    format!("{byte:02x}")
+                })
+                .collect();
+            let program = format!("{header}{encrypted}\n{}\ncleartomark\n", "0".repeat(512));
+            let to_unicode =
+                unicode.map_or(String::new(), |_| format!("/ToUnicode {} 0 R", font + 3));
+            objects.push(format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /{name} /FirstChar {slot} /LastChar {slot} /Widths [500] /Encoding << /Differences [{slot} /{glyph}] >> /FontDescriptor {} 0 R {to_unicode} >>", font + 1
+            ));
+            objects.push(format!(
+                "<< /Type /FontDescriptor /FontName /{program_name} /Flags 4 /FontBBox [0 0 500 700] /ItalicAngle 0 /Ascent 700 /Descent 0 /CapHeight 700 /StemV 80 /FontFile {} 0 R >>", font + 2
+            ));
+            objects.push(format!(
+                "<< /Length {} /Length1 {} >>\nstream\n{program}endstream",
+                program.len(),
+                program.len()
+            ));
+            if let Some(unicode) = unicode {
+                let cmap = format!(
+                    "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+                     /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+                     /CMapName /Zorp def\n/CMapType 2 def\n\
+                     1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                     1 beginbfchar\n<{slot:02x}> <{unicode}>\nendbfchar\n\
+                     endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+                );
+                objects.push(format!(
+                    "<< /Length {} >>\nstream\n{cmap}\nendstream",
+                    cmap.len()
+                ));
+            }
+        }
+        let contents = custom_contents.unwrap_or(&contents);
+        objects[2] = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << {resources} >> >> /Contents 4 0 R >>"
+        );
+        objects[3] = format!(
+            "<< /Length {} >>\nstream\n{contents}endstream",
+            contents.len()
+        );
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
     #[test]
-    fn decoded_ascii_in_tex_named_font_is_preserved() {
+    fn embedded_type1_zero_slot_and_broken_bbbk_surrogate_decode() {
+        let _native = super::pdfium_test_lock();
+        let pdfium = super::load_pdfium(None).unwrap();
+        for (font, expected) in [
+            (("ABCDEF+msbm10", 1, "zorp", Some("D875DD5C")), '𝕜'),
+            (("ABCDEF+stmary10", 0, "nux", None), '←'),
+        ] {
+            let document = pdfium
+                .load_pdf_from_byte_vec(synthetic_type1_pdf(&[font]), None)
+                .unwrap();
+            let page = document.pages().get(0).unwrap();
+            let text = page.text().unwrap();
+            let chars = text.chars();
+            let mut font_cache = std::collections::HashMap::new();
+            let decoded: String =
+                super::decoded_pdf_characters(&chars, &mut font_cache, || true, |_, _| {})
+                    .map(|(_, _, c)| c)
+                    .collect();
+            assert_eq!(decoded, expected.to_string());
+        }
+        let document = pdfium
+            .load_pdf_from_byte_vec(
+                synthetic_type1_pdf(&[("ABCDEF+stmary10", 0, "nux", None)]),
+                None,
+            )
+            .unwrap();
+        let page = document.pages().get(0).unwrap();
+        let text = page.text().unwrap();
+        let ch = text.chars().get(0).unwrap();
+        let mut cache = std::collections::HashMap::new();
+        assert_eq!(super::pdf_char_unicode(&ch, &mut cache), '←' as u32);
+        assert_eq!(super::pdf_char_unicode(&ch, &mut cache), '←' as u32);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn rotated_and_scaled_type1_glyphs_keep_unscaled_geometry_checks() {
+        let _native = super::pdfium_test_lock();
+        let pdfium = super::load_pdfium(None).unwrap();
+        let pdf = synthetic_type1_pdf_with_contents(
+            &[
+                ("ABCDEF+stmary10", 0x26, "zorp", None),
+                ("BCDEFG+cmmi10", 0x28, "vup", Some("0028")),
+                ("CDEFGH+cmmi10", 0x28, "wide", None),
+                ("ABCDEF+lmmi10", 0x2c, "nux", Some("002C")),
+                ("DEFGHI+cmmi10", 0x2c, "hook", None),
+                ("EFGHIJ+cmmi10", 0x2d, "hook", None),
+            ],
+            Some(
+                "BT /F0 1 Tf 0.8660254 2 -0.5 3.4641016 20 72 Tm <26> Tj ET\n\
+                 BT /F1 1 Tf 0.5 2 -3.4641016 0.8660254 50 72 Tm <28> Tj ET\n\
+                 BT /F2 1 Tf 0 1 -1 0 80 72 Tm <28> Tj ET\n\
+                 BT /F3 1 Tf 0 1 -1 0 110 72 Tm <2c> Tj ET\n\
+                 BT /F4 1 Tf 1 0 0 -1 140 72 Tm <2c> Tj ET\n\
+                 BT /F5 1 Tf 0.70710677 0.70710677 -0.70710677 0.70710677 170 72 Tm <2d> Tj ET\n",
+            ),
+        );
+        let document = pdfium.load_pdf_from_byte_vec(pdf, None).unwrap();
+        let page = document.pages().get(0).unwrap();
+        let text = page.text().unwrap();
+        let chars = text.chars();
+        let mut font_cache = std::collections::HashMap::new();
+        let decoded: String =
+            super::decoded_pdf_characters(&chars, &mut font_cache, || true, |_, _| {})
+                .map(|(_, _, c)| c)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+        assert_eq!(decoded, "↙(↼,⥼⥽");
+    }
+
+    #[test]
+    fn decoded_ascii_in_tex_named_font_is_preserved_in_clicks_and_search() {
         let _native = super::pdfium_test_lock();
         let pdfium = super::load_pdfium(None).unwrap();
         let stream = b"BT /F1 12 Tf 72 72 Td (&) Tj ET";
@@ -6530,6 +7661,92 @@ mod tests {
         let page = document.pages().get(0).unwrap();
         let text = page.text().unwrap();
         let ch = text.chars().get(0).unwrap();
-        assert_eq!(super::pdf_char_unicode(&ch), u32::from(b'&'));
+        let bounds = ch.tight_bounds().unwrap();
+        let mut font_cache = std::collections::HashMap::new();
+        let (context, byte) = super::clicked_text(
+            &page,
+            (bounds.left().value + bounds.right().value) * 0.5,
+            (bounds.bottom().value + bounds.top().value) * 0.5,
+            &mut font_cache,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&context[byte..byte + 1], "&");
+        let mut cache = super::empty_text_cache(1);
+        assert_eq!(
+            super::search_page(&document, 0, &mut cache, &mut font_cache, "&").0,
+            1
+        );
+        assert_eq!(
+            super::search_page(&document, 0, &mut cache, &mut font_cache, "↙").0,
+            0
+        );
+    }
+
+    #[test]
+    fn fit_modes_clamp_excessive_raster_dimensions_and_pixel_budget() {
+        for fit in [
+            super::FitMode::Page,
+            super::FitMode::Width,
+            super::FitMode::Height,
+            super::FitMode::Content,
+        ] {
+            for (pw, ph) in [(612.0, 792.0), (612.0, 793.0), (10.0, 5_000.0)] {
+                let (w, h) = fit.raster_size(pw, ph, [0.0, 0.0, 1.0, 1.0], 15_360, 8_640);
+                assert!((1..=32_768).contains(&w) && (1..=32_768).contains(&h));
+                assert!(u64::from(w) * u64::from(h) <= 16_777_216);
+            }
+        }
+    }
+
+    #[test]
+    fn dark_mode_base_cache_roundtrips_link_overlay_cleanly() {
+        let pdf = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        std::fs::write(pdf.path(), synthetic_link_pdf("XYZ null 300 null")).unwrap();
+        let worker = super::RenderWorker::spawn(1, pdf.path().to_path_buf(), None);
+        worker.wait_until_ready().unwrap();
+        worker.begin_generation(1);
+        let base = super::RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 240,
+            height: 240,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: true,
+            dark_mode_style: NEUTRAL_DARK_MODE,
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [80, 160, 255],
+            selected_link_ordinal: None,
+        };
+        worker
+            .render(super::RenderRequest {
+                key: base,
+                generation: 1,
+            })
+            .unwrap();
+        let plain1 = coordinate_frame(&worker);
+        worker
+            .render(super::RenderRequest {
+                key: super::RenderKey {
+                    link_mode: true,
+                    ..base
+                },
+                generation: 1,
+            })
+            .unwrap();
+        let highlighted = coordinate_frame(&worker);
+        assert_ne!(plain1.compressed_rgba, highlighted.compressed_rgba);
+        worker
+            .render(super::RenderRequest {
+                key: base,
+                generation: 1,
+            })
+            .unwrap();
+        let plain2 = coordinate_frame(&worker);
+        assert_eq!(plain1.compressed_rgba, plain2.compressed_rgba);
+        assert_eq!(plain2.render_elapsed, std::time::Duration::ZERO);
     }
 }

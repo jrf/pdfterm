@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Open a remote shell or Neovim with automatic client-side PDF windows."""
 import argparse
+import base64
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 import hmac
@@ -86,15 +87,6 @@ def forwarding_bind_addresses(platform, output, port):
             if len(fields) >= 4:
                 addresses.append(fields[3])
         return addresses, expected
-    if platform == 'Darwin':
-        expected = '127.0.0.1.' + str(port)
-        addresses = []
-        for line in output.splitlines():
-            fields = line.split()
-            if (len(fields) >= 6 and fields[0] in ('tcp4', 'tcp6')
-                    and fields[-1] == 'LISTEN' and fields[3].endswith('.' + str(port))):
-                addresses.append(fields[3])
-        return addresses, expected
     raise RuntimeError('cannot verify reverse-forward bind on remote platform ' + platform)
 
 
@@ -109,6 +101,10 @@ def allocated_forward_port(output):
 
 def forwarding_control_args(ssh, operation, specification):
     return ssh[:-1] + ['-O', operation, '-R', specification, ssh[-1]]
+
+
+GHOSTTY_CLOSE_SCRIPT = Path(__file__).resolve().with_name('ghostty-close.applescript')
+
 
 def applescript(body, *arguments, deadline=None):
     return run(['osascript', '-e', 'on run argv\ntell application "Ghostty"\n' + body
@@ -246,6 +242,11 @@ class WezTermTerminal(Terminal):
 
 
 class GhosttyTerminal(Terminal):
+    def __init__(self, source):
+        super().__init__(source)
+        # Load at capture so a missing helper fails before any split can be orphaned.
+        self.close_script = GHOSTTY_CLOSE_SCRIPT.read_text(encoding='utf-8')
+
     def launch(self, argv, deadline=None):
         identifier = applescript('''set cfg to new surface configuration
 set command of cfg to item 1 of argv
@@ -280,35 +281,8 @@ return liveIDs as text''', *sorted(identifiers), deadline=deadline)
         return set(result.splitlines())
 
     def close(self, identifier, deadline=None):
-        applescript('''repeat 15 times
-if not (exists terminal id (item 1 of argv)) then
-try
-focus (focused terminal of selected tab of front window)
-end try
-return
-end if
-try
-input text (character id 3) to terminal id (item 1 of argv)
-send key "c" modifiers "control" to terminal id (item 1 of argv)
-end try
-delay 0.02
-end repeat
-if exists terminal id (item 1 of argv) then
-try
-close terminal id (item 1 of argv)
-end try
-repeat 25 times
-if not (exists terminal id (item 1 of argv)) then
-try
-focus (focused terminal of selected tab of front window)
-end try
-return
-end if
-delay 0.02
-end repeat
-end if
-if exists terminal id (item 1 of argv) then error "owned viewer did not exit"''', identifier,
-                    deadline=deadline)
+        # Shared with lua/pdfterm/terminal.lua; the body runs inside `tell application "Ghostty"`.
+        applescript(self.close_script, identifier, deadline=deadline)
 
 
 def capture_terminal():
@@ -332,32 +306,67 @@ def popen_in_pgrp(args, pgid):
     )
 
 
+def remote_sh(script, *args):
+    tail = (' sh ' + shlex.join(args)) if args else ''
+    return '/bin/sh -c ' + shlex.quote(script) + tail
+
+
+def remote_login_exec(inner_command):
+    return remote_sh(
+        'case "${SHELL:-}" in '
+        '*/csh|*/tcsh) exec "$SHELL" -c "$1" ;; '
+        '?*) exec "$SHELL" -lc "$1" ;; '
+        'esac; exec sh -c "$1"',
+        inner_command,
+    )
+
+
+def remote_session_command(environment, files):
+    if files:
+        return remote_login_exec('exec ' + shlex.join(['env', *environment, 'nvim', *files]))
+    return remote_sh(
+        'case "${SHELL:-}" in ?*) exec env "$@" "$SHELL" -l ;; esac; exec env "$@" /bin/sh',
+        *environment,
+    )
+
+
+def relay_remote_command(source, remote_socket, marker):
+    blob = base64.b64encode((
+        f'import sys; sys.stdout.buffer.write(b"{marker}\\n"); sys.stdout.flush()\n'
+        f'sys.argv = ["pdfterm-relay.py", "listen", {remote_socket!r}]\n'
+        + source
+    ).encode()).decode('ascii')
+    py = f'exec python3 -c "import base64,sys;exec(base64.b64decode(sys.argv[1]))" {blob}'
+    return remote_login_exec(py)
+
+
 class StdioForward:
     """Keep the remote socket owned by the login user, including under Tailscale."""
 
     def __init__(self, ssh, remote_socket, local_socket):
-        helper = Path(__file__).with_name('pdfterm-relay.py')
+        helper = Path(__file__).resolve().with_name('pdfterm-relay.py')
         source = helper.read_text()
         self.relay = runpy.run_path(str(helper))['relay']
         self.error = None
         self.thread = None
-        command = shlex.join(['python3', '-u', '-c', source, 'listen', remote_socket])
-        command = 'exec "$SHELL" -lc ' + shlex.quote(command)
+        marker = secrets.token_hex(16)
+        command = relay_remote_command(source, remote_socket, marker)
         self.child = subprocess.Popen([*ssh, command], stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, start_new_session=True)
         try:
+            expected = marker.encode('ascii') + b'\nREADY\n'
             with selectors.DefaultSelector() as pending:
                 pending.register(self.child.stdout, selectors.EVENT_READ)
                 deadline = time.monotonic() + 10
                 greeting = bytearray()
-                while b'\n' not in greeting and len(greeting) < 32:
+                while not greeting.endswith(expected) and len(greeting) < 65536:
                     if not pending.select(max(0, deadline - time.monotonic())):
                         break
-                    chunk = os.read(self.child.stdout.fileno(), 32 - len(greeting))
+                    chunk = os.read(self.child.stdout.fileno(), 1)
                     if not chunk:
                         break
                     greeting.extend(chunk)
-                if greeting != b'READY\n':
+                if not greeting.endswith(expected):
                     raise RuntimeError('private SSH relay did not start; remote Python 3 is required')
             self.thread = threading.Thread(target=self.serve, args=(local_socket,))
             self.thread.start()
@@ -404,7 +413,7 @@ class Bridge:
         action = request.get('action')
         if action == 'launch':
             argv = request.get('argv')
-            if (not isinstance(argv, list) or not 2 <= len(argv) <= 9
+            if (not isinstance(argv, list) or not 2 <= len(argv) <= 7
                     or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)):
                 raise ValueError('invalid viewer argv')
             live = self.windows.existing(self.owned, deadline=deadline)
@@ -631,9 +640,11 @@ def main():
             remote_directory = candidate
             remote_token = remote_directory + '/launch.token'
             token = secrets.token_hex(32)
-            secure_token = ('umask 077 && chmod 700 ' + shlex.quote(remote_directory)
-                            + ' && cat > ' + shlex.quote(remote_token)
-                            + ' && chmod 600 ' + shlex.quote(remote_token))
+            secure_token = remote_sh(
+                'umask 077 && chmod 700 "$1" && cat > "$2" && chmod 600 "$2"',
+                remote_directory,
+                remote_token,
+            )
             run([*ssh, secure_token], timeout=30, input_data=token.encode())
             local_socket = directory + '/launch.sock'
             bridge = Bridge(local_socket, ssh, windows, token)
@@ -652,18 +663,12 @@ def main():
                 inspect = shlex.join(
                     ['ss', '-H', '-n', '-l', '-t', 'sport = :' + str(forward_port)]
                 )
-                required = 'ss'
-            else:
-                raise RuntimeError(
-                    'cannot verify reverse-forward bind on remote platform ' + remote_platform
-                )
-            if remote_platform == 'Linux':
                 try:
                     bindings = run([*ssh, inspect], timeout=5)
                 except (RuntimeError, subprocess.TimeoutExpired) as error:
                     raise RuntimeError(
                         'cannot verify SSH reverse-forward bind address; remote '
-                        + required + ' is required: ' + str(error)
+                        'ss is required: ' + str(error)
                     ) from error
                 addresses, loopback = forwarding_bind_addresses(
                     remote_platform, bindings, forward_port
@@ -674,14 +679,13 @@ def main():
                         'refusing insecure session'
                     )
                 remote_socket = 'tcp://127.0.0.1:' + str(forward_port)
+            else:
+                raise RuntimeError(
+                    'cannot verify reverse-forward bind on remote platform ' + remote_platform
+                )
             environment = ['PDFTERM_LAUNCH_SOCKET=' + remote_socket,
                            'PDFTERM_LAUNCH_TOKEN_FILE=' + remote_token]
-            if args.files:
-                command = shlex.join(['env', *environment, 'nvim', *args.files])
-                command = 'exec "$SHELL" -lc ' + shlex.quote(command)
-            else:
-                command = ('export ' + ' '.join(shlex.quote(value) for value in environment)
-                           + '; exec "$SHELL" -l')
+            command = remote_session_command(environment, args.files)
             # The master reads the multiplexed session's terminal descriptors.
             # Keep both SSH processes foreground, or input stops it with SIGTTIN.
             editor_ssh = ssh[:-1] + ['-tt', args.host]
@@ -725,8 +729,8 @@ def main():
                     files = [remote_token]
                     if remote_socket and remote_socket.startswith(remote_directory + '/'):
                         files.append(remote_socket)
-                    run([*ssh, shlex.join(['rm', '-f', *files])
-                         + ' && ' + shlex.join(['rmdir', remote_directory])], timeout=15)
+                    run([*ssh, remote_sh('dir="$1"; shift; rm -f "$@" && rmdir "$dir"',
+                                         remote_directory, *files)], timeout=15)
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                     print(f'pdfterm-ssh: remote cleanup: {error}', file=sys.stderr)
             if master is not None:

@@ -509,10 +509,9 @@ vim.cmd('qa!')
 """)
         self.assertEqual(self.windows.focused, ['editor'])
 
-    def test_snapshot_launch_keeps_expanded_argv_bounded_and_owned(self):
+    def test_launch_keeps_argv_bounded_and_owned(self):
         argv = ['viewer', 'paper.pdf', '--synctex-best-guess',
-                '--session', 'session', '--focus-token', 'f' * 32,
-                '--source-snapshot', '/compiled/sources/manifest.json']
+                '--session', 'session', '--focus-token', 'f' * 32]
         rejected = self.request({'action': 'launch', 'argv': [*argv, 'unexpected']})
         self.assertFalse(rejected['ok'])
         self.assertFalse(self.windows.live)
@@ -560,14 +559,9 @@ vim.cmd('qa!')
             'Linux', 'LISTEN 0 128 0.0.0.0:4567 0.0.0.0:*', 4567
         )
         self.assertNotEqual(wildcard, [expected])
-        darwin, expected = parse(
-            'Darwin', 'tcp4 0 0 127.0.0.1.4567 *.* LISTEN', 4567
-        )
-        self.assertEqual(darwin, [expected])
-        wildcard, expected = parse(
-            'Darwin', 'tcp4 0 0 *.4567 *.* LISTEN', 4567
-        )
-        self.assertNotEqual(wildcard, [expected])
+        # macOS remotes use an SSH stdio relay instead of a TCP reverse forward.
+        with self.assertRaises(RuntimeError):
+            parse('Darwin', 'tcp4 0 0 127.0.0.1.4567 *.* LISTEN', 4567)
 
     def test_dynamic_forward_parses_openssh_stdout(self):
         parse = launcher['allocated_forward_port']
@@ -670,6 +664,7 @@ vim.cmd('qa!')
         with patch.dict(os.environ, SSH_CONNECTION='', SSH_TTY='', TMUX=''), \
                 patch.object(sys, 'argv', ['pdfterm-ssh', 'test.invalid']), \
                 patch.object(sys.stdin, 'isatty', return_value=True), \
+                patch.object(sys.stdin, 'fileno', return_value=0), \
                 patch.object(os, 'tcgetpgrp', return_value=0), \
                 patch.dict(launcher['main'].__globals__, capture_terminal=lambda: self.windows), \
                 patch.object(subprocess, 'Popen', side_effect=CaptureMaster) as start:
@@ -736,6 +731,33 @@ vim.cmd('qa!')
             self.assertEqual(closed, [True, True])
         finally:
             signal.signal(signal.SIGHUP, previous)
+
+
+class HelperPathTests(unittest.TestCase):
+    script = Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'
+
+    def test_symlinked_launcher_resolves_helpers_next_to_real_script(self):
+        with tempfile.TemporaryDirectory(prefix='pdfterm-link-') as directory:
+            link = Path(directory) / 'pdfterm-ssh'
+            link.symlink_to(self.script)
+            linked = runpy.run_path(str(link))
+            close_script = linked['GHOSTTY_CLOSE_SCRIPT']
+            self.assertEqual(close_script, self.script.with_name('ghostty-close.applescript'))
+            self.assertTrue(close_script.is_file())
+            ghostty = linked['GhosttyTerminal']('ghostty-source')
+            self.assertEqual(ghostty.close_script, close_script.read_text(encoding='utf-8'))
+
+    def test_missing_close_script_fails_before_any_split(self):
+        with tempfile.TemporaryDirectory(prefix='pdfterm-copy-') as directory:
+            copy = Path(directory) / 'pdfterm-ssh'
+            shutil.copyfile(self.script, copy)
+            isolated = runpy.run_path(str(copy))
+            calls = []
+            terminal = isolated['GhosttyTerminal']
+            with patch.dict(terminal.launch.__globals__, applescript=lambda *args, **kwargs: calls.append(args)):
+                with self.assertRaises(FileNotFoundError):
+                    terminal('ghostty-source').launch(['viewer', 'paper.pdf'])
+            self.assertEqual(calls, [], 'no Ghostty split may be created without a close script')
 
 
 class ShellHookTests(unittest.TestCase):
@@ -889,6 +911,94 @@ class StdioRelayTests(unittest.TestCase):
         self.remote_process.wait(timeout=3)
         self.assertEqual(self.remote_process.returncode, 0)
         self.assertFalse(Path(self.remote).exists())
+
+    def test_write_all_completes_partial_writes(self):
+        import io
+        import struct
+        mod = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-relay.py'))
+        out = bytearray()
+        class ShortOut:
+            def write(self, buf):
+                chunk = bytes(buf[:3])
+                out.extend(chunk)
+                return len(chunk)
+            def flush(self):
+                pass
+        incoming = io.BytesIO(struct.pack('!II', 7, 0xffffffff))
+        mod['relay']('connect', str(Path(self.directory.name) / 'missing-zibble.sock'), incoming, ShortOut())
+        self.assertEqual(bytes(out), struct.pack('!II', 7, 0xfffffffd))
+
+    def test_stdio_forward_tolerates_csh_and_noisy_login_banner(self):
+        launcher = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/pdfterm-ssh'))
+        StdioForward = launcher['StdioForward']
+        remote_sh = launcher['remote_sh']
+        remote_session_command = launcher['remote_session_command']
+        bin_dir = Path(self.directory.name) / 'bin'
+        bin_dir.mkdir(mode=0o700)
+        (bin_dir / 'python3').symlink_to(sys.executable)
+        fake_nvim = bin_dir / 'nvim'
+        fake_nvim.write_text(
+            f'#!{sys.executable}\n'
+            'import json, os, sys\n'
+            'print("NVIM_OUT=" + json.dumps([os.environ.get("PDFTERM_LAUNCH_SOCKET"), sys.argv[1:]]))\n'
+        )
+        fake_nvim.chmod(0o700)
+        fake_ssh = bin_dir / 'fake-ssh'
+        fake_ssh.write_text(
+            f'#!{sys.executable}\n'
+            'import os, sys\n'
+            'sys.stdout.write("zibble-motd\\n")\n'
+            'sys.stdout.flush()\n'
+            'env = dict(os.environ, HOME=os.environ["TEST_HOME"], PATH=os.environ["TEST_PATH"], SHELL=os.environ["TEST_SHELL"])\n'
+            'os.execve(env["SHELL"], [env["SHELL"], "-c", sys.argv[-1]], env)\n'
+        )
+        fake_ssh.chmod(0o700)
+        for shell in ('/bin/sh', '/bin/bash', '/bin/zsh', '/bin/csh', '/bin/tcsh'):
+            if not Path(shell).is_file():
+                continue
+            sock_dir = Path(self.directory.name) / Path(shell).name
+            sock_dir.mkdir(mode=0o755)
+            remote_sock = str(sock_dir / 'remote.sock')
+            token_path = str(sock_dir / 'launch.token')
+            test_path = f'{bin_dir}:/usr/bin:/bin'
+            with patch.dict(
+                os.environ,
+                TEST_HOME=self.directory.name,
+                TEST_SHELL=shell,
+                TEST_PATH=test_path,
+            ):
+                secure_cmd = remote_sh(
+                    'umask 077 && chmod 700 "$1" && cat > "$2" && chmod 600 "$2"',
+                    str(sock_dir),
+                    token_path,
+                )
+                subprocess.run([str(fake_ssh), secure_cmd], input=b'quux-token', check=True, stdout=subprocess.DEVNULL)
+                self.assertEqual(stat.S_IMODE(os.stat(sock_dir).st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(os.stat(token_path).st_mode), 0o600)
+                self.assertEqual(Path(token_path).read_bytes(), b'quux-token')
+
+                bridge = StdioForward([str(fake_ssh)], remote_sock, str(Path(self.directory.name) / 'target.sock'))
+                try:
+                    self.assertTrue(Path(remote_sock).exists())
+                finally:
+                    bridge.close()
+
+                sess_cmd = remote_session_command(
+                    [f'PATH={test_path}', 'PDFTERM_LAUNCH_SOCKET=' + remote_sock],
+                    ['zibble file.tex'],
+                )
+                out = subprocess.check_output([str(fake_ssh), sess_cmd], text=True)
+                marker_line = [line for line in out.splitlines() if line.startswith('NVIM_OUT=')][-1]
+                self.assertEqual(json.loads(marker_line.split('=', 1)[1]), [remote_sock, ['zibble file.tex']])
+
+                clean_cmd = remote_sh(
+                    'dir="$1"; shift; rm -f "$@" && rmdir "$dir"',
+                    str(sock_dir),
+                    token_path,
+                    remote_sock,
+                )
+                subprocess.run([str(fake_ssh), clean_cmd], check=True, stdout=subprocess.DEVNULL)
+                self.assertFalse(sock_dir.exists())
 
 
 if __name__ == '__main__':

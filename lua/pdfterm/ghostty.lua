@@ -1,6 +1,5 @@
 -- Reuse the interpreter, never the focused terminal identity.
 local M = {}
-local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h')
 local process, failure
 local pending, sequence, count = {}, 0, 0
 local output, stderr = '', ''
@@ -93,7 +92,7 @@ function M.request(action, id, callback)
   if not process then
     local ok, result = pcall(
       vim.system,
-      { 'osascript', '-l', 'JavaScript', root .. '/scripts/ghostty-control.js' },
+      { 'osascript', '-l', 'JavaScript', require('pdfterm.terminal').root .. '/scripts/ghostty-control.js' },
       {
         stdin = true,
         text = true,

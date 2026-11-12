@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,17 +11,9 @@ const PDFIUM_LIBRARY_NAME: &str = env!("PDFIUM_LIBRARY_NAME");
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn materialize() -> io::Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
-        .ok_or_else(|| {
-            io::Error::other("HOME or XDG_CACHE_HOME must be set for the PDFium cache")
-        })?;
+    let base = crate::config::xdg_dir("XDG_CACHE_HOME", ".cache").ok_or_else(|| {
+        io::Error::other("HOME or XDG_CACHE_HOME must be set for the PDFium cache")
+    })?;
     fs::create_dir_all(&base)?;
     materialize_in(&base.join("pdfterm-private"))
 }
@@ -72,41 +64,19 @@ fn materialize_in(cache_root: &Path) -> io::Result<PathBuf> {
 }
 
 fn verified_file(path: &Path) -> io::Result<bool> {
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let metadata = file.metadata()?;
-    // SAFETY: geteuid takes no arguments and cannot fail.
     if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
+        || !crate::ipc::is_owned_with_mask(&metadata, 0o022)
         || metadata.len() != PDFIUM_BYTES.len() as u64
     {
         return Err(io::Error::other(format!(
             "unsafe PDFium cache file: {}",
             path.display()
         )));
-    }
-    let mut buffer = [0; 65536];
-    for expected in PDFIUM_BYTES.chunks(buffer.len()) {
-        file.read_exact(&mut buffer[..expected.len()])?;
-        if &buffer[..expected.len()] != expected {
-            return Err(io::Error::other(format!(
-                "PDFium cache content mismatch: {}",
-                path.display()
-            )));
-        }
-    }
-    if file.read(&mut buffer[..1])? != 0 {
-        return Err(io::Error::other(
-            "PDFium cache changed while being verified",
-        ));
     }
     Ok(true)
 }
@@ -115,10 +85,10 @@ fn verified_file(path: &Path) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom};
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     #[test]
-    fn reuses_verified_library_but_rejects_same_size_tampering() {
+    fn reuses_verified_library_and_rejects_unsafe_metadata() {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("private");
         let first = materialize_in(&cache).unwrap();
@@ -127,14 +97,25 @@ mod tests {
             materialize_in(&cache).unwrap().metadata().unwrap().ino(),
             identity
         );
-        let mut file = OpenOptions::new().write(true).open(&first).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(&[PDFIUM_BYTES[0] ^ 0xff]).unwrap();
+
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o620)).unwrap();
         assert!(
             materialize_in(&cache)
                 .unwrap_err()
                 .to_string()
-                .contains("content mismatch")
+                .contains("unsafe PDFium cache file")
+        );
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut file = OpenOptions::new().write(true).open(&first).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+        assert!(
+            materialize_in(&cache)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe PDFium cache file")
         );
     }
 

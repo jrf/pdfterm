@@ -3,6 +3,7 @@ local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root)
 
 local directory = assert(vim.uv.fs_mkdtemp(root .. '/.nvim-log-test-XXXXXX'))
+vim.env.XDG_CACHE_HOME = directory .. '/cache'
 local binary = vim.env.PDFTERM_EXECUTABLE
   or (vim.fn.executable(root .. '/target/debug/pdfterm') == 1 and (root .. '/target/debug/pdfterm'))
   or (vim.fn.executable(root .. '/target/release/pdfterm') == 1 and (root .. '/target/release/pdfterm'))
@@ -31,6 +32,8 @@ local ok, failure = xpcall(function()
   -- 3. Test log_entry writes formatted lines
   pdfterm.log_entry('INFO', 'hello world', 'test_ctx')
   assert(vim.fn.filereadable(log_file) == 1, 'log file must exist after log_entry')
+  assert(bit.band(assert(vim.uv.fs_stat(vim.fs.dirname(log_file))).mode, 511) == 448)
+  assert(bit.band(assert(vim.uv.fs_stat(log_file)).mode, 511) == 384)
   local lines = vim.fn.readfile(log_file)
   assert(#lines == 1, 'expected 1 log line, got: ' .. #lines)
   assert(lines[1]:match('%[%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d%] %[INFO%] %[test_ctx%] hello world'),
@@ -81,77 +84,47 @@ local ok, failure = xpcall(function()
   -- 6. Test inverse search logging
   -- Create a 5-line test buffer
   local test_file = directory .. '/test.tex'
-  vim.fn.writefile({ 'line 1', 'line 2', 'line 3', 'line 4', 'line 5' }, test_file)
+  vim.fn.writefile({ 'Wugzle', 'Blorf', 'Zibble', 'Quuxle', 'Frabble' }, test_file)
   local buf = vim.fn.bufadd(test_file)
   vim.fn.bufload(buf)
   vim.api.nvim_set_current_buf(buf)
 
-  -- Case A: precise match on line 3
-  local prev_count = #vim.fn.readfile(log_file)
-  pdfterm._inverse({
-    file = test_file,
-    line = 3,
-    byte_column = 2,
-    precise = true,
-  })
-  lines = vim.fn.readfile(log_file)
-  assert(#lines == prev_count + 1, 'expected 1 new log line for precise inverse')
-  assert(lines[#lines]:match('%[INFO%] %[inverse: .*test%.tex:3:2 %(precise=true%)] position matched'),
-    'unexpected line: ' .. lines[#lines])
-
-  -- Case B: imprecise match (precise = false)
-  prev_count = #lines
-  pdfterm._inverse({
-    file = test_file,
-    line = 2,
-    byte_column = 0,
-    precise = false,
-  })
-  lines = vim.fn.readfile(log_file)
-  assert(#lines == prev_count + 1, 'expected 1 new log line for imprecise inverse')
-  assert(lines[#lines]:match('%[INFO%] %[inverse: .*test%.tex:2:0 %(precise=false%)] imprecise/coarse line positioning'),
-    'unexpected line: ' .. lines[#lines])
-
-  -- Case B2: routine best-guess diagnostic logs as INFO without notifying WARN
-  prev_count = #lines
-  pdfterm._inverse({
-    file = test_file,
-    line = 2,
-    byte_column = 0,
-    precise = false,
-    warning = 'best-guess navigation: no literal source position was qualified; using the compiler line anchor',
-  })
-  lines = vim.fn.readfile(log_file)
-  assert(#lines == prev_count + 1, 'expected 1 new log line for routine diagnostic inverse')
-  assert(lines[#lines]:match('%[INFO%] %[inverse: .*test%.tex:2:0 %(precise=false%)] best%-guess navigation: no literal source position was qualified; using the compiler line anchor'),
-    'unexpected line: ' .. lines[#lines])
-
-  -- Case C: out of bounds line (line 50 in a 5-line buffer)
-  prev_count = #lines
-  pdfterm._inverse({
-    file = test_file,
-    line = 50,
-    byte_column = 0,
-    precise = true,
-  })
-  lines = vim.fn.readfile(log_file)
-  assert(#lines == prev_count + 1, 'expected 1 new log line for out-of-bounds line')
-  assert(lines[#lines]:match('%[WARN%] %[inverse: .*test%.tex:5:0 %(precise=true%)] inverse target line 50 is outside buffer bounds %(1%.%.5%)'),
-    'unexpected line: ' .. lines[#lines])
-
-  -- Case D: location with compiler warning
-  prev_count = #lines
-  pdfterm._inverse({
-    file = test_file,
-    line = 1,
-    byte_column = 0,
-    precise = true,
-    warning = 'compiler line ambiguity detected',
-  })
-  lines = vim.fn.readfile(log_file)
-  assert(#lines == prev_count + 1, 'expected 1 new log line for warned inverse')
-  assert(lines[#lines]:match('%[WARN%] %[inverse: .*test%.tex:1:0 %(precise=true%)] compiler line ambiguity detected'),
-    'unexpected line: ' .. lines[#lines])
+  local assumption = 'best-guess navigation: assuming saved source is unchanged since compilation'
+  local forward_assumption = 'assuming saved source is unchanged since compilation'
+  local coarse = 'best-guess navigation: no literal source position was qualified; using the compiler line anchor'
+  local unverified = 'best-guess: package execution unresolved; literal column unverified'
+  local prev_count
+  for _, case in ipairs({
+    { line = 3, byte = 2, precise = true },
+    { line = 2, byte = 0 },
+    { line = 2, byte = 0, warning = coarse },
+    { line = 2, byte = 0, warning = assumption .. '; ' .. coarse },
+    { line = 2, byte = 0, warning = forward_assumption },
+    { line = 2, byte = 0, warning = forward_assumption .. '; ' .. coarse },
+    { line = 3, byte = 3, warning = forward_assumption .. '; ' .. unverified, warn = true },
+    { line = 3, byte = 3, warning = forward_assumption .. ' unexpectedly', warn = true },
+    { line = 3, byte = 3, warning = assumption .. '; ' .. unverified, warn = true },
+    { line = 50, byte = 0, precise = true, target = 5, warn = true },
+    { line = 1, byte = 0, warning = 'saved source is newer than SyncTeX', warn = true },
+    { line = 1, byte = 0, precise = true, warning = 'compiler line ambiguity detected', warn = true },
+  }) do
+    local notices = {}
+    vim.notify = function(message, level) notices[#notices + 1] = { message = message, level = level } end
+    prev_count = #vim.fn.readfile(log_file)
+    pdfterm._inverse({
+      file = test_file, line = case.line, byte_column = case.byte,
+      precise = case.precise == true, warning = case.warning,
+    })
+    vim.notify = notify
+    assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { case.target or case.line, case.byte }),
+      'inverse changed the delivered saved-source coordinates')
+    lines = vim.fn.readfile(log_file)
+    assert(#lines == prev_count + 1, 'inverse must write exactly one log entry')
+    assert(lines[#lines]:find(case.warn and '[WARN]' or '[INFO]', 1, true),
+      'inverse diagnostic severity changed: ' .. lines[#lines])
+    assert(#notices == (case.warn and 1 or 0), 'routine diagnostics must not notify a warning')
+    if case.warn then assert(notices[1].level == vim.log.levels.WARN) end
+  end
 
   -- 7. Test forward search on non-tex buffer logs ERROR
   prev_count = #lines
@@ -163,6 +136,55 @@ local ok, failure = xpcall(function()
   assert(#lines == prev_count + 1, 'expected 1 new log line for non-tex forward search')
   assert(lines[#lines]:match('%[ERROR%] .*select a main TeX or Typst file with :PdfTermMain or project%.main'),
     'unexpected line: ' .. lines[#lines])
+
+  -- Activation may reload a shorter saved source. Clamp the delivered location,
+  -- without applying any compiled-source edit offset.
+  local saved = { 'Wugzle', 'Blorf', 'Zibble', 'Quuxle', 'Frabble' }
+  local reload_file = directory .. '/reload.tex'
+  vim.fn.writefile(saved, reload_file)
+  local reload_buffer = vim.fn.bufadd(reload_file)
+  vim.fn.bufload(reload_buffer)
+  vim.fn.writefile(vim.list_slice(saved, 3), reload_file)
+  vim.api.nvim_create_autocmd('BufEnter', {
+    buffer = reload_buffer, once = true, nested = true, callback = function() vim.cmd('edit!') end,
+  })
+  local request = { file = reload_file, line = 5, byte_column = 3, precise = false }
+  pdfterm._inverse(request)
+  assert(vim.api.nvim_get_current_buf() == reload_buffer)
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 3, 3 }),
+    'reload must clamp current coordinates, not apply a source-history offset')
+  request.line = 2
+  pdfterm._inverse(request)
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 3 }),
+    'saved source coordinates must be applied directly')
+
+  -- An unloaded source alias must retain its buffer identity during activation.
+  local real_dir = directory .. '/real-source'
+  vim.fn.mkdir(real_dir, 'p')
+  local alias_dir = directory .. '/alias-source'
+  assert(vim.uv.fs_symlink(real_dir, alias_dir))
+  vim.fn.writefile({ 'Wugzle flimble', 'Blorf quuxle' }, real_dir .. '/aliased.tex')
+  local aliased = { file = alias_dir .. '/aliased.tex', line = 2, byte_column = 6, precise = false }
+  assert(vim.fn.bufnr(aliased.file) == -1)
+  local alias_ok, alias_error = pcall(pdfterm._inverse, aliased)
+  assert(alias_ok, tostring(alias_error))
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 6 }),
+    'aliased unloaded source must receive the supplied cursor')
+
+  -- Log writer must refuse symlink targets and never write when fchmod fails.
+  local victim = directory .. '/victim.txt'
+  vim.fn.writefile({ 'untouched' }, victim)
+  vim.fn.delete(log_file)
+  assert(vim.uv.fs_symlink(victim, log_file))
+  pdfterm.log_entry('INFO', 'zibble-symlink')
+  assert(vim.deep_equal(vim.fn.readfile(victim), { 'untouched' }), 'log_entry must not follow symlinks')
+  vim.fn.delete(log_file)
+  vim.fn.writefile({}, log_file)
+  local orig_fchmod = vim.uv.fs_fchmod
+  vim.uv.fs_fchmod = function() return nil, 'EPERM' end
+  pdfterm.log_entry('INFO', 'zibble-secret')
+  vim.uv.fs_fchmod = orig_fchmod
+  assert(#vim.fn.readfile(log_file) == 0, 'log_entry must not write when fchmod fails')
 
   print('log regressions passed: path resolution, entry formatting, user command, precise/imprecise/bounds/warning inverse checks, forward buffer checks')
 end, debug.traceback)

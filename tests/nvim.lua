@@ -467,24 +467,6 @@ local ok, failure = xpcall(function()
       .. vim.fn.shellescape(directory .. '/hold-resolution')
       .. '; do sleep .01; done',
     '  fi',
-    '  if test "$argument" = --synctex-source-info && test -f '
-      .. vim.fn.shellescape(directory .. '/hold-metadata') .. '; then',
-    '    touch ' .. vim.fn.shellescape(directory .. '/metadata-started'),
-    '    while test -f ' .. vim.fn.shellescape(directory .. '/hold-metadata') .. '; do sleep .01; done',
-    '  fi',
-    '  if test "$argument" = --synctex-source-info && test -f '
-      .. vim.fn.shellescape(directory .. '/hold-build-preflight') .. '; then',
-    '    count=0',
-    '    if test -f ' .. vim.fn.shellescape(directory .. '/build-metadata-count')
-      .. '; then count=$(cat ' .. vim.fn.shellescape(directory .. '/build-metadata-count') .. '); fi',
-    '    count=$((count + 1))',
-    '    printf "%s" "$count" > ' .. vim.fn.shellescape(directory .. '/build-metadata-count'),
-    '    if test "$count" = 2; then',
-    '      touch ' .. vim.fn.shellescape(directory .. '/build-preflight-started'),
-    '      while test -f ' .. vim.fn.shellescape(directory .. '/hold-build-preflight')
-      .. '; do sleep .01; done',
-    '    fi',
-    '  fi',
     'done',
     'exec ' .. vim.fn.shellescape(binary) .. ' "$@"',
   }, wrapper)
@@ -575,6 +557,102 @@ local ok, failure = xpcall(function()
   end
   receive()
   vim.cmd.edit(vim.fn.fnameescape(source))
+  -- External compilation has no editor capture, but best-guess forwarding can still carry a saved-source hint.
+  local external_build = vim.system({
+    'pdflatex', '-interaction=nonstopmode', '-halt-on-error', '-synctex=1',
+    '-output-directory=artifacts', 'navigation.tex',
+  }, { cwd = directory, text = true }):wait(10000)
+  assert(external_build.code == 0, external_build.stdout .. external_build.stderr)
+  adapter.toggle_compile()
+  local target_line = vim.api.nvim_buf_get_lines(0, 5, 6, false)[1]
+  local target_byte = assert(target_line:find('zephyr', 1, true)) - 1
+  vim.api.nvim_win_set_cursor(0, { 6, target_byte })
+  local forward_notices, forward_notify = {}, vim.notify
+  vim.notify = function(message, level)
+    forward_notices[#forward_notices + 1] = { message = message, level = level }
+  end
+  local get_lines, full_copies = vim.api.nvim_buf_get_lines, 0
+  vim.api.nvim_buf_get_lines = function(buffer, first, last, strict)
+    if first == 0 and last == -1 then full_copies = full_copies + 1 end
+    return get_lines(buffer, first, last, strict)
+  end
+  adapter.forward(false)
+  wait(function() return #requests == 1 end)
+  vim.api.nvim_buf_get_lines = get_lines
+  assert(full_copies == 0, 'unmodified TeX forward copied the full source buffer')
+  vim.notify = forward_notify
+  for _, notice in ipairs(forward_notices) do
+    assert(notice.level ~= vim.log.levels.WARN and notice.level ~= vim.log.levels.ERROR,
+      'routine saved-source forward diagnostic raised a warning: ' .. vim.inspect(notice))
+  end
+  local uncaptured = table.remove(requests)
+  assert(uncaptured.best_guess == true and type(uncaptured.word) == 'table'
+    and uncaptured.word.words[uncaptured.word.selected + 1] == 'zephyr',
+    'absent compiler capture suppressed the saved-source best-guess hint')
+  assert(type(uncaptured.warning) == 'string' and uncaptured.warning ~= '',
+    'uncaptured saved-source hint lost its warning')
+  local virtualedit = vim.o.virtualedit
+  vim.o.virtualedit = 'onemore'
+  vim.api.nvim_win_set_cursor(0, { 6, #target_line })
+  adapter.forward(false)
+  wait(function() return #requests == 1 end)
+  assert(table.remove(requests).word == vim.NIL, 'line boundary acquired a saved-source hint')
+  vim.o.virtualedit = virtualedit
+  vim.api.nvim_win_set_cursor(0, { 6, target_byte })
+  local source_stat = assert(vim.uv.fs_stat(source))
+  assert(vim.uv.fs_utime(source, source_stat.atime.sec, assert(vim.uv.fs_stat(pdf)).mtime.sec + 60))
+  adapter.forward(false)
+  wait(function() return #requests == 1 end)
+  assert(table.remove(requests).word == vim.NIL, 'known-newer source acquired a saved-source hint')
+  assert(vim.uv.fs_utime(source, source_stat.atime.sec,
+    source_stat.mtime.sec + source_stat.mtime.nsec / 1e9))
+  adapter.forward(false)
+  vim.cmd.file(vim.fn.fnameescape(directory .. '/renamed-navigation.tex'))
+  wait(function() return #requests == 1 end)
+  assert(table.remove(requests).word == vim.NIL, 'renamed source acquired a hint for its old identity')
+  vim.cmd.file(vim.fn.fnameescape(source))
+  adapter.toggle_compile()
+  local saved_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  for _, edit in ipairs({ 'line', 'unicode', 'post-write' }) do
+    local edited, notify = false, vim.notify
+    if edit == 'post-write' then
+      vim.bo.modified = true
+      vim.api.nvim_create_autocmd('BufWritePost', {
+        buffer = vim.api.nvim_get_current_buf(),
+        once = true,
+        callback = function()
+          edited = true
+          vim.api.nvim_buf_set_lines(0, 0, 0, false, { '% Unsaved after write 1.', '% Unsaved after write 2.' })
+          vim.api.nvim_buf_set_lines(0, 7, 8, false, { string.rep('雪', 20) .. target_line })
+        end,
+      })
+    else
+      vim.notify = function(message, ...)
+        if not edited and message:match('^Compiling') then
+          edited = true
+          if edit == 'line' then
+            vim.api.nvim_buf_set_lines(0, 0, 0, false, { '% Unsaved while compiling.' })
+          else
+            vim.api.nvim_buf_set_lines(0, 5, 6, false, { string.rep('雪', 20) .. target_line })
+          end
+        end
+        notify(message, ...)
+      end
+    end
+    vim.api.nvim_win_set_cursor(0, { 6, target_byte })
+    adapter.forward(false)
+    wait(function() return #requests == 1 end)
+    vim.notify = notify
+    local request = table.remove(requests)
+    assert(edited and (edit == 'post-write' or vim.bo.modified), 'unsaved edit was not exercised: ' .. edit)
+    assert(request.h == uncaptured.h and request.v == uncaptured.v,
+      'unsaved edit moved the saved-source destination: ' .. edit)
+    assert(type(request.word) == 'table'
+      and request.word.words[request.word.selected + 1] == 'zephyr',
+      'unsaved edit selected a different saved-source word: ' .. edit)
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, saved_lines)
+    vim.cmd('write!')
+  end
   vim.api.nvim_win_set_cursor(0, { 4, 0 })
   adapter.forward()
   vim.api.nvim_win_set_cursor(0, { 6, 0 })
@@ -865,7 +943,11 @@ local ok, failure = xpcall(function()
     return #notices >= 1 and notices[#notices].message:find('PdfTermForwardSplit', 1, true) ~= nil
   end)
   assert(launches == 0 and #requests == 8, 'attach-only forward launched a viewer')
-  assert(#notices == 1 and notices[#notices].message:find('PdfTermForwardSplit', 1, true))
+  local attach_errors = vim.tbl_filter(function(notice)
+    return notice.level == vim.log.levels.ERROR
+  end, notices)
+  assert(#attach_errors == 1 and attach_errors[1].message:find('PdfTermForwardSplit', 1, true),
+    'attach-only forward did not report exactly one viewer-unavailable error')
   focused = nil
   vim.cmd('PdfTermForward')
   wait(function()
@@ -1045,10 +1127,13 @@ local ok, failure = xpcall(function()
       local request = requests[#requests]
       assert(request.pdf == vim.uv.fs_realpath(included_pdf), 'forward opened an included-file PDF')
       assert(request.page == case.page, 'forward lost the included source page')
-      assert(request.word == nil or request.word == vim.NIL,
-        'untraced TeX forward fabricated printed-word ownership')
-      assert(type(request.warning) == 'string',
-        'line-only navigation must report its source-ownership limitation')
+      if request.word ~= nil and request.word ~= vim.NIL then
+        assert(request.word.words[request.word.selected + 1] == case.word,
+          'best-guess forward hinted the wrong included-source word')
+      end
+      assert(request.best_guess == true and type(request.warning) == 'string' and request.warning ~= '',
+        'best-guess navigation must retain its unverified ownership warning')
+      assert(request.width > 0 or request.height > 0, 'forward lost usable compiler line geometry')
     end
   end
   do
@@ -1128,10 +1213,13 @@ local ok, failure = xpcall(function()
       assert(request.page == page,
         'root selection lost the included source cursor; expected page ' .. page .. ': '
           .. vim.json.encode(request))
-      assert(request.word == nil or request.word == vim.NIL,
-        'unchanged source text cannot prove TeX execution ownership: ' .. vim.json.encode(request))
-      assert(type(request.warning) == 'string',
-        'unchanged source anchor must retain its compiler line with a warning')
+      if request.word ~= nil and request.word ~= vim.NIL then
+        assert(request.word.words[request.word.selected + 1] == word,
+          'best-guess forward hinted the wrong source word: ' .. vim.json.encode(request))
+      end
+      assert(request.best_guess == true and type(request.warning) == 'string' and request.warning ~= '',
+        'unchanged source anchor must retain its unverified ownership warning')
+      assert(request.width > 0 or request.height > 0, 'forward lost usable compiler line geometry')
       return request
     end
     reset()
@@ -1152,12 +1240,41 @@ local ok, failure = xpcall(function()
     adapter.toggle_compile()
     vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_b })
     vim.api.nvim_buf_set_lines(child_buffer, 2, 2, false, { '% A new comment moves only the live cursor.' })
-    local request = navigate(pdf_b, 3, 'needle', 4, literal)
+    local describe, describes = project.describe, 0
+    project.describe = function(...)
+      describes = describes + 1
+      return describe(...)
+    end
+    local ok_nav, request = pcall(navigate, pdf_b, 3, 'needle', 4, literal)
+    project.describe = describe
+    assert(ok_nav, request)
+    assert(describes == 1, 'unmutated modified TeX save re-ran project.describe: ' .. describes)
     assert(request.h == expected.h and request.v == expected.v,
       'saving an edited directive rebased an unchanged compiled source span')
     assert(vim.fn.readfile(child)[1] == directive_b, 'forward did not save its selected source')
     assert(digest(pdf_a) == original_a and digest(pdf_b) == original_b,
       'noncompiling forward rebuilt a root')
+    vim.api.nvim_buf_set_lines(child_buffer, 2, 3, false, { '% Edited before write-hook root mutation.' })
+    vim.api.nvim_create_autocmd('BufWritePre', {
+      buffer = child_buffer,
+      once = true,
+      callback = function()
+        vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_a })
+      end,
+    })
+    describes, root_notices = 0, {}
+    project.describe = function(...)
+      describes = describes + 1
+      return describe(...)
+    end
+    vim.cmd('PdfTermForward')
+    project.describe = describe
+    assert(describes == 2, 'write-hook TeX mutation skipped post-save project.describe: ' .. describes)
+    assert(#root_notices == 1
+      and root_notices[1].message:find('source root changed while saving', 1, true),
+      'write-hook root change was not rejected: ' .. vim.inspect(root_notices))
+    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_b })
+    vim.cmd('write')
 
     -- Editing A to B must rebuild B, not merely resolve a B-shaped argument vector.
     vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_a })
@@ -1211,6 +1328,22 @@ local ok, failure = xpcall(function()
       assert(not vim.bo.modified, 'ownership build did not save the selected source')
     end
 
+    -- A new empty buffer is unmodified but still needs live ownership discovery.
+    vim.fn.mkdir(base .. '/sub', 'p')
+    local empty_child = base .. '/sub/zonk.tex'
+    include('sub/zonk')
+    vim.cmd.edit(vim.fn.fnameescape(empty_child))
+    assert(not vim.bo.modified and not vim.uv.fs_stat(empty_child))
+    root_notices = {}
+    vim.cmd('PdfTermBuild')
+    finish_build()
+    assert(vim.fn.filereadable(empty_child) == 1, 'new unmodified child was not saved')
+    assert(not vim.uv.fs_stat(base .. '/sub/zonk.pdf'), 'new unmodified child built its own root')
+    vim.api.nvim_buf_call(vim.fn.bufnr(main_b), function()
+      vim.api.nvim_buf_set_lines(0, -4, -2, false, {})
+      vim.cmd('write')
+    end)
+
     -- New unsaved children work with both a live directive and automatic ownership.
     local fresh_build = base .. '/fresh-build.tex'
     local fresh_literal = 'Silver owner silverneedle glows among quiet amber stones.'
@@ -1239,70 +1372,6 @@ local ok, failure = xpcall(function()
     vim.cmd.edit(vim.fn.fnameescape(child))
     navigate(pdf_a, 2, 'needle', 4, literal)
 
-    -- Changes during metadata acquisition reselect the root before the write.
-    reset()
-    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_a })
-    vim.fn.delete(directory .. '/metadata-started')
-    vim.fn.writefile({}, directory .. '/hold-metadata')
-    root_notices = {}
-    vim.cmd('PdfTermBuild')
-    wait(function() return vim.fn.filereadable(directory .. '/metadata-started') == 1 end)
-    assert(vim.fn.readfile(child)[1] == directive_b, 'build saved before preserving compiled metadata')
-    vim.api.nvim_buf_set_lines(child_buffer, 0, 1, false, { directive_b })
-    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, {
-      '', 'Chartreuse compasses distinguish the latest source intent.',
-    })
-    assert(vim.uv.fs_unlink(directory .. '/hold-metadata'))
-    finish_build()
-    assert(digest(pdf_a) == original_a and vim.fn.readfile(child)[1] == directive_b,
-      'an asynchronous root change compiled stale ownership')
-
-    -- Supersession must leave the old dirty buffer unsaved and navigate nowhere.
-    local saved_child = vim.fn.readfile(child)
-    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, { 'Obsolete unsaved intent.' })
-    local previous = #requests
-    vim.fn.delete(directory .. '/metadata-started')
-    vim.fn.writefile({}, directory .. '/hold-metadata')
-    vim.cmd('PdfTermForward')
-    wait(function() return vim.fn.filereadable(directory .. '/metadata-started') == 1 end)
-    vim.cmd('hide edit ' .. vim.fn.fnameescape(fresh_build))
-    vim.api.nvim_buf_set_lines(0, -1, -1, false, { '', 'Only the active build intent is saved.' })
-    assert(vim.uv.fs_unlink(directory .. '/hold-metadata'))
-    root_notices = {}
-    vim.cmd('PdfTermBuild')
-    finish_build()
-    assert(vim.deep_equal(vim.fn.readfile(child), saved_child) and vim.bo[child_buffer].modified,
-      'superseded forward saved the old source buffer')
-    assert(#requests == previous, 'superseded root resolution navigated')
-    assert(vim.fn.readfile(fresh_build)[4] == 'Only the active build intent is saved.',
-      'latest build saved a different buffer')
-    vim.api.nvim_buf_set_lines(child_buffer, 0, -1, false, saved_child)
-    vim.bo[child_buffer].modified = false
-
-    -- A post-save build preflight cannot start an obsolete compiler or strand
-    -- the current successor queued behind the same working directory.
-    local before_preflight_b = digest(pdf_b)
-    local obsolete_text = 'An obsolete compiler must not print this new paragraph.'
-    vim.cmd.edit(vim.fn.fnameescape(child))
-    vim.api.nvim_buf_set_lines(child_buffer, -1, -1, false, { '', obsolete_text })
-    vim.fn.delete(directory .. '/build-metadata-count')
-    vim.fn.delete(directory .. '/build-preflight-started')
-    vim.fn.writefile({}, directory .. '/hold-build-preflight')
-    root_notices = {}
-    vim.cmd('PdfTermBuild')
-    wait(function() return vim.fn.filereadable(directory .. '/build-preflight-started') == 1 end)
-    local written_child = vim.fn.readfile(child)
-    assert(written_child[#written_child] == obsolete_text, 'preflight test did not reach the post-save stage')
-    vim.cmd.edit(vim.fn.fnameescape(main_a))
-    local latest_text = 'The latest independent root rebuilds its real output.'
-    vim.api.nvim_buf_set_lines(0, 3, 4, false, { latest_text })
-    root_notices = {}
-    vim.cmd('PdfTermBuild')
-    wait(function() return vim.fn.readfile(main_a)[4] == latest_text end)
-    assert(vim.uv.fs_unlink(directory .. '/hold-build-preflight'))
-    finish_build()
-    assert(digest(pdf_b) == before_preflight_b, 'superseded preflight started the old compiler')
-    assert(digest(pdf_a) ~= original_a, 'retiring the stale preflight stranded the current queued build')
 
     -- An unsaved standalone document may explicitly name itself through a
     -- parent-directory alias; no unrelated missing root gains that permission.
@@ -1471,37 +1540,90 @@ local ok, failure = xpcall(function()
     assert(owned.main == vim.uv.fs_realpath(macro_dir .. '/owner.tex'),
       'braced bracket inside macro default hid subsequent \\input: ' .. tostring(owned.main))
 
-    local typ_file = macro_dir .. '/notes.typ'
-    vim.fn.writefile({ '= Heading', 'Paragraph target.' }, typ_file)
-    local anchors = require('pdfterm.source')
-    vim.cmd('edit ' .. vim.fn.fnameescape(typ_file))
-    vim.bo.filetype = 'typst'
-    vim.api.nvim_exec_autocmds('FileType', { buffer = 0 })
-    vim.api.nvim_buf_set_lines(0, 0, 0, false, { '// prepended line' })
-    local typ_mapped = anchors.inverse({
-      file = vim.uv.fs_realpath(typ_file),
-      line = 2,
-      byte_column = 10,
+  end
+
+  -- Typst forward search compiles and maps directly through Tinymist without a
+  -- redundant CLI pre-build, while :PdfTermBuild delegates to a retained service
+  -- when present and falls back to the CLI build otherwise.
+  do
+    vim.api.nvim_exec_autocmds('VimLeavePre', { group = 'pdfterm' })
+    wait(function() return not vim.uv.fs_lstat(config.editor.path) end)
+    package.loaded['pdfterm'] = nil
+    adapter = require('pdfterm')
+    local path = directory .. '/synthetic.typ'
+    vim.fn.writefile({ 'Zibble quarn.' }, path)
+    vim.cmd.edit(vim.fn.fnameescape(path))
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'Flarn quarn.' })
+    vim.api.nvim_create_autocmd('BufWritePre', {
+      buffer = vim.api.nvim_get_current_buf(), once = true,
+      callback = function() vim.api.nvim_buf_set_lines(0, 0, 0, false, { '// Plonk.' }) end,
     })
-    assert(typ_mapped.line == 3 and typ_mapped.byte_column == 10,
-      'Typst inverse did not project across unsaved buffer insert: ' .. vim.inspect(typ_mapped))
-    vim.cmd('silent write')
-    local typ_rebased = anchors.inverse({
-      file = vim.uv.fs_realpath(typ_file),
-      line = 3,
-      byte_column = 10,
-    })
-    assert(typ_rebased.line == 3 and typ_rebased.byte_column == 10 and not typ_rebased.warning,
-      'Typst inverse did not rebase warm source on write: ' .. vim.inspect(typ_rebased))
-    vim.fn.writefile({ '// external line', '// prepended line', '= Heading', 'Paragraph target.' }, typ_file)
-    vim.cmd('silent edit!')
-    local typ_reloaded = anchors.inverse({
-      file = vim.uv.fs_realpath(typ_file),
-      line = 4,
-      byte_column = 10,
-    })
-    assert(typ_reloaded.line == 4 and typ_reloaded.byte_column == 10 and not typ_reloaded.warning,
-      'Typst inverse double-shifted after external reload: ' .. vim.inspect(typ_reloaded))
+    adapter.setup({ executable = binary, session = 'adapter', attach_only = true,
+      focus_on_inverse = false, focus_on_forward = false, compile = false })
+    local typst = require('pdfterm.typst')
+    local build, resolve, typst_build = project.build, typst.resolve, typst.build
+    local builds, service_builds, resolutions, retained_service = 0, 0, 0, false
+    project.build = function(built, _, callback)
+      builds = builds + 1
+      vim.fn.writefile({ '%PDF-1.4' }, built.pdf)
+      if callback then callback({ code = 0 }) end
+    end
+    typst.build = function()
+      if not retained_service then return false end
+      service_builds = service_builds + 1
+      return true
+    end
+    typst.resolve = function(_, _, _, _, callback)
+      resolutions = resolutions + 1
+      vim.schedule(function() callback({ code = 1, stderr = 'synthetic mapping stopped' }) end)
+      return function() end
+    end
+    full_copies = 0
+    vim.api.nvim_buf_get_lines = function(buffer, first, last, strict)
+      if first == 0 and last == -1 then full_copies = full_copies + 1 end
+      return get_lines(buffer, first, last, strict)
+    end
+    local checked, reason = xpcall(function()
+      adapter.forward(false)
+      wait(function() return resolutions == 1 end)
+      assert(builds == 0, 'Typst forward with missing PDF ran a redundant CLI pre-build')
+      assert(full_copies == 0, 'Typst save/navigation copied the full source buffer')
+      assert(not vim.bo.modified and vim.fn.readfile(path)[1] == '// Plonk.',
+        'Typst navigation skipped saving or its write hook')
+      adapter.toggle_compile()
+      adapter.forward(false)
+      wait(function() return resolutions == 2 end)
+      assert(builds == 0 and full_copies == 0, 'compile=true Typst forward ran a redundant CLI pre-build')
+      adapter.build()
+      wait(function() return builds == 1 end)
+      assert(service_builds == 0, 'unretained Typst build skipped CLI build fallback')
+      retained_service = true
+      adapter.build()
+      wait(function() return service_builds == 1 end)
+      assert(builds == 1, 'retained Typst build raced a duplicate CLI build')
+    end, debug.traceback)
+    project.build, typst.resolve, typst.build = build, resolve, typst_build
+    vim.api.nvim_buf_get_lines = get_lines
+    assert(checked, reason)
+
+    local latin1_path = directory .. '/latin1-unmodified.tex'
+    local f = assert(io.open(latin1_path, 'wb'))
+    f:write('% caf\233\n\\documentclass{article}\n\\begin{document}\nZibble.\n\\end{document}\n')
+    f:close()
+    vim.cmd.edit(vim.fn.fnameescape(latin1_path))
+    assert(vim.bo.fileencoding == 'latin1' and not vim.bo.modified)
+    local built_main
+    project.build = function(built, _, callback)
+      built_main = built.main
+      callback({ code = 0 })
+    end
+    local ok_latin1, err_latin1 = xpcall(function()
+      adapter.build()
+      wait(function() return built_main ~= nil end)
+      assert(built_main == vim.uv.fs_realpath(latin1_path))
+    end, debug.traceback)
+    project.build = build
+    assert(ok_latin1, err_latin1)
   end
 
   vim.notify = original_notify

@@ -96,6 +96,22 @@ impl Tab {
             selected_link_ordinal,
         }
     }
+
+    pub(super) fn view_position(&self) -> ViewPosition {
+        ViewPosition {
+            page: self.page,
+            scroll_x: self.scroll_x,
+            scroll_y: self.scroll_y,
+            center_content: self.center_content,
+        }
+    }
+
+    pub(super) fn set_view_position(&mut self, position: ViewPosition) {
+        self.page = position.page.min(self.page_count.saturating_sub(1));
+        self.scroll_x = position.scroll_x;
+        self.scroll_y = position.scroll_y;
+        self.center_content = position.center_content;
+    }
 }
 
 // Watch both files: a companion published after its PDF must also trigger reload.
@@ -103,6 +119,7 @@ pub(super) type FileFingerprint = crate::synctex::DocumentRevision;
 
 pub(super) struct FileWatcher {
     pub(super) accepted: FileFingerprint,
+    pub(super) failed: Option<FileFingerprint>,
     pub(super) candidate: Option<(FileFingerprint, Instant)>,
     pub(super) next_poll: Instant,
 }
@@ -116,6 +133,7 @@ impl FileWatcher {
     pub(super) fn from_revision(accepted: FileFingerprint) -> Self {
         Self {
             accepted,
+            failed: None,
             candidate: None,
             next_poll: Instant::now() + FILE_POLL_INTERVAL,
         }
@@ -143,7 +161,7 @@ impl FileWatcher {
         fingerprint: FileFingerprint,
         now: Instant,
     ) -> Option<FileFingerprint> {
-        if fingerprint == self.accepted {
+        if fingerprint == self.accepted || self.failed == Some(fingerprint) {
             self.candidate = None;
             return None;
         }
@@ -164,6 +182,7 @@ impl FileWatcher {
 
     pub(super) fn accept(&mut self, fingerprint: FileFingerprint) {
         self.accepted = fingerprint;
+        self.failed = None;
         if self
             .candidate
             .is_some_and(|(candidate, _)| candidate == fingerprint)
@@ -172,8 +191,10 @@ impl FileWatcher {
         }
     }
 
-    pub(super) fn defer(&mut self, duration: Duration) {
-        self.next_poll = Instant::now() + duration;
+    pub(super) fn mark_failed(&mut self, fingerprint: FileFingerprint) {
+        self.failed = Some(fingerprint);
+        self.candidate = None;
+        self.next_poll = Instant::now() + RELOAD_RETRY_DELAY;
     }
 }
 
@@ -194,6 +215,14 @@ pub(super) enum PendingOpen {
         path: PathBuf,
         view: Option<TabView>,
     },
+}
+
+impl PendingOpen {
+    fn document_id(&self) -> DocumentId {
+        match self {
+            Self::Reload { document_id, .. } | Self::Selection { document_id, .. } => *document_id,
+        }
+    }
 }
 
 impl App {
@@ -223,12 +252,11 @@ impl App {
         self.clear_document_flash(document_id);
         if self.tab().document_id == document_id {
             self.navigation.inverse.take();
-            self.generation = self.generation.wrapping_add(1);
-            self.worker.begin_generation(self.generation);
+            self.bump_generation(true);
             self.reset_render_state();
             self.pending_scale = None;
         } else {
-            self.pending.retain(|key| key.document_id != document_id);
+            self.pending.retain(|key, _| key.document_id != document_id);
         }
         self.worker
             .open(document_id, path)
@@ -252,14 +280,15 @@ impl App {
         revision: FileFingerprint,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let Some(pending) = self.session.pending_open.take() else {
+        let Some(pending) = self
+            .session
+            .pending_open
+            .take_if(|pending| pending.document_id() == document_id)
+        else {
             return Ok(());
         };
         match pending {
-            PendingOpen::Reload {
-                document_id: expected,
-                fingerprint,
-            } if expected == document_id => {
+            PendingOpen::Reload { fingerprint, .. } => {
                 let Some(index) = self.tab_index(document_id) else {
                     return Ok(());
                 };
@@ -282,11 +311,8 @@ impl App {
                     self.request_current(output)?;
                 }
             }
-            PendingOpen::Selection {
-                document_id: expected,
-                path,
-                view,
-            } if expected == document_id => {
+            PendingOpen::Selection { path, view, .. } => {
+                self.restore_active_picker_preview();
                 crate::recent::record(&path);
                 let watcher = FileWatcher::from_revision(revision);
                 self.session.tabs.push(Tab::new(
@@ -308,13 +334,10 @@ impl App {
                 ));
                 if let Some(view) = view {
                     let tab = self.session.tabs.last_mut().expect("new tab");
-                    tab.page = view.position.page.min(pages - 1);
-                    tab.scroll_x = view.position.scroll_x;
-                    tab.scroll_y = view.position.scroll_y;
+                    tab.set_view_position(view.position);
                     tab.fit = view.fit;
                     tab.zoom = view.zoom;
                     tab.invert = view.invert;
-                    tab.center_content = view.position.center_content;
                 }
                 self.session.active_tab = self.session.tabs.len() - 1;
                 self.reset_active_tab_pickers();
@@ -322,7 +345,6 @@ impl App {
                 self.ensure_link_index();
                 self.request_current(output)?;
             }
-            _ => {}
         }
         Ok(())
     }
@@ -333,25 +355,36 @@ impl App {
         error: &str,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        self.finish_forward(Some(format!("document open failed: {error}")));
-        let state = match self.session.pending_open.take() {
-            Some(PendingOpen::Reload {
-                document_id: expected,
-                ..
-            }) if expected == document_id => {
-                if let Some(index) = self.tab_index(document_id) {
-                    self.session.tabs[index].watcher.defer(RELOAD_RETRY_DELAY);
-                }
-                format!("reload failed: {error}; retrying")
-            }
-            Some(PendingOpen::Selection {
-                document_id: expected,
-                ..
-            }) if expected == document_id => format!("open failed: {error}"),
-            _ => return Ok(()),
+        let Some(pending) = self
+            .session
+            .pending_open
+            .take_if(|pending| pending.document_id() == document_id)
+        else {
+            return Ok(());
         };
-        self.request_current(output)?;
-        self.draw_status(output, self.viewport()?, &state)?;
+        let (failed_path, state) = match pending {
+            PendingOpen::Reload { fingerprint, .. } => {
+                let Some(index) = self.tab_index(document_id) else {
+                    return Ok(());
+                };
+                self.session.tabs[index].watcher.mark_failed(fingerprint);
+                let path = self.session.tabs[index].path.clone();
+                let state =
+                    (index == self.session.active_tab).then(|| format!("reload failed: {error}"));
+                (path, state)
+            }
+            PendingOpen::Selection { path, .. } => (path, Some(format!("open failed: {error}"))),
+        };
+        if self.navigation.forward.as_ref().is_some_and(|fwd| {
+            fwd.request.pdf == failed_path
+                || fs::canonicalize(&fwd.request.pdf).ok().as_deref() == Some(failed_path.as_path())
+        }) {
+            self.finish_forward(Some(format!("document open failed: {error}")));
+        }
+        if let Some(state) = state {
+            self.request_current(output)?;
+            self.draw_status(output, self.viewport()?, &state)?;
+        }
         Ok(())
     }
 
@@ -369,12 +402,7 @@ impl App {
         }
         let tab = self.tab();
         let view = TabView {
-            position: ViewPosition {
-                page: tab.page,
-                scroll_x: tab.scroll_x,
-                scroll_y: tab.scroll_y,
-                center_content: tab.center_content,
-            },
+            position: tab.view_position(),
             fit: tab.fit,
             zoom: tab.zoom,
             invert: tab.invert,
@@ -427,6 +455,7 @@ impl App {
         {
             return Ok(());
         }
+        self.restore_active_picker_preview();
         self.navigation.inverse.take();
         self.session.active_tab = index;
         self.reset_active_tab_pickers();

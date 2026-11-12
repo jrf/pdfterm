@@ -1,5 +1,6 @@
 -- Tinymist's preview uses Typst source spans, not PDF text matching. Its LSP
 -- scrollPreview command delivers document positions over the local data plane.
+local project_mod = require('pdfterm.project')
 local source = require('pdfterm.source')
 local M = {}
 local active = {}
@@ -8,7 +9,18 @@ local closing = {}
 
 local function canonical(path, cwd)
   local absolute = vim.fs.normalize(vim.startswith(path, '/') and path or cwd .. '/' .. path)
-  return vim.uv.fs_realpath(absolute) or absolute
+  local prefix, suffix = absolute, nil
+  while true do
+    local real = vim.uv.fs_realpath(prefix)
+    if real then
+      return suffix and (real:gsub('/+$', '') .. '/' .. suffix) or real
+    end
+    local parent = vim.fs.dirname(prefix)
+    if not parent or parent == prefix then return absolute end
+    local base = vim.fs.basename(prefix)
+    suffix = suffix and (base .. '/' .. suffix) or base
+    prefix = parent
+  end
 end
 
 local function literal_word(source, byte_column)
@@ -98,11 +110,11 @@ local function compile_args(project)
 end
 
 local function revision(path)
-  return source.saved_revision(assert(vim.uv.fs_stat(path), 'cannot stat Typst PDF: ' .. path))
+  return source.saved_revision(vim.uv.fs_stat(path))
 end
 
--- Track compiler-accessed files, not output directories, swap files, or other
--- unrelated root entries. Keep symlink identity as well as target metadata.
+-- Track project Typst files, not output directories, swap files, or unrelated
+-- non-Typst root entries. Keep symlink identity as well as target metadata.
 local function fingerprint(path)
   local stat = vim.uv.fs_lstat(path)
   if not stat then return { 'missing' } end
@@ -117,14 +129,44 @@ local function fingerprint(path)
   return value
 end
 
+local function scan_typst_inputs(root, main)
+  local inputs = { [main] = fingerprint(main) }
+  local visited = {}
+  local scanned = 1
+  local function walk(dir, depth)
+    if depth > 8 or scanned >= 512 then return end
+    local real_dir = canonical(dir, '/')
+    if visited[real_dir] then return end
+    visited[real_dir] = true
+    local handle = vim.uv.fs_scandir(dir)
+    if not handle then return end
+    while scanned < 512 do
+      local name, kind = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      scanned = scanned + 1
+      if name:sub(1, 1) ~= '.' and name ~= 'target' and name ~= 'node_modules' then
+        local full = dir .. '/' .. name
+        kind = kind or (vim.uv.fs_lstat(full) or {}).type
+        if kind == 'directory' or (kind == 'link' and (vim.uv.fs_stat(full) or {}).type == 'directory') then
+          walk(full, depth + 1)
+        elseif name:sub(-4):lower() == '.typ' then
+          inputs[full] = fingerprint(full)
+          local real = canonical(full, '/')
+          inputs[real] = fingerprint(real)
+        end
+      end
+    end
+  end
+  walk(root, 1)
+  return inputs
+end
+
 local function unchanged(inputs)
   for path, value in pairs(inputs) do
     if not vim.deep_equal(value, fingerprint(path)) then return false end
   end
   return true
 end
-
-local saved_bytes = source.read_bytes
 
 -- Only a local Tinymist data-plane connection is accepted. Frames are drained
 -- incrementally, retaining at most 512 bytes: SVG updates can be very large.
@@ -234,11 +276,12 @@ end
 
 -- Preview source positions count Unicode scalars, including Tinymist's legacy
 -- showDocument wrapper. UTF-16 is computed from the saved, compiled source.
-local function location(path, row, character, inputs)
+local function location(path, row, character)
   assert(type(path) == 'string' and path:sub(1, 1) == '/' and not path:find('%z'),
     'Tinymist returned an invalid source path')
   path = canonical(path, '/')
-  assert(inputs[path] and inputs[path][1] == 'file', 'mapped source is outside the saved project inputs')
+  local stat = vim.uv.fs_stat(path)
+  assert(stat and stat.type == 'file', 'mapped source is outside the saved project inputs')
   assert(integer(row, 0) and integer(character, 0), 'Tinymist returned an invalid source position')
   local lines = vim.fn.readfile(path, 'b', row + 2)
   local source = assert(lines[row + 1], 'Tinymist source line is outside the saved file')
@@ -340,15 +383,89 @@ local function inverse_listener(path, dispatch)
   return close
 end
 
+local function normalize_project(project)
+  return vim.tbl_extend('force', project, {
+    main = canonical(project.main, project.cwd),
+    cwd = canonical(project.cwd, project.cwd),
+    pdf = canonical(project.pdf, project.cwd),
+  })
+end
+
 function M.resolve(project, file, line, byte_column, callback)
-  local completed, stopped, private, close_listener, monitor
-  local generation, waiting, published, endpoint, args, source, character
-  local stop, launch, refresh, run_waiting
-  local function complete(error, payload)
-    if completed then return end
-    completed = true
+  local ok_prep, prep = pcall(function()
+    assert(vim.fn.executable('tinymist') == 1, 'tinymist is required for Typst cursor navigation')
+    project = normalize_project(project)
+    file = canonical(file, project.cwd)
+    local parsed_args, parsed_root = compile_args(project)
+    local src_line = vim.fn.readfile(file, '', line)[line]
+    assert(src_line and byte_column >= 0 and byte_column <= #src_line, 'cursor is outside the saved Typst source')
+    -- Preview looks up the leaf before the scalar boundary; normal-mode is ON
+    -- the character, so send its trailing boundary.
+    local char_col = vim.fn.strchars(src_line:sub(1, byte_column)) + (byte_column < #src_line and 1 or 0)
+    return { args = parsed_args, root = parsed_root, source = src_line, character = char_col }
+  end)
+  if not ok_prep then
+    local err_msg = 'Typst source navigation: ' .. tostring(prep)
+    vim.schedule(function() callback({ code = 1, stdout = '', stderr = err_msg }) end)
+    return function() end
+  end
+  local args, root, src_line, character = prep.args, prep.root, prep.source, prep.character
+  local previous = retained[project.pdf]
+  if previous and previous.matches(project, args) then
+    return previous.forward(file, line, byte_column, src_line, character, callback)
+  end
+  if previous then previous.stop('Typst source map replaced') end
+
+  local initial_completed, stopped, private, close_listener, debounce, fallback_timer = false, false
+  local watchers = {}
+  local generation, waiting, published, endpoint, service
+  local pending_forward = {
+    file = file, line = line, byte_column = byte_column,
+    source = src_line, character = character, callback = callback,
+    awaiting_jump = false, ready_for_jump = false,
+  }
+  local pending_build
+  local fenced_until = 0
+  local start_fn = vim.lsp.rpc.start
+  local stop, launch, refresh, run_waiting, sync_watchers, schedule_watch_check
+
+  local function close_timer(timer)
+    if timer then timer:stop(); timer:close() end
+  end
+  local function clear_forward(pf)
+    if not pf then return end
+    close_timer(pf.timer)
+    pf.timer = nil
+    if pending_forward == pf then pending_forward = nil end
+  end
+  local function finish_forward(pf, error, payload)
+    if not pf or pf.done then return end
+    pf.done = true
+    clear_forward(pf)
+    local cb = pf.callback
     local value = { code = error and 1 or 0, stdout = payload or '', stderr = error or '' }
-    vim.schedule(function() callback(value) end)
+    vim.schedule(function() cb(value) end)
+  end
+  local function finish_build(error)
+    local build = pending_build
+    if not build then return end
+    pending_build = nil
+    build.finish(error)
+  end
+  local function clear_query(g)
+    if not g or not g.query then return end
+    close_timer(g.query.timer)
+    g.query.timer = nil
+    g.query = nil
+  end
+  local function close_watchers()
+    close_timer(debounce); debounce = nil
+    close_timer(fallback_timer); fallback_timer = nil
+    for dir, entry in pairs(watchers) do
+      watchers[dir] = nil
+      entry.handle:stop()
+      entry.handle:close()
+    end
   end
   local function cleanup(g)
     closing[g] = nil
@@ -358,8 +475,8 @@ function M.resolve(project, file, line, byte_column, callback)
   local function retire(g)
     if not g or g.stopped then return end
     g.stopped = true
-    if g.timer then g.timer:stop(); g.timer:close(); g.timer = nil end
-    if g.settle then g.settle:stop(); g.settle:close(); g.settle = nil end
+    close_timer(g.timer); g.timer = nil
+    if g.query then close_timer(g.query.timer); g.query.timer = nil end
     if g.socket and not g.socket:is_closing() then g.socket:read_stop(); g.socket:close() end
     if g.rpc and not g.exited then
       -- Each generation has a separate export directory: a terminating export
@@ -381,15 +498,18 @@ function M.resolve(project, file, line, byte_column, callback)
     if stopped then return end
     stopped = true
     active[stop] = nil
-    if retained[project.pdf] == stop then retained[project.pdf] = nil end
-    complete(error or 'Typst source-map service stopped')
-    answer(waiting, { ok = false, error = error or 'Typst source-map service stopped' })
+    if retained[project.pdf] == service then retained[project.pdf] = nil end
+    local message = error or 'Typst source-map service stopped'
+    finish_forward(pending_forward, message)
+    finish_build(message)
+    answer(waiting, { ok = false, error = message })
     waiting = nil
     if generation then
-      answer(generation.query, { ok = false, error = error or 'Typst source-map service stopped' })
+      answer(generation.query, { ok = false, error = message })
+      clear_query(generation)
       retire(generation)
     end
-    if monitor then monitor:stop(); monitor:close(); monitor = nil end
+    close_watchers()
     if close_listener then close_listener(); close_listener = nil end
     remove_directory(private)
     private = nil
@@ -398,13 +518,19 @@ function M.resolve(project, file, line, byte_column, callback)
     if stopped or generation ~= g or g.stopped then return end
     g.inputs[project.main] = g.inputs[project.main] or fingerprint(project.main)
     g.before = revision(project.pdf)
+    sync_watchers()
     g.error = 'Typst source navigation: ' .. tostring(reason)
+    finish_build(tostring(reason))
     answer(g.query, { ok = false, error = g.error })
-    g.query = nil
+    clear_query(g)
     answer(waiting, { ok = false, error = g.error })
     waiting = nil
     retire(g)
-    if not completed then stop(g.error) end
+    if not initial_completed then
+      stop(g.error)
+    else
+      finish_forward(pending_forward, g.error)
+    end
   end
   local function guarded(g, fn)
     return function(...)
@@ -420,38 +546,204 @@ function M.resolve(project, file, line, byte_column, callback)
         next_step(value)
       end)), 'Tinymist request could not be sent')
   end
+  local function start_generation_timer(g)
+    close_timer(g.timer)
+    g.timer = assert(vim.uv.new_timer())
+    g.timer:start(30000, 0, function()
+      vim.schedule(guarded(g, function() fail(g, 'source mapping timed out (the cursor may have no rendered position)') end))
+    end)
+  end
+  local function arm_forward_timeout(g, pf, timeout_ms, on_timeout)
+    close_timer(pf.timer)
+    pf.timer = assert(vim.uv.new_timer())
+    pf.timer:start(timeout_ms, 0, function()
+      vim.schedule(function()
+        if stopped or pending_forward ~= pf or pf.done then return end
+        if pf.awaiting_jump then
+          fenced_until = math.max(fenced_until, vim.uv.hrtime() + 40000000)
+        end
+        local message = 'source mapping timed out (the cursor may have no rendered position)'
+        if generation == g and not g.stopped and (g.scroll_inflight or 0) > 0 then
+          if initial_completed then
+            finish_forward(pf, 'Typst source navigation: ' .. message)
+            refresh()
+          else
+            fail(g, message)
+          end
+          return
+        end
+        finish_forward(pf, 'Typst source navigation: ' .. message)
+        if on_timeout then on_timeout() end
+      end)
+    end)
+  end
+  local function scroll_preview(g, pf, on_timeout)
+    if pending_forward ~= pf or pf.done then return end
+    arm_forward_timeout(g, pf, 2000, on_timeout)
+    local function send_scroll()
+      if stopped or generation ~= g or g.stopped or pending_forward ~= pf or pf.done then return end
+      if (g.scroll_inflight or 0) > 0 then
+        g.after_scroll = send_scroll
+        return
+      end
+      local delay_ms = math.ceil((fenced_until - vim.uv.hrtime()) / 1000000)
+      if delay_ms > 0 then
+        vim.defer_fn(send_scroll, delay_ms)
+        return
+      end
+      g.scroll_inflight = (g.scroll_inflight or 0) + 1
+      pf.awaiting_jump = true
+      pf.ready_for_jump = true
+      local ok, err = pcall(command, g, 'tinymist.scrollPreview', { 'pdfterm', {
+        event = 'panelScrollTo', filepath = pf.file, line = pf.line - 1, character = pf.character,
+      } }, function()
+        g.scroll_inflight = math.max(0, (g.scroll_inflight or 1) - 1)
+        if g.scroll_inflight == 0 and g.after_scroll then
+          local next_scroll = g.after_scroll
+          g.after_scroll = nil
+          fenced_until = math.max(fenced_until, vim.uv.hrtime() + 40000000)
+          next_scroll()
+        end
+      end)
+      if not ok then
+        g.scroll_inflight = math.max(0, (g.scroll_inflight or 1) - 1)
+        if initial_completed then
+          finish_forward(pf, 'Typst source navigation: ' .. tostring(err))
+        else
+          fail(g, err)
+        end
+      end
+    end
+    send_scroll()
+  end
   local function validate(g, request)
     assert(generation == g and not g.stopped and g.ready, 'Typst source map is refreshing')
-    assert(vim.deep_equal(published, revision(project.pdf)), 'PDF changed; source map is refreshing')
+    assert(published ~= nil and vim.deep_equal(published, revision(project.pdf)), 'PDF changed; source map is refreshing')
     assert(vim.deep_equal(request.revision, published), 'stale PDF revision; retry from the updated view')
     assert(unchanged(g.inputs), 'saved Typst inputs changed; source map is refreshing')
   end
+  local debounce_pending = false
+  local function ensure_fallback_poll()
+    if stopped or fallback_timer then return end
+    fallback_timer = assert(vim.uv.new_timer())
+    fallback_timer:start(500, 500, function() schedule_watch_check() end)
+  end
+  schedule_watch_check = function()
+    if stopped or debounce_pending then return end
+    debounce_pending = true
+    if not debounce then debounce = assert(vim.uv.new_timer()) end
+    debounce:start(50, 0, function()
+      debounce_pending = false
+      vim.schedule(function()
+        if stopped or not generation then return end
+        for dir, entry in pairs(watchers) do
+          if (vim.uv.fs_stat(dir) or {}).ino ~= entry.ino then sync_watchers(); break end
+        end
+        local g = generation
+        local changed = not unchanged(g.inputs)
+          or not vim.deep_equal(g.ready and published or g.before, revision(project.pdf))
+        if changed then refresh() end
+      end)
+    end)
+  end
+  sync_watchers = function()
+    if stopped then return end
+    local dirs, watch_failed = {}, false
+    local root_prefix = project.cwd:gsub('/+$', '') .. '/'
+    local function add_path(path)
+      local dir = vim.fs.dirname(path)
+      while dir and dir ~= '/' and dir ~= '.' and vim.fn.isdirectory(dir) == 0 do
+        dir = vim.fs.dirname(dir)
+      end
+      while dir and vim.fn.isdirectory(dir) == 1 do
+        local resolved = canonical(dir, '/')
+        dirs[resolved] = true
+        if resolved == project.cwd or resolved:sub(1, #root_prefix) ~= root_prefix then break end
+        dir = vim.fs.dirname(resolved)
+      end
+    end
+    add_path(project.pdf)
+    add_path(project.main)
+    if generation then
+      for path in pairs(generation.inputs) do add_path(path) end
+    end
+    for dir, entry in pairs(watchers) do
+      if not dirs[dir] or (vim.uv.fs_stat(dir) or {}).ino ~= entry.ino then
+        watchers[dir] = nil
+        entry.handle:stop()
+        entry.handle:close()
+      elseif entry.failed then
+        watch_failed = true
+      end
+    end
+    for dir in pairs(dirs) do
+      if not watchers[dir] then
+        local ino = (vim.uv.fs_stat(dir) or {}).ino
+        local handle = vim.uv.new_fs_event()
+        local entry = { handle = handle, ino = ino }
+        if handle and handle:start(dir, {}, function(err)
+          if err then
+            entry.failed = true
+            vim.schedule(ensure_fallback_poll)
+          end
+          schedule_watch_check()
+        end) then
+          watchers[dir] = entry
+        else
+          if handle then handle:close() end
+          watch_failed = true
+        end
+      end
+    end
+    if watch_failed then
+      ensure_fallback_poll()
+    elseif fallback_timer then
+      close_timer(fallback_timer); fallback_timer = nil
+    end
+  end
   refresh = function(reason)
     if stopped then return end
-    if not completed then
+    if not initial_completed then
       stop(reason or 'Typst inputs or PDF changed during forward search; repeat navigation')
       return
     end
+    finish_forward(pending_forward, reason or 'Typst inputs or PDF changed during forward search; repeat navigation')
     if generation then
       answer(generation.query, { ok = false, error = reason or 'Typst source map is refreshing' })
-      generation.query = nil
+      clear_query(generation)
       retire(generation)
     end
     launch()
   end
+  local function arm_query_timer(g, query, timeout_ms)
+    close_timer(query.timer)
+    query.timer = assert(vim.uv.new_timer())
+    query.timer:start(timeout_ms, 0, function()
+      vim.schedule(function()
+        if stopped or generation ~= g or g.query ~= query then return end
+        clear_query(g)
+        if not query.abandoned then
+          answer(query, { ok = false, error = 'Typst inverse search timed out; the point may have no rendered source' })
+        end
+        run_waiting()
+      end)
+    end)
+  end
   run_waiting = function()
     local g, query = generation, waiting
-    if not g or not g.ready or not query then return end
+    if not g or not g.ready or g.query or not query then return end
     waiting = nil
     local ok, reason = pcall(validate, g, query.request)
     if not ok then
       answer(query, { ok = false, error = tostring(reason) })
-      if not unchanged(g.inputs) or not vim.deep_equal(published, revision(project.pdf)) then
+      local msg = tostring(reason)
+      if msg:find('PDF changed', 1, true) or msg:find('inputs changed', 1, true) then
         refresh()
       end
       return
     end
     g.query = query
+    arm_query_timer(g, query, 1000)
     local sent, error = pcall(g.send, 'src-point ' .. vim.json.encode({
       page_no = query.request.page, x = query.request.x, y = query.request.y,
     }))
@@ -468,60 +760,181 @@ function M.resolve(project, file, line, byte_column, callback)
     answer(waiting, { ok = false, error = 'Typst inverse request superseded' })
     waiting = query
     local g = generation
-    if g and g.query then
-      -- An ID-less response cannot be reassigned to the newer click. Fence all
-      -- callbacks by retiring the whole compiler, not just its websocket.
-      refresh('Typst inverse request superseded')
-    elseif not g or g.stopped then
+    if not g or g.stopped then
       refresh()
-    elseif not unchanged(g.inputs) or (g.ready and not vim.deep_equal(published, revision(project.pdf))) then
-      refresh()
-    else
+    elseif g.query then
+      if not g.query.abandoned then
+        answer(g.query, { ok = false, error = 'Typst inverse request superseded' })
+        g.query.abandoned = true
+        arm_query_timer(g, g.query, 50)
+      end
+    elseif g.ready then
       run_waiting()
+    elseif not unchanged(g.inputs) then
+      refresh()
     end
     return function()
       if waiting == query then
         waiting = nil
       elseif generation and generation.query == query then
         query.reply = nil
-        refresh('Typst inverse request cancelled')
+        if not query.abandoned then
+          query.abandoned = true
+          arm_query_timer(generation, query, 50)
+        end
       end
     end
   end
+  local function ensure_endpoint()
+    if close_listener then close_listener(); close_listener = nil end
+    remove_directory(private)
+    private, endpoint = nil, nil
+    local tmp = vim.fn.isdirectory('/tmp') == 1 and '/tmp' or vim.uv.os_tmpdir():gsub('/+$', '')
+    private = canonical(assert(vim.uv.fs_mkdtemp(tmp .. '/pdfterm-XXXXXX')), '/')
+    assert(vim.uv.fs_chmod(private, 448))
+    local owner = assert(vim.uv.fs_lstat(private))
+    assert(owner.uid == vim.uv.getuid() and bit.band(owner.mode, 511) == 448,
+      'Typst inverse socket directory is not private')
+    endpoint = private .. '/inverse.sock'
+    close_listener = inverse_listener(endpoint, inverse)
+  end
+  local function complete_forward(g, pf)
+    close_timer(g.timer); g.timer = nil
+    ensure_endpoint()
+    initial_completed = true
+    retained[project.pdf] = service
+    finish_forward(pf, nil, vim.json.encode({ pdf = project.pdf, revision = published,
+      best_guess = true, inverse_search = endpoint,
+      page = g.position.page, h = g.position.x, v = g.position.y,
+      width = 0, height = 0, word = literal_word(pf.source, pf.byte_column) }))
+  end
+  service = {
+    stop = stop,
+    matches = function(cand_project, cand_args)
+      return not stopped and initial_completed
+        and start_fn == vim.lsp.rpc.start
+        and project.cwd == cand_project.cwd and project.main == cand_project.main
+        and vim.deep_equal(args, cand_args)
+    end,
+    is_coherent = function(cand_project, cand_args)
+      return not stopped and initial_completed
+        and generation ~= nil and generation.ready and not generation.stopped
+        and not generation.exited and not generation.query and not waiting
+        and start_fn == vim.lsp.rpc.start
+        and project.cwd == cand_project.cwd and project.main == cand_project.main
+        and vim.deep_equal(args, cand_args)
+        and published ~= nil and vim.deep_equal(published, revision(project.pdf))
+        and unchanged(generation.inputs)
+    end,
+    forward = function(next_file, next_line, next_byte, next_source, next_char, next_callback)
+      if pending_forward then
+        if pending_forward.awaiting_jump then
+          fenced_until = math.max(fenced_until, vim.uv.hrtime() + 40000000)
+        end
+        finish_forward(pending_forward, 'Typst forward request superseded')
+      end
+      if generation and generation.exported and not generation.ready and not generation.stopped then
+        generation.publish()
+      end
+      local pf = {
+        file = next_file, line = next_line, byte_column = next_byte,
+        source = next_source, character = next_char, callback = next_callback,
+        awaiting_jump = false, ready_for_jump = false,
+      }
+      local coherent = generation and generation.ready and not generation.stopped
+        and not generation.exited and published ~= nil
+        and vim.deep_equal(published, revision(project.pdf))
+        and unchanged(generation.inputs)
+      if coherent then
+        pending_forward = pf
+        generation.position = nil
+        scroll_preview(generation, pf)
+      else
+        local refreshing_current = generation and not generation.ready and not generation.stopped
+          and not generation.exited and not generation.exported
+          and unchanged(generation.inputs)
+          and vim.deep_equal(generation.before, revision(project.pdf))
+        if not refreshing_current then
+          refresh('Typst source map refreshing')
+        end
+        pending_forward = pf
+      end
+      return function()
+        if pending_forward == pf then
+          pf.done = true
+          if pf.awaiting_jump then
+            fenced_until = math.max(fenced_until, vim.uv.hrtime() + 40000000)
+          end
+          clear_forward(pf)
+          if generation and generation.exported and not generation.ready and not generation.stopped then
+            generation.publish()
+          end
+        end
+      end
+    end,
+    build = function(id)
+      if not project_mod.current(id) then return end
+      local notification = pending_build and pending_build.notification
+        or { id = 'pdfterm.build.' .. id, title = 'pdfterm: ' .. vim.fs.basename(project.pdf) }
+      local finished = false
+      local function notify_build(status, level)
+        vim.notify(status, level, vim.tbl_extend('force', notification, { timeout = finished and 5000 or false }))
+      end
+      pending_build = {
+        notification = notification,
+        finish = function(err)
+          if finished then return end
+          finished = true
+          if err then
+            notify_build('Compilation failed\n' .. tostring(err), vim.log.levels.ERROR)
+          else
+            notify_build('Compilation OK', vim.log.levels.INFO)
+          end
+        end,
+      }
+      notify_build('Compiling…', vim.log.levels.INFO)
+      if stopped then return end
+      if not generation or generation.stopped or generation.exited or generation.ready
+        or generation.exported or not unchanged(generation.inputs)
+        or not vim.deep_equal(generation.before, revision(project.pdf)) then
+        refresh('Typst build requested')
+      end
+    end,
+  }
   launch = function()
     if stopped then return end
-    local g = { inputs = {}, before = revision(project.pdf) }
+    local g = { inputs = scan_typst_inputs(root, project.main), before = revision(project.pdf) }
     generation = g
+    sync_watchers()
     local start = guarded(g, function()
-      g.temporary = canonical(assert(vim.uv.fs_mkdtemp(vim.fs.dirname(project.pdf) .. '/.pdfterm-XXXXXX')),
-        project.cwd)
+      local pdf_dir = vim.fs.dirname(project.pdf)
+      vim.fn.mkdir(pdf_dir, 'p')
+      g.temporary = canonical(assert(vim.uv.fs_mkdtemp(pdf_dir .. '/.pdfterm-XXXXXX')), project.cwd)
       local output = g.temporary .. '/mapped.pdf'
       local function publish()
         if not unchanged(g.inputs) or not vim.deep_equal(g.export_inputs, g.inputs)
           or not vim.deep_equal(g.before, revision(project.pdf)) then
           refresh('Typst inputs or PDF changed during source-map refresh')
-          return
+          return false
         end
+        vim.fn.mkdir(vim.fs.dirname(project.pdf), 'p')
         assert(vim.uv.fs_rename(output, project.pdf))
-        published, g.ready = revision(project.pdf), true
-        if g.timer then g.timer:stop(); g.timer:close(); g.timer = nil end
-        if not completed then
-          local tmp = vim.fn.isdirectory('/tmp') == 1 and '/tmp' or vim.uv.os_tmpdir():gsub('/+$', '')
-          private = canonical(assert(vim.uv.fs_mkdtemp(tmp .. '/pdfterm-XXXXXX')), '/')
-          assert(vim.uv.fs_chmod(private, 448))
-          local owner = assert(vim.uv.fs_lstat(private))
-          assert(owner.uid == vim.uv.getuid() and bit.band(owner.mode, 511) == 448,
-            'Typst inverse socket directory is not private')
-          endpoint = private .. '/inverse.sock'
-          close_listener = inverse_listener(endpoint, inverse)
-          retained[project.pdf] = stop
-          complete(nil, vim.json.encode({ pdf = project.pdf, revision = published,
-            best_guess = true,
-            inverse_search = endpoint, page = g.position.page, h = g.position.x, v = g.position.y,
-            width = 0, height = 0, word = literal_word(source, byte_column) }))
+        published = assert(revision(project.pdf), 'cannot stat exported Typst PDF: ' .. project.pdf)
+        g.ready = true
+        close_timer(g.timer); g.timer = nil
+        sync_watchers()
+        if not pending_forward and not endpoint then
+          ensure_endpoint()
         end
+        if not initial_completed then
+          initial_completed = true
+          retained[project.pdf] = service
+        end
+        finish_build(nil)
         run_waiting()
+        return true
       end
+      g.publish = publish
       local function export()
         if g.exporting or g.ready then return end
         g.exporting = true
@@ -529,72 +942,70 @@ function M.resolve(project, file, line, byte_column, callback)
         command(g, 'tinymist.exportPdf', { project.main }, function(value)
           assert(value ~= vim.NIL and value ~= nil and vim.uv.fs_stat(output),
             'Tinymist could not export the current saved document')
-          if completed then
-            publish()
-          else
+          if pending_forward then
             g.exported = true
-            command(g, 'tinymist.scrollPreview', { 'pdfterm', {
-              event = 'panelScrollTo', filepath = file, line = line - 1, character = character,
-            } }, function() end)
+            scroll_preview(g, pending_forward, function()
+              if generation == g and not g.stopped and not g.ready then
+                publish()
+              end
+            end)
+          else
+            publish()
           end
         end)
       end
       local function source_position(path, row, column)
         local query = g.query
         if not query then return end
-        g.query = nil
+        clear_query(g)
+        if query.abandoned then
+          run_waiting()
+          return
+        end
         local ok, mapped = pcall(function()
-          validate(g, query.request)
-          local value = location(path, row, column, g.inputs)
-          validate(g, query.request)
-          return value
+          assert(generation == g and not g.stopped and g.ready
+            and vim.deep_equal(query.request.revision, published)
+            and vim.deep_equal(published, revision(project.pdf))
+            and vim.deep_equal(g.inputs[project.main], fingerprint(project.main)),
+            'Typst source map is refreshing')
+          local loc = location(path, row, column)
+          assert(not g.inputs[loc.file] or vim.deep_equal(g.inputs[loc.file], fingerprint(loc.file)),
+            'Typst source map is refreshing')
+          return loc
         end)
         answer(query, ok and { ok = true, location = mapped } or { ok = false, error = tostring(mapped) })
-        if not unchanged(g.inputs) or not vim.deep_equal(published, revision(project.pdf)) then refresh() end
+        if not ok and tostring(mapped):find('source map is refreshing', 1, true)
+          and generation == g and not g.stopped then
+          refresh()
+        else
+          run_waiting()
+        end
       end
       local function on_message(data)
         if data:match('^new,') or data:match('^diff%-v1,') then
           g.rendered = true
           if not unchanged(g.inputs) then refresh(); return end
           export()
-        elseif g.exported and not completed and data:match('^jump,') then
+        elseif (g.exported or g.ready) and pending_forward and pending_forward.ready_for_jump and data:match('^jump,') then
+          local pf = pending_forward
+          pf.awaiting_jump = false
           local page, x, y = data:match('^jump,(%d+) ([^ ,]+) ([^ ,]+)')
           page, x, y = tonumber(page), tonumber(x), tonumber(y)
           assert(page and page > 0 and x and y and x == x and y == y
             and math.abs(x) < math.huge and math.abs(y) < math.huge, 'invalid Tinymist document position')
           g.position = { page = page, x = x, y = y }
-          publish()
-        end
-      end
-      local function filesystem(params)
-        assert(type(params) == 'table' and type(params.inserts) == 'table',
-          'Tinymist returned an invalid input footprint')
-        local inserts = {}
-        for _, uri in ipairs(params.inserts) do
-          local path = vim.uri_to_fname(uri)
-          local before = fingerprint(path)
-          if g.ready or (g.inputs[path] and not vim.deep_equal(g.inputs[path], before)) then
-            vim.schedule(guarded(g, function() refresh() end))
-            return
+          if g.ready then
+            if not unchanged(g.inputs) or not vim.deep_equal(published, revision(project.pdf)) then
+              refresh('Typst inputs or PDF changed during forward search; repeat navigation')
+              return
+            end
+            complete_forward(g, pf)
+          else
+            if publish() then complete_forward(g, pf) end
           end
-          g.inputs[path] = before
-          local real = canonical(path, '/')
-          g.inputs[real] = fingerprint(real)
-          local bytes, reason = saved_bytes(path)
-          assert(vim.deep_equal(before, fingerprint(path)), 'Typst input changed while reading saved bytes')
-          inserts[#inserts + 1] = { uri = uri, content = bytes
-            and { type = 'ok', content = vim.base64.encode(bytes) }
-            or { type = 'err', error = tostring(reason) } }
         end
-        vim.schedule(guarded(g, function()
-          assert(g.rpc.request('tinymist/fsChange', {
-            inserts = inserts, removes = params.removes or {}, isSync = false,
-          }, guarded(g, function(err)
-            if err then fail(g, err.message or vim.inspect(err)) end
-          end)), 'Tinymist saved inputs could not be sent')
-        end))
       end
-      g.rpc = vim.lsp.rpc.start({ 'tinymist', 'lsp' }, {
+      g.rpc = start_fn({ 'tinymist', 'lsp' }, {
         notification = guarded(g, function(method, params)
           if method == 'window/showMessage' and params.type == 1 then
             fail(g, params.message)
@@ -602,24 +1013,19 @@ function M.resolve(project, file, line, byte_column, callback)
             assert(type(params) == 'table' and type(params.start) == 'table',
               'Tinymist returned a missing source position')
             source_position(params.filepath, params.start[1], params.start[2])
-          elseif method == 'tinymist/compileStatus' and params.status == 'compileError' and not g.ready then
-            -- Missing delegated inputs can temporarily fail a compile. Wait
-            -- for its footprint to settle, then use explicit export (which
-            -- never falls back to the previous successful preview).
-            if not g.settle then g.settle = assert(vim.uv.new_timer()) end
-            g.settle:start(300, 0, function()
-              vim.schedule(guarded(g, function()
-                if g.preview_started and not g.rendered then export() end
-              end))
-            end)
+          elseif method == 'tinymist/compileStatus' and not g.ready then
+            if params.status == 'compileError' then
+              g.compile_failed = true
+              if g.preview_started and not g.rendered then export() end
+            elseif params.status == 'compiling' or params.status == 'compileSuccess' then
+              g.compile_failed = false
+            end
           end
         end),
         server_request = function(method, params)
           if stopped or generation ~= g or g.stopped then return vim.NIL end
           local ok, reason = pcall(function()
-            if method == 'tinymist/fs/watch' then
-              filesystem(params)
-            elseif method == 'window/showDocument' and g.query then
+            if method == 'window/showDocument' and g.query then
               assert(type(params) == 'table' and type(params.selection) == 'table'
                 and type(params.selection.start) == 'table', 'Tinymist returned a missing source position')
               source_position(vim.uri_to_fname(params.uri), params.selection.start.line,
@@ -638,16 +1044,13 @@ function M.resolve(project, file, line, byte_column, callback)
           cleanup(g)
         end,
       }, { cwd = project.cwd, detached = false })
-      g.timer = assert(vim.uv.new_timer())
-      g.timer:start(30000, 0, function()
-        vim.schedule(guarded(g, function() fail(g, 'source mapping timed out (the cursor may have no rendered position)') end))
-      end)
+      start_generation_timer(g)
       assert(g.rpc.request('initialize', {
         processId = vim.fn.getpid(), rootUri = vim.uri_from_fname(project.cwd),
         capabilities = { general = { positionEncodings = { 'utf-16' } } },
         initializationOptions = {
           exportPdf = 'never', outputPath = g.temporary .. '/mapped', typstExtraArgs = args,
-          delegateFsRequests = true, compileStatus = 'enable', customizedShowDocument = true,
+          compileStatus = 'enable', customizedShowDocument = true,
           formatterMode = 'disable', semanticTokens = 'disable',
         },
       }, guarded(g, function(err, value)
@@ -664,7 +1067,11 @@ function M.resolve(project, file, line, byte_column, callback)
             assert(type(port) == 'number' and port > 0 and port < 65536,
               'Tinymist did not expose a local preview data plane')
             g.preview_started = true
-            g.socket = websocket(port, guarded(g, function(send) g.send = send; send() end),
+            g.socket = websocket(port, guarded(g, function(send)
+              g.send = send
+              send()
+              if g.compile_failed and not g.rendered then export() end
+            end),
               function(data) vim.schedule(guarded(g, function() on_message(data) end)) end,
               function(error) vim.schedule(guarded(g, function() fail(g, error) end)) end)
           end)
@@ -674,48 +1081,48 @@ function M.resolve(project, file, line, byte_column, callback)
     start()
   end
   active[stop] = true
-  local ok, reason = pcall(function()
-    assert(vim.fn.executable('tinymist') == 1, 'tinymist is required for Typst cursor navigation')
-    project = vim.tbl_extend('force', project, {
-      main = canonical(project.main, project.cwd),
-      cwd = canonical(project.cwd, project.cwd),
-      pdf = canonical(project.pdf, project.cwd),
-    })
-    file = canonical(file, project.cwd)
-    args = compile_args(project)
-    source = vim.fn.readfile(file, '', line)[line]
-    assert(source and byte_column >= 0 and byte_column <= #source, 'cursor is outside the saved Typst source')
-    -- Preview looks up the leaf before the scalar boundary; normal-mode is ON
-    -- the character, so send its trailing boundary.
-    character = vim.fn.strchars(source:sub(1, byte_column)) + (byte_column < #source and 1 or 0)
-    -- A new explicit forward search owns this PDF before starting its compiler.
-    -- The previous automatic publisher must not race the replacement export.
-    local previous = retained[project.pdf]
-    if previous then previous('Typst source map replaced') end
-    monitor = assert(vim.uv.new_timer())
-    monitor:start(200, 200, function()
-      vim.schedule(function()
-        if stopped or not generation then return end
-        local g = generation
-        local valid, changed = pcall(function()
-          return not unchanged(g.inputs)
-            or not vim.deep_equal(g.ready and published or g.before, revision(project.pdf))
-        end)
-        if valid and changed then refresh() end
-      end)
-    end)
-    launch()
-  end)
+  retained[project.pdf] = service
+  local initial_pf = pending_forward
+  local ok, reason = pcall(launch)
   if not ok then stop('Typst source navigation: ' .. tostring(reason)) end
   return function()
-    if not completed then stop('navigation cancelled') end
+    if pending_forward == initial_pf then
+      initial_pf.done = true
+      if initial_completed then
+        clear_forward(initial_pf)
+      else
+        stop('navigation cancelled')
+      end
+    end
   end
+end
+
+function M.build(project, id)
+  local normalized = normalize_project(project)
+  local service = retained[normalized.pdf]
+  if not service then return false end
+  local ok, parsed_args = pcall(compile_args, normalized)
+  if not ok or not service.matches(normalized, parsed_args) then
+    service.stop('Typst source-map ownership released')
+    return false
+  end
+  service.build(id)
+  return true
+end
+
+function M.is_coherent(project)
+  local ok, coherent = pcall(function()
+    local normalized = normalize_project(project)
+    local service = retained[normalized.pdf]
+    return service ~= nil and service.is_coherent(normalized, compile_args(normalized))
+  end)
+  return ok and coherent
 end
 
 -- A different builder must be able to take ownership of the same PDF path.
 function M.release(pdf)
-  local stop = retained[canonical(pdf, vim.fn.getcwd())]
-  if stop then stop('Typst source-map ownership released') end
+  local service = retained[canonical(pdf, vim.fn.getcwd())]
+  if service then service.stop('Typst source-map ownership released') end
 end
 
 vim.api.nvim_create_autocmd('VimLeavePre', {

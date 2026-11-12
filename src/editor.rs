@@ -1,8 +1,7 @@
 use crate::process::Operation;
-use crate::synctex::{DocumentRevision, SourceLocation};
+use crate::synctex::SourceLocation;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Editor selection is trusted configuration. Document paths are arguments, never shell code.
@@ -20,22 +19,11 @@ pub enum Editor {
 }
 
 #[derive(Serialize)]
-pub struct SourceDocument<'a> {
-    pub pdf: &'a Path,
-    pub revision: crate::synctex::PdfRevision,
-    pub document_revision: DocumentRevision,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_snapshot: Option<&'a Path>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<&'a str>,
-}
-
-#[derive(Serialize)]
 struct EditorLocation<'a> {
     #[serde(flatten)]
     location: &'a SourceLocation,
-    #[serde(flatten)]
-    document: Option<SourceDocument<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'a str>,
 }
 
 impl Editor {
@@ -52,11 +40,7 @@ impl Editor {
                 Err(io::Error::other("editor socket path must not be empty"))
             }
             Self::Command { argv } => {
-                if argv.is_empty() || argv[0].is_empty() || argv[0].contains(['{', '}']) {
-                    return Err(io::Error::other(
-                        "editor command requires a literal executable as argv[0]",
-                    ));
-                }
+                validate_command_head(argv)?;
                 let sample = SourceLocation {
                     file: String::new(),
                     line: 1,
@@ -74,56 +58,11 @@ impl Editor {
         }
     }
 
-    pub(crate) fn source_snapshot(
-        &self,
-        pdf: &Path,
-        document_revision: DocumentRevision,
-        operation: &Operation,
-    ) -> io::Result<Option<PathBuf>> {
-        let Self::Socket { path } = self else {
-            return Ok(None);
-        };
-        #[derive(Serialize)]
-        struct Request<'a> {
-            action: &'static str,
-            pdf: &'a Path,
-            document_revision: DocumentRevision,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Reply {
-            ok: bool,
-            error: Option<String>,
-            source_snapshot: Option<PathBuf>,
-        }
-        let bytes = serde_json::to_vec(&Request {
-            action: "source_snapshot",
-            pdf,
-            document_revision,
-        })?;
-        let reply: Reply = crate::ipc::exchange(path, &bytes, "source snapshot", operation)?;
-        if !reply.ok {
-            return Err(io::Error::other(
-                reply
-                    .error
-                    .unwrap_or_else(|| "source snapshot request rejected".into()),
-            ));
-        }
-        if let Some(snapshot) = &reply.source_snapshot
-            && (!snapshot.is_absolute() || snapshot.as_os_str().as_encoded_bytes().contains(&0))
-        {
-            return Err(io::Error::other(
-                "source snapshot path must be absolute without NUL",
-            ));
-        }
-        Ok(reply.source_snapshot)
-    }
-
     pub fn deliver(
         &self,
         location: &SourceLocation,
         operation: &Operation,
-        document: Option<SourceDocument<'_>>,
+        warning: Option<&str>,
     ) -> io::Result<()> {
         operation.check()?;
         match self {
@@ -132,12 +71,12 @@ impl Editor {
                 let mut stream = crate::ipc::connect(path, operation)?;
                 crate::ipc::send(
                     &mut stream,
-                    &serde_json::to_vec(&EditorLocation { location, document })?,
+                    &serde_json::to_vec(&EditorLocation { location, warning })?,
                     operation,
                 )
             }
             Self::Command { argv } => {
-                self.validate()?;
+                validate_command_head(argv)?;
                 let arguments = argv[1..]
                     .iter()
                     .map(|argument| expand(argument, location))
@@ -156,6 +95,15 @@ impl Editor {
             }
         }
     }
+}
+
+fn validate_command_head(argv: &[String]) -> io::Result<()> {
+    if argv.is_empty() || argv[0].is_empty() || argv[0].contains(['{', '}']) {
+        return Err(io::Error::other(
+            "editor command requires a literal executable as argv[0]",
+        ));
+    }
+    Ok(())
 }
 
 fn expand(template: &str, location: &SourceLocation) -> io::Result<String> {
@@ -233,52 +181,6 @@ mod tests {
             }
             .validate()
             .is_err()
-        );
-    }
-
-    #[test]
-    fn snapshot_lookup_rejects_invalid_authority_and_cancellation() {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixListener;
-        let root = tempfile::tempdir().unwrap();
-        let pdf = root.path().join("document.pdf");
-        std::fs::write(&pdf, b"revision").unwrap();
-        let revision = DocumentRevision::read(&pdf).unwrap();
-        for response in [
-            r#"{"ok":true,"source_snapshot":"relative/manifest.json"}"#,
-            r#"{"ok":true,"source_snapshot":"/cache/\u0000manifest.json"}"#,
-            r#"{"ok":false,"error":"cached source changed after publication"}"#,
-            r#"{"ok":true,"source_snapshot":null,"unexpected":true}"#,
-        ] {
-            let socket = root.path().join("editor.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream.read_to_end(&mut Vec::new()).unwrap();
-                stream.write_all(response.as_bytes()).unwrap();
-            });
-            let editor = Editor::Socket {
-                path: socket.to_str().unwrap().into(),
-            };
-            assert!(
-                editor
-                    .source_snapshot(&pdf, revision, &Operation::default())
-                    .is_err()
-            );
-            server.join().unwrap();
-            std::fs::remove_file(socket).unwrap();
-        }
-        let operation = Operation::default();
-        operation.cancel();
-        let editor = Editor::Socket {
-            path: root.path().join("absent.sock").to_str().unwrap().into(),
-        };
-        assert_eq!(
-            editor
-                .source_snapshot(&pdf, revision, &operation)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Interrupted
         );
     }
 }

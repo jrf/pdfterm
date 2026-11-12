@@ -250,15 +250,14 @@ local ok, failure = xpcall(function()
   precise(independent, other.main, 1, independent_line, 'anchor')
 
   -- Tinymist sends no source notification for an unrendered point. Its timeout
-  -- must retire only the ambiguous compiler generation, never the endpoint.
+  -- must keep the warm compiler generation and private endpoint intact.
   local before_timeout = vim.deepcopy(main_point)
   rejected(query(main_point, { page = 4294967295 }))
   main_point = recovered(main_point, p.pdf, p.main, 5, main_line, 'anchor')
   included = current(included, p.pdf)
   precise(included, root .. '/chapter.typ', 3, included_line, 'includedanchor')
-  if not vim.deep_equal(before_timeout.revision, main_point.revision) then
-    rejected(query(before_timeout))
-  end
+  assert(vim.deep_equal(before_timeout.revision, main_point.revision),
+    'unrendered inverse timeout restarted Tinymist or rewrote PDF')
 
   -- Cancel a real included-page request, then request a different location.
   -- A late notification must not be delivered as the newer main-page reply.
@@ -266,8 +265,11 @@ local ok, failure = xpcall(function()
   main_point = recovered(main_point, p.pdf, p.main, 5, main_line, 'anchor')
   included = current(included, p.pdf)
   precise(included, root .. '/chapter.typ', 3, included_line, 'includedanchor')
+  local before_abandon = vim.deepcopy(main_point)
   abandon(main_point, { page = 4294967295 })
   main_point = recovered(main_point, p.pdf, p.main, 5, main_line, 'anchor')
+  assert(vim.deep_equal(before_abandon.revision, main_point.revision),
+    'abandoned unrendered inverse click restarted Tinymist or rewrote PDF')
   included = current(included, p.pdf)
   precise(included, root .. '/chapter.typ', 3, included_line, 'includedanchor')
 

@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::time::Duration;
 
@@ -10,7 +9,6 @@ use serde::Deserialize;
 
 pub(crate) const FOCUS_TIMEOUT: Duration = Duration::from_secs(6);
 const HELPER_TIMEOUT: Duration = Duration::from_secs(3);
-const REPLY_LIMIT: usize = 4096;
 
 #[derive(Deserialize)]
 struct BridgeReply {
@@ -130,48 +128,11 @@ fn focus_ssh_with(
             stream
                 .shutdown(std::net::Shutdown::Write)
                 .map_err(|e| bridge_error("shutdown", e))?;
-            operation.check()?;
-            let mut response = Vec::with_capacity(256);
-            let mut chunk = [0_u8; 512];
-            loop {
-                let timeout = remaining()?.min(Duration::from_millis(50));
-                let mut descriptor = libc::pollfd {
-                    fd: stream.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ready =
-                    unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
-                if ready == 0 {
-                    continue;
-                }
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(bridge_error("poll", error));
-                }
-                let count = match stream.read(&mut chunk) {
-                    Ok(count) => count,
-                    Err(error)
-                        if error.kind() == io::ErrorKind::WouldBlock
-                            || error.kind() == io::ErrorKind::Interrupted =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(bridge_error("read", error)),
-                };
-                if count == 0 {
-                    break;
-                }
-                if response.len() + count > REPLY_LIMIT {
-                    return Err(invalid_data("SSH focus bridge reply exceeds 4096 bytes"));
-                }
-                response.extend_from_slice(&chunk[..count]);
-            }
-            operation.check()?;
-            serde_json::from_slice(&response).map_err(invalid_data)?
+            stream
+                .set_nonblocking(true)
+                .map_err(|e| bridge_error("nonblocking", e))?;
+            crate::ipc::read_json_reply(&mut stream, "SSH focus bridge", operation)
+                .map_err(|e| bridge_operation_error("read", e))?
         }
     };
     if reply.ok {
@@ -219,7 +180,7 @@ fn parse_endpoint(endpoint: &str) -> io::Result<Endpoint<'_>> {
 fn read_token(path: &str) -> io::Result<String> {
     #[cfg(unix)]
     let file = {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -228,9 +189,7 @@ fn read_token(path: &str) -> io::Result<String> {
         if !metadata.is_file() {
             return Err(invalid("SSH focus token path is not a regular file"));
         }
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        if !crate::ipc::is_owned_with_mask(&metadata, 0o077) {
             return Err(invalid("SSH focus token file must be private (mode 0600)"));
         }
         file

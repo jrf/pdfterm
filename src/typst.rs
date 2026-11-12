@@ -4,11 +4,7 @@ use crate::{
     synctex::{InversePoint, InverseResolution, PdfRevision, SourceLocation},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    io,
-    os::unix::fs::{FileTypeExt, MetadataExt},
-    path::Path,
-};
+use std::{io, path::Path};
 
 pub(crate) fn resolve_inverse(
     endpoint: &str,
@@ -17,27 +13,9 @@ pub(crate) fn resolve_inverse(
     operation: &Operation,
 ) -> io::Result<InverseResolution> {
     operation.check()?;
-    let path = Path::new(endpoint);
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("Typst source-map socket has no parent"))?;
     // The adapter owns a private, local resolver. Do not contact a replaced
     // symlink, another user's socket, or a publicly accessible endpoint.
-    let directory = std::fs::symlink_metadata(parent)?;
-    let socket = std::fs::symlink_metadata(path)?;
-    let uid = unsafe { libc::geteuid() };
-    if !directory.is_dir()
-        || directory.uid() != uid
-        || directory.mode() & 0o077 != 0
-        || !socket.file_type().is_socket()
-        || socket.uid() != uid
-        || socket.mode() & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Typst source-map endpoint must be a private current-user-owned socket",
-        ));
-    }
+    crate::ipc::check_private_socket(Path::new(endpoint))?;
     #[derive(Serialize)]
     struct Request {
         revision: PdfRevision,

@@ -28,54 +28,28 @@ end
 
 function M.launch(source, argv, callback)
   local arguments = {
-    'launch',
-    '--match',
-    'window_id:' .. source.id,
-    '--type=window',
-    '--location=vsplit',
-    '--keep-focus',
-    '--next-to',
-    'id:' .. source.id,
-    '--env',
-    'PATH=' .. vim.env.PATH,
-    '--env',
-    'XDG_CONFIG_HOME=' .. (vim.env.XDG_CONFIG_HOME or ''),
+    'launch', '--match', 'window_id:' .. source.id, '--type=window', '--location=vsplit',
+    '--keep-focus', '--next-to', 'id:' .. source.id,
+    '--env', 'PATH=' .. vim.env.PATH, '--env', 'XDG_CONFIG_HOME=' .. (vim.env.XDG_CONFIG_HOME or ''),
   }
   vim.list_extend(arguments, argv)
-  return remote(
-    { 'goto-layout', '--match', 'window_id:' .. source.id, 'splits' },
-    vim.schedule_wrap(function(result)
-      if result.code ~= 0 then
-        callback(result)
-        return
+  return remote({ 'goto-layout', '--match', 'window_id:' .. source.id, 'splits' }, vim.schedule_wrap(function(result)
+    if result.code ~= 0 then
+      callback(result)
+      return
+    end
+    remote(arguments, vim.schedule_wrap(function(split)
+      local id = vim.trim(split.stdout or '')
+      if split.code == 0 and (id == '' or id == source.id) then
+        split = {
+          code = 1,
+          stdout = '',
+          stderr = 'Kitty split returned no distinct window ID; created window ownership is unknown',
+        }
       end
-      remote(
-        arguments,
-        vim.schedule_wrap(function(split)
-          local id = vim.trim(split.stdout or '')
-          if split.code == 0 and (id == '' or id == source.id) then
-            split = {
-              code = 1,
-              stdout = '',
-              stderr = 'Kitty split returned no distinct window ID; created window ownership is unknown',
-            }
-          end
-          local ok, failure = xpcall(callback, debug.traceback, split)
-          if not ok then
-            if split.code == 0 and id ~= '' then
-              local closed, close_error = pcall(M.close, { id = id })
-              if not closed then
-                split.code, split.unclosed = 1, true
-                split.stderr = failure .. '; could not close unowned Kitty split: ' .. tostring(close_error)
-                error(split.stderr)
-              end
-            end
-            error(failure)
-          end
-        end)
-      )
-    end)
-  )
+      require('pdfterm.terminal').finish_launch(split, callback, M.close, 'Kitty split')
+    end))
+  end))
 end
 
 function M.focus(source, callback)

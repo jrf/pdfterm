@@ -3,8 +3,8 @@ local M = {}
 local socket = require('pdfterm.socket')
 local project = require('pdfterm.project')
 local terminal = require('pdfterm.terminal')
-local anchors = require('pdfterm.source')
-local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h')
+local saved_source = require('pdfterm.source')
+local root = terminal.root
 local options, main_file, initialized, exiting, paired
 local cancel_forward, cancel_focus, cancel_resolution, close_listener
 local owned_splits, launch_waiters = {}, nil
@@ -46,12 +46,28 @@ local function log_entry(level, message, context)
   local ok, failure = pcall(function()
     local dir = vim.fs.dirname(path)
     if dir and dir ~= '' and vim.fn.isdirectory(dir) == 0 then
-      assert(vim.fn.mkdir(dir, 'p') == 1, 'cannot create log directory ' .. dir)
+      assert(vim.fn.mkdir(dir, 'p', '0700') == 1, 'cannot create log directory ' .. dir)
     end
-    local file = assert(io.open(path, 'a'))
-    local written, write_error = file:write(line)
-    local closed, close_error = file:close()
-    assert(written, write_error)
+    local uv, c = vim.uv, vim.uv.constants
+    local existing = uv.fs_lstat(path)
+    assert(not existing or existing.type == 'file', 'log path is not a regular file')
+    local flags = existing and bit.bor(c.O_WRONLY, c.O_APPEND, c.O_NONBLOCK or 0)
+      or bit.bor(c.O_WRONLY, c.O_CREAT, c.O_EXCL, c.O_APPEND)
+    local fd = assert(uv.fs_open(path, flags, 384))
+    local ok_io, io_err = pcall(function()
+      local st = assert(uv.fs_fstat(fd))
+      assert(st.type == 'file' and st.uid == uv.getuid(), 'log file must be a user-owned regular file')
+      assert(not existing or (st.dev == existing.dev and st.ino == existing.ino), 'log path changed during open')
+      assert(uv.fs_fchmod(fd, 384))
+      local offset = 0
+      while offset < #line do
+        local n = assert(uv.fs_write(fd, line:sub(offset + 1), -1))
+        assert(n > 0, 'short log write')
+        offset = offset + n
+      end
+    end)
+    local closed, close_error = uv.fs_close(fd)
+    assert(ok_io, io_err)
     assert(closed, close_error)
   end)
   if not ok then
@@ -131,23 +147,9 @@ local function command(arguments)
   return vim.list_extend(argv, arguments)
 end
 local function describe(main, current_source)
-  local p = project.describe(options.project, main_file or main, not main_file and current_source or nil)
-  p.executable = options.executable
-  return p
+  return project.describe(options.project, main_file or main, not main_file and current_source or nil)
 end
 
-local function with_document(p, id, callback)
-  cancel_resolution = project.source_info(p, function(info, error)
-    if not alive(id) then return end
-    cancel_resolution = nil
-    if not info then notify(error); return end
-    p.main = p.main or info.main
-    local ok, document = pcall(anchors.ensure, p, info)
-    if not ok then notify(document); return end
-    local call_ok, call_error = pcall(callback, document)
-    if not call_ok then notify(call_error) end
-  end)
-end
 
 local function warning_text(...)
   local values, seen = {}, {}
@@ -162,13 +164,11 @@ local function warning_text(...)
 end
 
 local routine_diagnostics = {
-  'best-guess navigation: compiled source history unavailable; assuming saved source is unchanged since compilation',
-  'best-guess navigation: compiled source history unavailable; using the compiler line anchor',
+  'assuming saved source is unchanged since compilation',
+  'best-guess navigation: assuming saved source is unchanged since compilation',
+  'best-guess navigation: using saved source and the compiler line anchor',
   'best-guess navigation: no literal source position was qualified; using the compiler line anchor',
-  'line-only navigation: compiled TeX execution cannot be verified; using the SyncTeX line anchor',
   'line-only navigation: using the SyncTeX line anchor',
-  'compiled source snapshot/identity is unavailable; using a clamped current position',
-  'Compiled source unavailable; using the requested compiler line if available.',
 }
 
 local function split_navigation_diagnostic(message)
@@ -203,14 +203,17 @@ local function warnings(...)
   end
   return message
 end
-local function save_buffer(buffer)
-  if vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer) then
-    if vim.bo[buffer].modified or not vim.uv.fs_stat(vim.api.nvim_buf_get_name(buffer)) then
-      vim.api.nvim_buf_call(buffer, function() vim.cmd('write') end)
-    end
-  else
-    warnings('Source buffer unloaded during navigation; using saved inputs and a best-guess anchor.')
-  end
+local function snapshot_point(point)
+  if not point or point.buffer == nil then return end
+  local buffer = point.buffer
+  local valid = vim.api.nvim_buf_is_valid(buffer)
+  local loaded = valid and vim.api.nvim_buf_is_loaded(buffer)
+  local position = valid
+    and vim.api.nvim_buf_get_extmark_by_id(buffer, point_namespace, point.mark, { details = true }) or {}
+  local row, byte = position[1] or point.row, position[2] or point.column
+  point.saved_row, point.saved_byte = row, byte
+  point.saved_line = loaded and vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or nil
+  point.saved_coarse = point.boundary or not loaded or #position == 0 or position[3].invalid
 end
 
 local function current_source(buffer)
@@ -219,72 +222,95 @@ local function current_source(buffer)
   end
 end
 
-local function with_saved_project(buffer, file, id, callback, header, depth)
-  if not alive(id) then return end
-  local tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
-  local text = header or current_source(buffer)
-  local p = describe(file, text)
-  -- Preserve the selected PDF's old source history before writing any live edits.
-  local function saved(document)
-    if not alive(id) then return end
-    local current_tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
-    if current_tick ~= tick then
-      local updated = current_source(buffer)
-      if updated ~= nil and updated ~= text then
-        if describe(file, updated).main ~= p.main then
-          assert((depth or 0) < 4, 'pdfterm: source root changed repeatedly while saving; repeat the command')
-          with_saved_project(buffer, file, id, callback, updated, (depth or 0) + 1)
-          return
+local function save_buffer(buffer)
+  if vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer) then
+    local name = vim.api.nvim_buf_get_name(buffer)
+    if vim.bo[buffer].modified or not vim.uv.fs_stat(name) then
+      local point = forward_point and forward_point.buffer == buffer and forward_point or nil
+      local pre_tick = vim.api.nvim_buf_get_changedtick(buffer)
+      local write_tick
+      if point then snapshot_point(point) end
+      local hook = vim.api.nvim_create_autocmd('BufWritePre', {
+        buffer = buffer,
+        once = true,
+        callback = function()
+          if point then snapshot_point(point) end
+          write_tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
+        end,
+      })
+      local ok, err = pcall(vim.api.nvim_buf_call, buffer, function() vim.cmd('write') end)
+      pcall(vim.api.nvim_del_autocmd, hook)
+      if not ok then error(err, 0) end
+      local valid = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer)
+      local after_tick = valid and vim.api.nvim_buf_get_changedtick(buffer) or nil
+      if point then
+        if not valid then
+          snapshot_point(point)
+        elseif write_tick and after_tick > write_tick + 1 then
+          local disk = saved_source.read_input(name)
+          if disk and disk:gsub('\r\n', '\n'):gsub('\n$', '') == (current_source(buffer) or '') then
+            snapshot_point(point)
+          end
         end
-        text = updated
       end
+      return not valid or not write_tick or write_tick ~= pre_tick
+        or after_tick > write_tick + 1 or vim.bo[buffer].modified
     end
-    save_buffer(buffer)
-    if not alive(id) then return end
-    local after_tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
-    if after_tick ~= current_tick then
-      local updated = current_source(buffer)
-      if updated ~= nil and updated ~= text then
-        assert(describe(file, updated).main == p.main,
-          'pdfterm: source root changed while saving; repeat the command')
-      end
-    end
-    callback(p, document)
-  end
-  if not p.main:match('%.typ$') and vim.uv.fs_stat(p.pdf) then
-    with_document(p, id, saved)
+    return false
   else
-    saved()
+    warnings('Source buffer unloaded during navigation; using saved inputs and a best-guess anchor.')
+    return false
   end
+end
+
+local function with_saved_project(buffer, file, id, callback)
+  if not alive(id) then return end
+  local valid = vim.api.nvim_buf_is_valid(buffer)
+  local tick = valid and vim.api.nvim_buf_get_changedtick(buffer) or nil
+  local typst = file:lower():sub(-4) == '.typ'
+  local fenc = valid and vim.bo[buffer].fileencoding:lower() or ''
+  local non_utf8 = fenc ~= '' and fenc ~= 'utf-8'
+  local text = not typst and valid
+    and (vim.bo[buffer].modified or non_utf8 or not vim.uv.fs_stat(file))
+    and current_source(buffer) or nil
+  local p = describe(file, text)
+  local mutated = save_buffer(buffer)
+  if not alive(id) then return end
+  local after_tick = vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_get_changedtick(buffer) or nil
+  if not typst and (mutated or (text == nil and after_tick ~= tick)) then
+    local saved = (non_utf8 or not vim.uv.fs_stat(file)) and current_source(buffer) or nil
+    if saved == nil or saved ~= text then
+      assert(describe(file, saved).main == p.main,
+        'pdfterm: source root changed while saving; repeat the command')
+    end
+  end
+  callback(p)
 end
 local function inverse(location)
   if exiting then
     return
   end
-  local mapped = location
-  if location.document_revision or location.file:match('%.typ$') then
-    mapped = anchors.inverse(location)
-  end
-  local buffer = mapped.buffer or vim.fn.bufadd(mapped.file)
+  local buffer = vim.fn.bufadd(location.file)
   local window = vim.fn.win_findbuf(buffer)[1]
   if window then
     vim.api.nvim_set_current_win(window)
   else
     vim.cmd('hide buffer ' .. buffer)
   end
-  local line = math.max(1, math.min(mapped.line, vim.api.nvim_buf_line_count(0)))
-  local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ''
-  vim.api.nvim_win_set_cursor(0, { line, math.min(mapped.byte_column, #text) })
+  assert(vim.api.nvim_get_current_buf() == buffer, 'pdfterm: source activation selected a different buffer')
   local total_lines = vim.api.nvim_buf_line_count(0)
-  local boundary_warn = (mapped.line < 1 or mapped.line > total_lines)
-    and string.format('inverse target line %d is outside buffer bounds (1..%d)', mapped.line, total_lines)
+  local line = math.max(1, math.min(location.line, total_lines))
+  local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ''
+  vim.api.nvim_win_set_cursor(0, { line, math.min(location.byte_column, #text) })
+  local boundary_warn = (location.line < 1 or location.line > total_lines)
+    and string.format('inverse target line %d is outside buffer bounds (1..%d)', location.line, total_lines)
     or nil
-  local warn_msg = warning_text(mapped.warning, boundary_warn)
+  local warn_msg = warning_text(location.warning, boundary_warn)
   local context = string.format(
     'inverse: %s:%d:%d (precise=%s)',
-    mapped.file,
+    location.file,
     line,
-    mapped.byte_column,
+    location.byte_column,
     tostring(location.precise == true)
   )
   local warn_part, info_part = split_navigation_diagnostic(warn_msg)
@@ -382,7 +408,7 @@ local function ready(callback, listen)
       return
     end
     if listen and not close_listener and options.editor.transport == 'socket' then
-      local ok, result = pcall(socket.listen, options.editor.path, inverse, anchors.snapshot)
+      local ok, result = pcall(socket.listen, options.editor.path, inverse)
       if not ok then
         socket.diagnose(options.editor.path, function(status)
           if not exiting then
@@ -403,23 +429,22 @@ local function ready(callback, listen)
   end)
 end
 
-local function viewer_command(pdf, source_snapshot)
+local function viewer_command(pdf)
   local argv = command({ pdf, '--synctex-best-guess' })
-  if source_snapshot then vim.list_extend(argv, { '--source-snapshot', source_snapshot }) end
   if options.focus_on_forward then
     argv = vim.list_extend({ root .. '/scripts/pdfterm-viewer' }, argv)
   end
   if vim.env.XDG_CONFIG_HOME then
     argv = vim.list_extend({ 'env', 'XDG_CONFIG_HOME=' .. vim.env.XDG_CONFIG_HOME }, argv)
   end
-  return table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' ')
+  return terminal.shell_join(argv)
 end
 
 local function launch(source, source_error, callback)
   if remote_session() or options.attach_only then
     callback(
       'viewer unavailable; run on this machine in another terminal: '
-        .. viewer_command(M._launch_pdf, M._launch_snapshot)
+        .. viewer_command(M._launch_pdf)
     )
     return
   end
@@ -467,8 +492,7 @@ local function launch(source, source_error, callback)
       end)
     end,
     options.session,
-    focus_token,
-    M._launch_snapshot
+    focus_token
   )
   if ok then
     launch_process = process
@@ -570,7 +594,6 @@ local function deliver(pdf, payload, id, source, source_error, allow_launch, foc
         if not launched then
           launched = true
           M._launch_pdf = pdf
-          M._launch_snapshot = vim.json.decode(payload).source_snapshot
           launch(source, source_error, function(launch_error, split, token)
             if not alive(id) then
               return
@@ -617,21 +640,13 @@ local function open_pdf(pdf, id, source, source_error, allow_launch, focus_forwa
     local path = assert(vim.uv.fs_realpath(pdf))
     local stat = assert(vim.uv.fs_stat(path))
     assert(stat.type == 'file', 'PDF is not a regular file')
-    local p = {
-      pdf = path, executable = options.executable,
-      cwd = options.project and options.project.cwd or vim.fn.getcwd(),
-    }
-    with_document(p, id, function(document)
-      local payload = vim.json.encode({
-        pdf = path,
-        revision = anchors.saved_revision(stat),
-        page = 1, h = 0, v = 0, width = 0, height = 0,
-        source_snapshot = document and document.source_snapshot or nil,
-        best_guess = true,
-        warning = not document and 'Compiled source unavailable; using best-guess navigation.' or nil,
-      })
-      deliver(path, payload, id, source, source_error, allow_launch, focus_forward)
-    end)
+    local payload = vim.json.encode({
+      pdf = path,
+      revision = saved_source.saved_revision(stat),
+      page = 1, h = 0, v = 0, width = 0, height = 0,
+      best_guess = true,
+    })
+    deliver(path, payload, id, source, source_error, allow_launch, focus_forward)
   end, true)
 end
 
@@ -674,25 +689,12 @@ function M.viewer_command(pdf)
         return
       end
       M._source_terminal = captured_source
-      local p = pdf and {
-        pdf = vim.fn.fnamemodify(pdf, ':p'), executable = options.executable,
-        cwd = options.project and options.project.cwd or vim.fn.getcwd(),
-      } or describe(source)
-      local function publish_command(document)
-        local shell_command = viewer_command(p.pdf, document and document.source_snapshot)
-        vim.fn.setreg('+', shell_command)
-        vim.notify(shell_command)
-        if options.focus_on_inverse and not captured_source then
-          notify('source terminal focus unavailable: ' .. (source_error or 'source terminal unavailable'))
-        end
-      end
-      local stat, stat_error, stat_code = vim.uv.fs_stat(p.pdf)
-      if stat then
-        with_document(p, id, publish_command)
-      elseif stat_code == 'ENOENT' then
-        publish_command()
-      else
-        notify(stat_error)
+      local path = pdf and vim.fn.fnamemodify(pdf, ':p') or describe(source).pdf
+      local shell_command = viewer_command(path)
+      vim.fn.setreg('+', shell_command)
+      vim.notify(shell_command)
+      if options.focus_on_inverse and not captured_source then
+        notify('source terminal focus unavailable: ' .. (source_error or 'source terminal unavailable'))
       end
     end, true)
   end, true)
@@ -700,12 +702,15 @@ end
 function M.build()
   local id, buffer = intent(), vim.api.nvim_get_current_buf()
   local file = vim.api.nvim_buf_get_name(buffer)
-  local header = current_source(buffer)
   ready(function()
     with_saved_project(buffer, file, id, function(p)
-      if not p.main:match('%.typ$') then release_typst(p.pdf) end
-      project.build(p, id)
-    end, header)
+      if not p.main:match('%.typ$') then
+        release_typst(p.pdf)
+        project.build(p, id)
+      elseif not require('pdfterm.typst').build(p, id) then
+        project.build(p, id)
+      end
+    end)
   end)
 end
 local function forward(allow_launch)
@@ -715,7 +720,6 @@ local function forward(allow_launch)
   local id = intent()
   local buffer, cursor = vim.api.nvim_get_current_buf(), vim.api.nvim_win_get_cursor(0)
   local file = vim.api.nvim_buf_get_name(buffer)
-  local header = current_source(buffer)
   local text = vim.api.nvim_buf_get_lines(buffer, cursor[1] - 1, cursor[1], false)[1] or ''
   local character = vim.fn.strcharpart(text, vim.fn.strchars(text:sub(1, cursor[2])), 1)
   local point = {
@@ -728,24 +732,29 @@ local function forward(allow_launch)
   }
   forward_point = point
   with_source(id, nil, function(source, source_error)
-    local function navigate(p, document)
+    local function navigate(p)
       if not p.main:match('%.typ$') then release_typst(p.pdf) end
-      local function resolve(document)
+      -- Freeze saved-source coordinates before a build can outlive unsaved edits.
+      if point.saved_row == nil then snapshot_point(point) end
+      local row, byte = point.saved_row, point.saved_byte
+      local line_text, coarse = point.saved_line, point.saved_coarse
+      local column = line_text and vim.fn.strchars(line_text:sub(1, byte)) + 1
+      local source_warning = coarse and (point.boundary
+        and 'Source cursor is a line boundary; using a best-guess compiled line.'
+        or 'Source cursor anchor was deleted or unloaded before navigation; using a best-guess compiled line.')
+      local context = string.format('forward: %s:%d:%d', file, row + 1, byte + 1)
+      local fallback = allow_launch
+        and 'Source navigation unavailable; opening PDF at page 1 without source positioning.'
+        or 'Source navigation unavailable; PDF position unchanged.'
+      local function resolve()
         if not alive(id) then return end
-        local position = vim.api.nvim_buf_is_valid(buffer)
-          and vim.api.nvim_buf_get_extmark_by_id(buffer, point_namespace, point.mark, { details = true }) or {}
-        local row, byte = position[1] or point.row, position[2] or point.column
-        local context = string.format('forward: %s:%d:%d', file, row + 1, byte + 1)
         local function resolved(result)
           if not alive(id) then return end
           cancel_resolution = nil
           release_point(point)
           if result.code ~= 0 then
             if result.code == 3 then
-              local fallback = allow_launch
-                and 'Source navigation unavailable; opening PDF at page 1 without source positioning.'
-                or 'Source navigation unavailable; PDF position unchanged.'
-              local text = warning_text(fallback, vim.trim(result.stderr):gsub('^pdfterm:%s*', ''))
+              local text = warning_text(fallback, (vim.trim(result.stderr):gsub('^pdfterm:%s*', '')))
               warn(text or fallback, context)
               if allow_launch then
                 open_pdf(p.pdf, id, source, source_error, true, true)
@@ -756,6 +765,13 @@ local function forward(allow_launch)
             return
           end
           local payload = vim.json.decode(result.stdout)
+          if source_warning and not p.main:match('%.typ$') then
+            payload.warning = warning_text(source_warning, payload.warning)
+          end
+          if not vim.api.nvim_buf_is_valid(buffer) or vim.api.nvim_buf_get_name(buffer) ~= file then
+            payload.word = vim.NIL
+            payload.warning = warning_text(payload.warning, 'Source identity changed during navigation; using the compiler line anchor.')
+          end
           local page_info = payload.page and string.format(' (page %s)', payload.page) or ''
           local warn_part, info_part = split_navigation_diagnostic(payload.warning)
           if warn_part then
@@ -765,72 +781,47 @@ local function forward(allow_launch)
           else
             log_entry('INFO', 'position resolved' .. page_info, context)
           end
-          deliver(p.pdf, result.stdout, id, source, source_error, allow_launch, true)
+          deliver(p.pdf, vim.json.encode(payload), id, source, source_error, allow_launch, true)
         end
         if p.main:match('%.typ$') then
-          cancel_resolution = require('pdfterm.typst').resolve(p, file, row + 1, byte, resolved)
+          project.after_build(p, function()
+            if alive(id) then
+              cancel_resolution = require('pdfterm.typst').resolve(p, file, row + 1, byte, resolved)
+            else
+              release_point(point)
+            end
+          end)
         else
-          local mapped, unavailable
-          if document then
-            mapped, unavailable = anchors.forward(document, buffer, row, byte)
-          elseif vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer) then
-            local line_text = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ''
-            mapped = {
-              file = file, line = row + 1, column = vim.fn.strchars(line_text:sub(1, byte)) + 1, coarse = true,
-              warning = 'Compiled source unavailable; using the requested compiler line if available.',
-            }
-          end
-          if not mapped then
+          if not column then
             release_point(point)
-            local fallback = allow_launch
-              and 'Source navigation unavailable; opening PDF at page 1 without source positioning.'
-              or 'Source navigation unavailable; PDF position unchanged.'
-            local msg = allow_launch and (warning_text(fallback, unavailable) or fallback)
-              or (unavailable or fallback)
-            warn(msg, context)
+            warn(fallback, context)
             if allow_launch then
               open_pdf(p.pdf, id, source, source_error, true, true)
             end
             return
           end
-          if point.boundary or #position == 0 or position[3].invalid then
-            mapped.coarse = true
-            mapped.warning = point.boundary
-              and 'Source cursor is a line boundary; using a best-guess compiled line.'
-              or 'Source cursor anchor was deleted or unloaded before navigation; using a best-guess compiled line.'
-          end
           local argv = command({
-            p.pdf, '--synctex-view', mapped.file, '--line', tostring(mapped.line),
-            '--column', tostring(mapped.column), '--synctex-best-guess',
+            p.pdf, '--synctex-view', file, '--line', tostring(row + 1),
+            '--column', tostring(column), '--synctex-best-guess',
           })
-          if mapped.source_snapshot then
-            vim.list_extend(argv, { '--source-snapshot', mapped.source_snapshot })
-          end
-          if mapped.coarse then argv[#argv + 1] = '--synctex-anchor' end
-          cancel_resolution = project.run(argv, p.cwd, 11000, function(result)
-            if alive(id) and result.code == 0 then
-              local payload = vim.json.decode(result.stdout)
-              payload.warning = warning_text(mapped.warning, payload.warning)
-              result.stdout = vim.json.encode(payload)
-            end
-            resolved(result)
-          end)
+          if coarse then argv[#argv + 1] = '--synctex-anchor' end
+          cancel_resolution = project.run(argv, p.cwd, 11000, resolved)
         end
       end
-      if options.compile or p.main:match('%.typ$') then
+      if options.compile and not p.main:match('%.typ$') then
         project.build(p, id, function(result)
           if result.code == 0 then
-            resolve(result.source_document)
+            resolve()
           else
             release_point(point)
           end
         end)
       else
-        resolve(document)
+        resolve()
       end
     end
     ready(function()
-      with_saved_project(buffer, file, id, navigate, header)
+      with_saved_project(buffer, file, id, navigate)
     end, true)
   end)
 end
@@ -907,7 +898,6 @@ function M.setup(opts)
     end
   end
   local group = vim.api.nvim_create_augroup('pdfterm', { clear = true })
-  anchors.setup(group)
   install_mappings()
   vim.api.nvim_create_user_command('PdfTermOpen', function(args)
     M.open(args.args ~= '' and args.args or nil)

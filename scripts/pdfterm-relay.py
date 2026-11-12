@@ -15,10 +15,19 @@ def relay(mode, path, incoming=None, outgoing=None):
     stopping = threading.Event()
     listener = None
 
+    def write_all(payload):
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            written = outgoing.write(view[offset:])
+            if not written:
+                raise OSError('relay stream closed during write')
+            offset += written
+        outgoing.flush()
+
     def send(identifier, kind, data=b''):
         with writing:
-            outgoing.write(struct.pack('!II', identifier, kind) + data)
-            outgoing.flush()
+            write_all(struct.pack('!II', identifier, kind) + data)
 
     def forget(identifier, notify=False):
         with lock:
@@ -111,8 +120,7 @@ def relay(mode, path, incoming=None, outgoing=None):
             listener.bind(path)
             os.chmod(path, 0o600)
             listener.listen(4)
-            outgoing.write(b'READY\n')
-            outgoing.flush()
+            write_all(b'READY\n')
             threading.Thread(target=accept, daemon=True).start()
         elif mode != 'connect':
             raise ValueError('invalid relay mode')

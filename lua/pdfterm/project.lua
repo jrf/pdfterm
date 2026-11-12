@@ -1,5 +1,6 @@
 -- Project builds are serialized; navigation generations begin at user intent.
 local M = {}
+local saved_source = require('pdfterm.source')
 local generation, builds, processes = 0, {}, {}
 
 function M.current(id)
@@ -104,7 +105,7 @@ local function root_source(source, current_source)
     assert(not visited[identity], 'pdfterm: cyclic TeX root directive at ' .. source)
     visited[identity] = true
     local text, reason = current_source
-    if text == nil then text, reason = require('pdfterm.source').read_input(source) end
+    if text == nil then text, reason = saved_source.read_header(source, 65536) end
     current_source = nil
     assert(text, 'pdfterm: cannot read TeX root source: ' .. tostring(reason))
     local target, examined = nil, 0
@@ -142,7 +143,7 @@ end
 -- This is a literal source graph, not a TeX interpreter. In particular, macro
 -- filenames, conditionals, search paths and catcode changes are not evaluated.
 local function tex_includes(path, text)
-  if text == nil then text = require('pdfterm.source').read_input(path) end
+  if text == nil then text = saved_source.read_input(path) end
   if not text then
     return { inputs = {} }
   end
@@ -329,28 +330,78 @@ local function tex_includes(path, text)
   return { inputs = inputs, document = document }
 end
 
+local include_cache, root_cache = {}, {}
+
+local function saved_includes(path)
+  local revision = saved_source.saved_revision(vim.uv.fs_stat(path))
+  local cached = include_cache[path]
+  if revision and cached and vim.deep_equal(cached.revision, revision) then
+    return cached.node, true
+  end
+  -- A stable byte read can be cached even when UTF-8 validation rejects it.
+  -- Failed or concurrently truncated reads have no revision and remain uncached.
+  local text, _, read_revision = saved_source.read_input(path)
+  local node = text and tex_includes(path, text) or { inputs = {} }
+  local stable = read_revision ~= nil
+  include_cache[path] = stable and { revision = read_revision, node = node } or nil
+  return node, stable
+end
+
+local function root_dependency(path)
+  return { identity = vim.uv.fs_realpath(path) or false,
+    revision = saved_source.saved_revision(vim.uv.fs_stat(path)) or false }
+end
+
 local function automatic_root(source, configured_cwd, current_source)
-  local target = vim.uv.fs_realpath(source)
+  local home = vim.uv.os_homedir()
+  home = home and (vim.uv.fs_realpath(home) or home)
+  local key = source .. '\0' .. (configured_cwd or '')
+  local cached = current_source == nil and root_cache[key] or nil
+  if cached and cached.home == home then
+    local valid = true
+    for path, value in pairs(cached.dependencies) do
+      if not vim.deep_equal(value, root_dependency(path)) then valid = false; break end
+    end
+    if valid then return cached.root end
+  end
+  local dependencies, cacheable = {}, current_source == nil
+  local function identity(path)
+    local value = root_dependency(path)
+    if dependencies[path] and not vim.deep_equal(dependencies[path], value) then cacheable = false end
+    dependencies[path] = value
+    return value.identity or nil
+  end
+  local function remember(root)
+    if current_source == nil then
+      root_cache[key] = cacheable and { root = root, home = home, dependencies = dependencies } or nil
+    end
+    return root
+  end
+  local target = identity(source)
   local unsaved = target == nil and current_source ~= nil
   target = target or unsaved_identity(source) or source
   local function included(path)
-    local identity = vim.uv.fs_realpath(path)
-    if identity or not unsaved then return identity end
+    local resolved = identity(path)
+    if resolved or not unsaved then return resolved end
     -- A new child can already have a literal owner before its first write.
     return unsaved_identity(path) == target and target or nil
   end
-  local home = vim.uv.os_homedir()
-  home = home and (vim.uv.fs_realpath(home) or home)
   local parsed, directories = {}, {}
   local function scan(path)
-    local identity = vim.uv.fs_realpath(path) or (unsaved and path == target and target or nil)
-    if not identity then
+    local resolved = identity(path) or (unsaved and path == target and target or nil)
+    if not resolved then
       return nil
     end
-    if not parsed[identity] then
-      parsed[identity] = tex_includes(identity, identity == target and current_source or nil)
+    if not parsed[resolved] then
+      if resolved == target and current_source ~= nil then
+        parsed[resolved] = tex_includes(resolved, current_source)
+      else
+        local stable
+        parsed[resolved], stable = saved_includes(resolved)
+        cacheable = cacheable and stable
+      end
     end
-    return parsed[identity], identity
+    return parsed[resolved], resolved
   end
   local function owns(candidate)
     local root, identity = scan(candidate)
@@ -386,13 +437,14 @@ local function automatic_root(source, configured_cwd, current_source)
   end
   local directory = vim.fs.dirname(source)
   while directory do
-    local identity = vim.uv.fs_realpath(directory) or directory
-    if directories[identity] then
+    local directory_identity = identity(directory) or directory
+    if directories[directory_identity] then
       break
     end
-    directories[identity] = true
+    directories[directory_identity] = true
     local owners, seen = {}, {}
     local entries = vim.uv.fs_scandir(directory)
+    if not entries then cacheable = false end
     if entries then
       while true do
         local name = vim.uv.fs_scandir_next(entries)
@@ -401,7 +453,7 @@ local function automatic_root(source, configured_cwd, current_source)
         end
         if name:match('%.tex$') then
           local candidate = vim.fs.normalize(directory .. '/' .. name)
-          local canonical = vim.uv.fs_realpath(candidate)
+          local canonical = identity(candidate)
           if canonical and not seen[canonical] then
             seen[canonical] = true
             if owns(canonical) then
@@ -424,9 +476,13 @@ local function automatic_root(source, configured_cwd, current_source)
         'pdfterm: multiple TeX roots include ' .. source .. ': ' .. table.concat(owners, ', ')
           .. '; select one with :PdfTermMain or project.main'
       )
-      return owners[1]
+      return remember(owners[1])
     end
-    if identity == home or vim.uv.fs_stat(directory .. '/.git') or vim.uv.fs_stat(directory .. '/.jj') then
+    -- Track absent boundaries too: creating one must invalidate an outer root.
+    identity(directory .. '/.git')
+    identity(directory .. '/.jj')
+    if directory_identity == home or dependencies[directory .. '/.git'].revision
+      or dependencies[directory .. '/.jj'].revision then
       break
     end
     local parent = vim.fs.dirname(directory)
@@ -435,48 +491,7 @@ local function automatic_root(source, configured_cwd, current_source)
     end
     directory = parent
   end
-  return source
-end
-
-function M.sources(main, cwd)
-  cwd = cwd or vim.fs.dirname(main)
-  local pending, visited, sources = { main }, {}, {}
-  while #pending > 0 do
-    local path = table.remove(pending)
-    path = vim.uv.fs_realpath(path) or vim.fs.normalize(vim.fn.fnamemodify(path, ':p'))
-    if not visited[path] then
-      visited[path] = true
-      sources[#sources + 1] = path
-      for _, name in ipairs(tex_includes(path).inputs) do
-        if not vim.startswith(name, '/') then name = cwd .. '/' .. name end
-        local child = not name:match('%.tex$') and vim.uv.fs_realpath(name .. '.tex') or nil
-        child = child or vim.uv.fs_realpath(name)
-        if child and not visited[child] then pending[#pending + 1] = child end
-      end
-    end
-  end
-  return sources
-end
-
-function M.source_info(project, callback)
-  return M.run(
-    { project.executable, project.pdf, '--synctex-source-info' },
-    project.cwd,
-    10000,
-    function(result)
-      if result.code ~= 0 then
-        callback(nil, vim.trim(result.stderr))
-        return
-      end
-      local ok, info = pcall(vim.json.decode, result.stdout)
-      if not ok or type(info) ~= 'table' or type(info.pdf) ~= 'string'
-        or type(info.revision) ~= 'table' or type(info.inputs) ~= 'table' then
-        callback(nil, 'invalid compiled source metadata')
-        return
-      end
-      callback(info)
-    end
-  )
+  return remember(source)
 end
 
 function M.describe(config, main, current_source)
@@ -526,9 +541,12 @@ function M.describe(config, main, current_source)
   return { main = source, pdf = pdf, cwd = cwd, build = argv }
 end
 
-function M.build(project, id, callback)
-  if not M.current(id) then return end
-  local job = { project = project, id = id, callback = callback }
+function M.build(project, id, callback, waiters)
+  if not M.current(id) then
+    for _, waiter in ipairs(waiters or {}) do waiter() end
+    return
+  end
+  local job = { project = project, id = id, callback = callback, waiters = waiters }
   local active = builds[project.cwd] or builds[project.pdf]
   if active then
     active.pending = job
@@ -536,8 +554,6 @@ function M.build(project, id, callback)
   end
   builds[project.cwd], builds[project.pdf] = job, job
   local tail, scheduled, completed = '', false, false
-  local tracked = project.executable and project.main and project.main:match('%.tex$')
-  local source = tracked and require('pdfterm.source') or nil
   local notification = { id = 'pdfterm.build.' .. id, title = 'pdfterm: ' .. vim.fs.basename(project.pdf) }
   local function append(data)
     tail = (tail .. data:sub(-2000)):sub(-2000)
@@ -565,53 +581,28 @@ function M.build(project, id, callback)
       )
     end
     if callback and M.current(id) then callback(result) end
-    if pending then M.build(pending.project, pending.id, pending.callback) end
+    if pending then
+      local merged = job.waiters or {}
+      for _, waiter in ipairs(pending.waiters or {}) do merged[#merged + 1] = waiter end
+      M.build(pending.project, pending.id, pending.callback, #merged > 0 and merged or nil)
+    elseif job.waiters then
+      for _, waiter in ipairs(job.waiters) do waiter() end
+    end
   end
   local function obsolete()
     if job.closed then return true end
     if M.current(id) then return false end
-    if job.capture then source.publish(job.capture, nil); job.capture = nil end
     finish({ code = 1, stdout = '', stderr = 'navigation cancelled' }, nil, true)
     return true
   end
-  local function tracking_failure(error, result)
-    if job.closed then return end
-    if job.capture then source.publish(job.capture, nil) end
-    append('\nsource tracking: ' .. tostring(error))
-    finish(
-      { code = 1, stdout = result and result.stdout or '', stderr = 'source tracking: ' .. tostring(error) },
-      'Source tracking failed'
-    )
-  end
-  local function begin(info)
+  local function begin()
     if obsolete() then return end
-    if source then
-      local ok, capture = pcall(function()
-        if info then source.ensure(project, info) end
-        local inputs = M.sources(project.main, project.cwd)
-        vim.list_extend(inputs, info and info.inputs or {})
-        return source.capture(project, inputs)
-      end)
-      if not ok then tracking_failure(capture); return end
-      job.capture = capture
-    end
     show('Compiling…', vim.log.levels.INFO)
+    -- Notifications can synchronously cancel or supersede this build.
     if obsolete() then return end
     M.run(project.build, project.cwd, 120000, function(result)
       if job.closed then return end
-      if not source or result.code ~= 0 then
-        if source and job.capture then source.publish(job.capture, nil) end
-        finish(result)
-        return
-      end
-      M.source_info(project, function(published, error)
-        if job.closed then return end
-        if not published then tracking_failure(error, result); return end
-        local ok, document = pcall(source.publish, job.capture, published)
-        if not ok then tracking_failure(document, result); return end
-        result.source_document = document
-        finish(result)
-      end)
+      finish(result)
     end, function(data)
       append(data)
       if scheduled then return end
@@ -622,26 +613,25 @@ function M.build(project, id, callback)
       end, 100)
     end)
   end
-  if source and vim.uv.fs_stat(project.pdf) then
-    M.source_info(project, function(info, error)
-      if obsolete() then return end
-      if not info then tracking_failure(error); return end
-      begin(info)
-    end)
-  else
-    begin()
+  begin()
+end
+
+function M.after_build(project, callback)
+  local active = builds[project.cwd] or builds[project.pdf]
+  if not active then
+    callback()
+    return
   end
+  active.waiters = active.waiters or {}
+  active.waiters[#active.waiters + 1] = callback
 end
 
 function M.close()
   M.next()
   for _, job in pairs(builds) do
     job.pending = nil
+    job.waiters = nil
     job.closed = true
-    if job.capture then
-      require('pdfterm.source').publish(job.capture, nil)
-      job.capture = nil
-    end
   end
   for process in pairs(processes) do
     vim.uv.kill(-process.pid, 9)

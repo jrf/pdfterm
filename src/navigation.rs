@@ -7,9 +7,9 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     thread::{self, JoinHandle},
 };
 
@@ -22,7 +22,7 @@ pub(crate) struct Coordinator {
     pub next_request_id: u64,
     // The retained resolver validates each displayed revision, including reloads.
     pub source_maps: HashMap<PathBuf, String>,
-    pub source_snapshots: HashMap<PathBuf, SourceState>,
+    pub best_guess: HashSet<PathBuf>,
 }
 impl Coordinator {
     pub fn new() -> Self {
@@ -33,23 +33,11 @@ impl Coordinator {
             flash: None,
             next_request_id: 1,
             source_maps: HashMap::new(),
-            source_snapshots: HashMap::new(),
+            best_guess: HashSet::new(),
         }
     }
 }
 
-pub(crate) struct SourceState {
-    pub revision: DocumentRevision,
-    pub snapshot: Option<PathBuf>,
-    pub best_guess: bool,
-}
-impl SourceState {
-    pub fn snapshot_for_revision(&self, revision: DocumentRevision) -> Option<&Path> {
-        (self.revision == revision)
-            .then_some(self.snapshot.as_deref())
-            .flatten()
-    }
-}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardStage {
     AwaitingDocument,
@@ -57,18 +45,13 @@ pub(crate) enum ForwardStage {
 }
 pub(crate) struct PendingForward {
     pub request: synctex::ForwardRequest,
-    pub document_revision: Option<DocumentRevision>,
-    pub source_state: Option<SourceState>,
     pub reply: crate::ipc::ForwardReply,
     pub deadline: std::time::Instant,
     pub stage: ForwardStage,
 }
 impl PendingForward {
     pub fn check_revision(&self) -> io::Result<()> {
-        match self.document_revision {
-            Some(revision) => revision.check(&self.request.pdf),
-            None => self.request.revision.check(&self.request.pdf),
-        }
+        self.request.revision.check(&self.request.pdf)
     }
 }
 pub(crate) struct PendingFlash {
@@ -79,17 +62,12 @@ pub(crate) struct PendingFlash {
     pub expires_at: Option<std::time::Instant>,
 }
 
-pub(crate) enum InverseStage {
-    HitTest,
-    Resolving,
-}
 pub(crate) struct PendingInverse {
     pub document_id: DocumentId,
     pub page: u32,
     pub request_id: u64,
     pub revision: DocumentRevision,
     pub operation: Operation,
-    pub stage: InverseStage,
 }
 impl Drop for PendingInverse {
     fn drop(&mut self) {
@@ -106,7 +84,6 @@ pub(crate) struct InverseTask {
     pub radius: u32,
     pub editor: Editor,
     pub inverse_search: Option<String>,
-    pub source_snapshot: Option<PathBuf>,
     pub best_guess: bool,
     pub operation: Operation,
 }
@@ -136,31 +113,15 @@ impl InverseTask {
                 self.click.synctex
             }
         };
-        let discovered_snapshot = if self.source_snapshot.is_none() && self.inverse_search.is_none()
-        {
-            self.editor
-                .source_snapshot(&self.path, self.revision, &self.operation)?
-        } else {
-            None
-        };
-        let source_snapshot = self
-            .source_snapshot
-            .as_deref()
-            .or(discovered_snapshot.as_deref());
         let mut result = if let Some(endpoint) = &self.inverse_search {
             crate::typst::resolve_inverse(endpoint, self.revision.pdf, point, &self.operation)?
         } else {
-            let pdf = std::path::absolute(&self.path)?;
-            let snapshot = source_snapshot
-                .map(|path| crate::source_snapshot::SourceSnapshot::load(path, &pdf))
-                .transpose()?;
             synctex::resolve_inverse_with_cache(
-                &pdf,
+                &self.path,
                 point,
                 word,
                 self.radius,
                 &self.operation,
-                snapshot.as_ref(),
                 self.best_guess,
                 cache,
             )?
@@ -186,17 +147,8 @@ impl InverseTask {
         }
         self.operation.check()?;
         self.revision.check(&self.path)?;
-        self.editor.deliver(
-            &result.location,
-            &self.operation,
-            Some(crate::editor::SourceDocument {
-                pdf: &self.path,
-                revision: self.revision.pdf,
-                document_revision: self.revision,
-                source_snapshot,
-                warning: result.warning.as_deref(),
-            }),
-        )?;
+        self.editor
+            .deliver(&result.location, &self.operation, result.warning.as_deref())?;
         Ok(result)
     }
 }
@@ -206,6 +158,7 @@ pub(crate) struct NavigationWorker {
     queued: Receiver<InverseTask>,
     pub replies: Receiver<InverseReply>,
     thread: Option<JoinHandle<()>>,
+    operation: Option<Operation>,
 }
 impl NavigationWorker {
     pub fn new() -> Self {
@@ -229,26 +182,31 @@ impl NavigationWorker {
             queued,
             replies,
             thread: Some(thread),
+            operation: None,
         }
     }
-    pub fn submit(&self, task: InverseTask) -> io::Result<()> {
+    pub fn submit(&mut self, task: InverseTask) -> io::Result<()> {
         let requests = self.requests.as_ref().expect("live worker");
+        if let Some(previous) = self.operation.replace(task.operation.clone()) {
+            previous.cancel();
+        }
         let mut task = task;
         loop {
             if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+                task.operation.cancel();
                 return Err(io::Error::other("navigation worker stopped"));
             }
             match requests.try_send(task) {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(latest)) => {
-                    // The UI already cancels the superseded active request.
                     // Replace its queued successor instead of losing this click.
                     if let Ok(obsolete) = self.queued.try_recv() {
                         obsolete.operation.cancel();
                     }
                     task = latest;
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(TrySendError::Disconnected(stopped)) => {
+                    stopped.operation.cancel();
                     return Err(io::Error::other("navigation worker stopped"));
                 }
             }
@@ -257,12 +215,14 @@ impl NavigationWorker {
 }
 impl Drop for NavigationWorker {
     fn drop(&mut self) {
+        if let Some(operation) = self.operation.take() {
+            operation.cancel();
+        }
         while let Ok(task) = self.queued.try_recv() {
             task.operation.cancel();
         }
         self.requests.take();
-        // Drain completions while shutting down so the bounded reply queue
-        // cannot keep the worker alive. Active operations have a hard deadline.
+        // Drain completions so the bounded reply queue cannot block the join.
         if let Some(thread) = self.thread.take() {
             while !thread.is_finished() {
                 let _ = self
@@ -281,6 +241,7 @@ mod tests {
         fs,
         io::{Read, Write},
         os::unix::{fs::PermissionsExt, net::UnixStream},
+        path::Path,
         process::Command,
         time::{Duration, Instant},
     };
@@ -346,7 +307,6 @@ mod tests {
                         .unwrap()
                         .into(),
                 ),
-                source_snapshot: None,
                 best_guess: false,
                 operation: Operation::new(Duration::from_secs(5)),
             }
@@ -383,7 +343,7 @@ mod tests {
             }
         }
         fn stalled_worker(&self) -> (NavigationWorker, Operation, UnixStream) {
-            let worker = NavigationWorker::new();
+            let mut worker = NavigationWorker::new();
             let completed = self.task(1);
             completed.operation.cancel();
             worker.submit(completed).unwrap();
@@ -407,21 +367,23 @@ mod tests {
     #[test]
     fn inverse_burst_replaces_canceled_queue_and_only_delivers_latest_click() {
         let harness = InverseHarness::new();
-        let (worker, active, stalled) = harness.stalled_worker();
-        active.cancel();
+        let (mut worker, active, stalled) = harness.stalled_worker();
+        assert!(!active.is_cancelled());
 
         let queued = harness.task(3);
         let obsolete = queued.operation.clone();
         worker.submit(queued).unwrap();
+        assert!(active.is_cancelled());
         let replacement = harness.task(4);
         let mut operation = replacement.operation.clone();
         worker.submit(replacement).unwrap();
         assert!(obsolete.is_cancelled());
         for request_id in 5..=12 {
-            operation.cancel();
             let latest = harness.task(request_id);
-            operation = latest.operation.clone();
+            let replacement = latest.operation.clone();
             worker.submit(latest).unwrap();
+            assert!(operation.is_cancelled());
+            operation = replacement;
         }
         drop(stalled);
 
@@ -471,16 +433,15 @@ mod tests {
     #[test]
     fn inverse_shutdown_discards_queued_work_and_drains_blocked_completions() {
         let harness = InverseHarness::new();
-        let (worker, active, stalled) = harness.stalled_worker();
+        let (mut worker, active, stalled) = harness.stalled_worker();
         let queued = harness.task(3);
         let operation = queued.operation.clone();
         worker.submit(queued).unwrap();
-        // Coordinator drops PendingInverse before the worker.
-        active.cancel();
+        assert!(active.is_cancelled());
         let started = Instant::now();
         drop(worker);
         drop(stalled);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_millis(500));
         assert!(operation.is_cancelled());
         assert!(
             matches!(harness.map.socket.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
@@ -491,33 +452,139 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_authority_requires_the_full_revision_independently_of_mode() {
-        let directory = tempfile::tempdir().unwrap();
-        let pdf = directory.path().join("document.pdf");
-        fs::write(&pdf, b"stable document revision").unwrap();
-        let revision = DocumentRevision::read(&pdf).unwrap();
-        let snapshot = directory.path().join("manifest.json");
-        fs::write(pdf.with_extension("synctex"), b"new companion revision").unwrap();
-        let reloaded = DocumentRevision::read(&pdf).unwrap();
-        assert_eq!(revision.pdf, reloaded.pdf);
-        assert_ne!(revision, reloaded);
-        for best_guess in [false, true] {
-            let state = SourceState {
-                revision,
-                snapshot: Some(snapshot.clone()),
-                best_guess,
+    fn standalone_inverse_shutdown_cancels_active_work_without_pending_inverse() {
+        let harness = InverseHarness::new();
+        let mut worker = NavigationWorker::new();
+        let task = harness.task(1);
+        let operation = task.operation.clone();
+        worker.submit(task).unwrap();
+        let mut stalled = InverseHarness::accept(&harness.map);
+        assert_eq!(InverseHarness::read(&mut stalled)["x"].as_f64(), Some(1.));
+        assert!(!operation.is_cancelled());
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(operation.is_cancelled());
+        let mut byte = [0];
+        assert_eq!(stalled.read(&mut byte).unwrap(), 0);
+        assert!(
+            matches!(harness.editor.socket.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn native_source_cpu_work_is_superseded_and_joined_on_shutdown() {
+        let harness = InverseHarness::new();
+        let contents = format!(
+            "\\documentclass{{beamer}}\n\
+             \\newcommand{{\\eqA}}{{\\begin{{equation}}x\\end{{equation}}}}\n\
+             \\newcommand{{\\eqB}}{{\\eqA{{}} \\eqA{{}} \\eqA{{}} \\eqA{{}}}}\n\
+             \\newcommand{{\\eqC}}{{\\eqB{{}} \\eqB{{}} \\eqB{{}} \\eqB{{}}}}\n\
+             \\newcommand{{\\eqD}}{{\\eqC{{}} \\eqC{{}} \\eqC{{}} \\eqC{{}}}}\n\
+             \\newcommand{{\\unused}}{{\n{}}}\n\
+             \\begin{{document}}\n\\begin{{frame}}[shrink=1]\n\
+             Quartz \\eqD{{}} zephyr.\nCopper nimbus.\n\
+             \\end{{frame}}\n\\end{{document}}\n",
+            "Neutral filler prose remains unrelated to selected target.\n".repeat(18_644),
+        );
+        fs::write(harness.directory.path().join("navigation.tex"), &contents).unwrap();
+        let output = crate::process::output(
+            Command::new("pdflatex")
+                .current_dir(harness.directory.path())
+                .args([
+                    "-interaction=batchmode",
+                    "-halt-on-error",
+                    "-synctex=1",
+                    "navigation.tex",
+                ]),
+            &Operation::new(Duration::from_secs(30)),
+        )
+        .expect("pdflatex is required for the native CPU cancellation fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let cpu_task = |request_id| {
+            let mut task = harness.task(request_id);
+            task.editor = Editor::None;
+            task.inverse_search = None;
+            task.word_precision = true;
+            task.radius = 10;
+            task.click.synctex = synctex::InversePoint {
+                page: 1,
+                x: 35.,
+                y_from_top: 265.,
+                page_height_pt: 272.126,
             };
-            assert_eq!(
-                state.snapshot_for_revision(revision),
-                Some(snapshot.as_path())
-            );
-            assert!(state.snapshot_for_revision(reloaded).is_none());
-        }
+            task.click.text = Ok(Some(("Copper nimbus.".into(), 0)));
+            task
+        };
+        let expected_line = contents
+            .lines()
+            .position(|line| line == "Copper nimbus.")
+            .unwrap() as u32
+            + 1;
+        let control = cpu_task(0).resolve(None).unwrap();
+        assert_eq!(control.location.line, expected_line);
+        assert!(control.location.precise);
+
+        let mut worker = NavigationWorker::new();
+        let active = cpu_task(1);
+        let superseded = active.operation.clone();
+        worker.submit(active).unwrap();
+        thread::sleep(Duration::from_millis(5));
+        assert!(
+            worker.replies.is_empty(),
+            "CPU fixture completed before supersession"
+        );
+        let mut latest = cpu_task(2);
+        latest.word_precision = false;
+        let started = Instant::now();
+        worker.submit(latest).unwrap();
+        let canceled = worker
+            .replies
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(canceled.request_id, 1);
+        assert!(
+            matches!(canceled.result, Err(error) if error.kind() == io::ErrorKind::Interrupted)
+        );
+        assert!(superseded.is_cancelled());
+        let latest = worker
+            .replies
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(latest.request_id, 2);
+        let location = latest.result.unwrap().location;
+        assert_eq!(
+            Path::new(&location.file),
+            harness
+                .directory
+                .path()
+                .join("navigation.tex")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(!location.precise);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let active = cpu_task(3);
+        let shutdown = active.operation.clone();
+        worker.submit(active).unwrap();
+        thread::sleep(Duration::from_millis(5));
+        assert!(
+            worker.replies.is_empty(),
+            "CPU fixture completed before shutdown"
+        );
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(shutdown.is_cancelled());
     }
 
     #[test]
     fn failed_pdf_text_preserves_real_synctex_navigation_and_stale_pairs_fail() {
-        use sha2::Digest;
         let _native = crate::pdf::pdfium_test_lock();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -565,7 +632,6 @@ mod tests {
             radius: 4,
             editor: Editor::None,
             inverse_search: None,
-            source_snapshot: None,
             best_guess: false,
             operation: Operation::default(),
         };
@@ -594,41 +660,6 @@ mod tests {
                 .contains("best-guess navigation")
         );
 
-        let cache = root.join("compiled-source");
-        fs::create_dir(&cache).unwrap();
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(cache.join("1.txt"), contents).unwrap();
-        let manifest = cache.join("manifest.json");
-        use std::fmt::Write as _;
-        let mut digest = String::with_capacity(64);
-        for byte in sha2::Sha256::digest(contents.as_bytes()) {
-            write!(&mut digest, "{byte:02x}").unwrap();
-        }
-        fs::write(
-            &manifest,
-            serde_json::to_vec(&serde_json::json!({
-                "pdf": task.path,
-                "revision": task.revision,
-                "cwd": root,
-                "main": source,
-                "files": std::collections::BTreeMap::from([(source.clone(), "1.txt")]),
-                "digests": std::collections::BTreeMap::from([(source.clone(), digest)]),
-                "warnings": {},
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        task.source_snapshot = Some(manifest);
-        task.best_guess = false;
-        let captured = task.resolve(Some(&mut synctex_cache)).unwrap();
-        assert_eq!(captured.location.line, 6);
-        assert!(!captured.warning.unwrap().contains("best-guess navigation"));
-        // Explicit opt-in must not downgrade required captured-text failures.
-        task.best_guess = true;
-        fs::write(cache.join("1.txt"), "changed cached source\n").unwrap();
-        assert!(
-            matches!(task.resolve(Some(&mut synctex_cache)), Err(error) if error.to_string().contains("cached source changed"))
-        );
         // A changed companion must reject before any source refinement/delivery.
         fs::remove_file(task.path.with_extension("synctex.gz")).unwrap();
         assert!(
