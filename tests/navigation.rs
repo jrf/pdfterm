@@ -58,31 +58,7 @@ fn unmapped_hook_does_not_resolve_to_a_separate_comma_and_arrow() {
          {\"page\":1,\"x\":140.46785,\"y\":147.14844}\n",
     )
     .unwrap();
-    // Reuse bounded process-group supervision while supplying the fixture's batch stdin.
-    let output = process::output(
-        Command::new("sh")
-            .args([
-                "-c",
-                "exec \"$1\" \"$2\" --synctex-edit-batch < \"$3\"",
-                "hook-probe",
-            ])
-            .arg(env!("CARGO_BIN_EXE_pdfterm"))
-            .arg(&pdf)
-            .arg(points)
-            .env("XDG_CONFIG_HOME", directory.path().join("cli-config")),
-        &Operation::default(),
-    )
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let results: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let results = run_inverse_batch(directory.path(), &pdf, &points, false);
     assert_eq!(results.len(), 3);
     for (result, line) in results.iter().zip([5, 5, 6]) {
         assert_eq!(result["ok"], true, "{result}");
@@ -257,6 +233,47 @@ fn inverse_starred_subparagraph_heading_keeps_its_word_column() {
     }
 }
 
+/// Compiles a fixture painting `word` first in a generated heading, then as a body
+/// literal, and checks each occurrence's (line, precise) in strict and best-guess modes.
+fn assert_generated_heading_word(
+    contents: &str,
+    word: &str,
+    [generated, body]: [(u32, bool); 2],
+    case: &str,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let (pdf, source) = compile_out_of_tree_fixture(directory.path(), contents);
+    let source = source.canonicalize().unwrap();
+    let mut occurrences = painted_word_occurrences(&pdf, word);
+    occurrences.sort_by(|a, b| a.1.y_from_top.total_cmp(&b.1.y_from_top));
+    assert_eq!(occurrences.len(), 2, "{case}");
+    for ((hit, center), (line, precise)) in occurrences.into_iter().zip([generated, body]) {
+        for point in [hit, center] {
+            for best_guess in [false, true] {
+                let result = synctex::resolve_inverse(
+                    &pdf,
+                    point,
+                    Some((word, 0)),
+                    3,
+                    &Operation::default(),
+                    best_guess,
+                )
+                .unwrap();
+                assert_eq!(
+                    Path::new(&result.location.file).canonicalize().unwrap(),
+                    source
+                );
+                assert_eq!(
+                    result.location.line, line,
+                    "{case}, best={best_guess}: {result:?}"
+                );
+                assert_eq!(result.location.byte_column, 0, "{result:?}");
+                assert_eq!(result.location.precise, precise, "{result:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn inverse_generated_section_number_does_not_borrow_next_lines_literal() {
     for (numbering, word) in [
@@ -279,44 +296,18 @@ fn inverse_generated_section_number_does_not_borrow_next_lines_literal() {
                  {word} Copper.\n\
                  \\end{{document}}\n"
             );
-            let directory = tempfile::tempdir().unwrap();
-            let (pdf, source) = compile_out_of_tree_fixture(directory.path(), &contents);
-            let source = source.canonicalize().unwrap();
             let heading_line = contents
                 .lines()
                 .position(|row| row.starts_with("\\section"))
                 .unwrap() as u32
                 + u32::from(separator == "\n")
                 + title.lines().count() as u32;
-            let mut occurrences = painted_word_occurrences(&pdf, word);
-            occurrences.sort_by(|a, b| a.1.y_from_top.total_cmp(&b.1.y_from_top));
-            assert_eq!(occurrences.len(), 2, "{word}, {title}");
-            for ((hit, center), generated) in occurrences.into_iter().zip([true, false]) {
-                for point in [hit, center] {
-                    for best_guess in [false, true] {
-                        let result = synctex::resolve_inverse(
-                            &pdf,
-                            point,
-                            Some((word, 0)),
-                            3,
-                            &Operation::default(),
-                            best_guess,
-                        )
-                        .unwrap();
-                        assert_eq!(
-                            Path::new(&result.location.file).canonicalize().unwrap(),
-                            source
-                        );
-                        assert_eq!(
-                            result.location.line,
-                            heading_line + u32::from(!generated),
-                            "{word}, {title}, best={best_guess}: {result:?}"
-                        );
-                        assert_eq!(result.location.byte_column, 0, "{result:?}");
-                        assert_eq!(result.location.precise, !generated, "{result:?}");
-                    }
-                }
-            }
+            assert_generated_heading_word(
+                &contents,
+                word,
+                [(heading_line, false), (heading_line + 1, true)],
+                &format!("{word}, {title}"),
+            );
         }
     }
 }
@@ -330,38 +321,7 @@ fn inverse_generated_contents_heading_does_not_borrow_next_lines_literal() {
                     \\tableofcontents\n\
                     Contents Wazzit.\n\
                     \\end{document}\n";
-    let directory = tempfile::tempdir().unwrap();
-    let (pdf, source) = compile_out_of_tree_fixture(directory.path(), contents);
-    let source = source.canonicalize().unwrap();
-    let mut occurrences = painted_word_occurrences(&pdf, "Contents");
-    occurrences.sort_by(|a, b| a.1.y_from_top.total_cmp(&b.1.y_from_top));
-    assert_eq!(occurrences.len(), 2);
-    for ((hit, center), generated) in occurrences.into_iter().zip([true, false]) {
-        for point in [hit, center] {
-            for best_guess in [false, true] {
-                let result = synctex::resolve_inverse(
-                    &pdf,
-                    point,
-                    Some(("Contents", 0)),
-                    3,
-                    &Operation::default(),
-                    best_guess,
-                )
-                .unwrap();
-                assert_eq!(
-                    Path::new(&result.location.file).canonicalize().unwrap(),
-                    source
-                );
-                assert_eq!(
-                    result.location.line,
-                    5 + u32::from(!generated),
-                    "best={best_guess}: {result:?}"
-                );
-                assert_eq!(result.location.byte_column, 0, "{result:?}");
-                assert_eq!(result.location.precise, !generated, "{result:?}");
-            }
-        }
-    }
+    assert_generated_heading_word(contents, "Contents", [(5, false), (6, true)], "contents");
 }
 
 #[test]
@@ -387,39 +347,16 @@ fn inverse_unbraced_section_keeps_shared_native_anchor_for_duplicate_numbers() {
              1 Wazzit neighboring laterword end.\n\
              \\end{{document}}\n"
         );
-        let directory = tempfile::tempdir().unwrap();
-        let (pdf, source) = compile_out_of_tree_fixture(directory.path(), &contents);
-        let source = source.canonicalize().unwrap();
-        let mut occurrences = painted_word_occurrences(&pdf, "1");
-        occurrences.sort_by(|a, b| a.1.y_from_top.total_cmp(&b.1.y_from_top));
-        assert_eq!(occurrences.len(), 2);
-        for ((hit, center), generated) in occurrences.into_iter().zip([true, false]) {
-            for point in [hit, center] {
-                for best_guess in [false, true] {
-                    let result = synctex::resolve_inverse(
-                        &pdf,
-                        point,
-                        Some(("1", 0)),
-                        3,
-                        &Operation::default(),
-                        best_guess,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        Path::new(&result.location.file).canonicalize().unwrap(),
-                        source
-                    );
-                    let direct_body = !generated && title == "C";
-                    assert_eq!(
-                        result.location.line,
-                        heading_line + u32::from(direct_body),
-                        "best={best_guess}: {result:?}"
-                    );
-                    assert_eq!(result.location.byte_column, 0, "{result:?}");
-                    assert_eq!(result.location.precise, direct_body, "{result:?}");
-                }
-            }
-        }
+        let direct_body = title == "C";
+        assert_generated_heading_word(
+            &contents,
+            "1",
+            [
+                (heading_line, false),
+                (heading_line + u32::from(direct_body), direct_body),
+            ],
+            &format!("{prelude:?}, {prefix:?}, {title}"),
+        );
     }
 }
 
@@ -438,33 +375,26 @@ fn cli_wrapped_paragraph_first_word_keeps_its_source_line_and_column() {
     let directory = tempfile::tempdir().unwrap();
     let (pdf, source) = compile_out_of_tree_fixture(directory.path(), contents);
     let source = source.canonicalize().unwrap();
-    let mut requests = String::new();
-    let mut expected = Vec::new();
-    for (word, precise) in [
+    let words = [
         ("brambling", true),
         ("nudges", true),
         ("porridges", true),
         ("teakettle", true),
         // The preceding macro argument still requires separate scope proof.
         ("turnip", false),
-    ] {
+    ];
+    let painted = painted_word_points(&pdf, words.map(|(word, _)| word));
+    let mut points = Vec::new();
+    let mut expected = Vec::new();
+    for ((word, precise), (hit, center)) in words.into_iter().zip(painted) {
         let (line, row) = contents
             .lines()
             .enumerate()
             .find(|(_, row)| row.contains(word))
             .unwrap();
         let byte = row.find(word).unwrap();
-        let (hit, center) = painted_word_points(&pdf, word);
         for point in [hit, center] {
-            requests.push_str(
-                &serde_json::json!({
-                    "page": point.page,
-                    "x": point.x,
-                    "y": point.y_from_top,
-                })
-                .to_string(),
-            );
-            requests.push('\n');
+            points.push(point);
             expected.push((
                 word,
                 line + usize::from(precise),
@@ -473,30 +403,9 @@ fn cli_wrapped_paragraph_first_word_keeps_its_source_line_and_column() {
             ));
         }
     }
-    let points = directory.path().join("points.jsonl");
-    fs::write(&points, requests).unwrap();
+    let requests = write_inverse_requests(directory.path(), &points);
     for best_guess in [false, true] {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exec \"$@\" < \"$0\""])
-            .arg(&points)
-            .arg(env!("CARGO_BIN_EXE_pdfterm"))
-            .arg(&pdf)
-            .arg("--synctex-edit-batch")
-            .env("XDG_CONFIG_HOME", directory.path().join("cli-config"));
-        if best_guess {
-            cmd.arg("--synctex-best-guess");
-        }
-        let output = process::output(&mut cmd, &Operation::default()).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let results: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let results = run_inverse_batch(directory.path(), &pdf, &requests, best_guess);
         assert_eq!(results.len(), expected.len());
         for (result, &(word, line, byte, precise)) in results.iter().zip(&expected) {
             assert_eq!(result["ok"], true, "{word}, best={best_guess}: {result}");
@@ -544,8 +453,14 @@ fn inverse_multiline_formatting_keeps_each_words_source_column() {
         } else {
             &["Snazzles", "frobnitz", "inherently", "wazzit", "blimble"]
         };
-        for &word in words {
-            let (hit, center) = painted_word_points(&pdf, word);
+        let painted = with_painted_pdf(&pdf, |painted| {
+            words
+                .iter()
+                .map(|word| painted.occurrences(word))
+                .collect::<Vec<_>>()
+        });
+        for (&word, occurrences) in words.iter().zip(painted) {
+            let (hit, center) = sole_occurrence(word, occurrences);
             let (line, row) = contents
                 .lines()
                 .enumerate()
@@ -663,9 +578,9 @@ The final literal sentence closes the caption.
 \end{document}
 ";
     let (pdf, source) = compile_out_of_tree_fixture(&root, contents);
-    let caption = painted_word_points(&pdf, "CaptionCopper").1;
-    let legend = painted_word_points(&pdf, "LegendQuartz").1;
-    let outside = painted_word_points(&pdf, "OutsideAmber").1;
+    let [caption, legend, outside] =
+        painted_word_points(&pdf, ["CaptionCopper", "LegendQuartz", "OutsideAmber"])
+            .map(|(_, center)| center);
     assert_eq!(caption.page, legend.page);
     assert!(legend.y_from_top < caption.y_from_top);
     let cursor = |word: &str| {
@@ -805,8 +720,8 @@ fn inverse_subfigure_images_use_native_geometry_without_caption_or_sibling_confu
 ";
     let (pdf, source) = compile_out_of_tree_fixture(&root, contents);
     let source = source.canonicalize().unwrap();
-    // These helpers finish their native workers before the next PDFium transaction.
-    let captions = [
+    // This helper finishes its native worker before the next PDFium transaction.
+    let caption_words = [
         "CaptionCopper",
         "CaptionNickel",
         "CaptionSilver",
@@ -815,8 +730,9 @@ fn inverse_subfigure_images_use_native_geometry_without_caption_or_sibling_confu
         "CaptionIndigo",
         "CaptionViolet",
         "CaptionQuartz",
-    ]
-    .map(|word| (word, painted_word_points(&pdf, word).1));
+    ];
+    let mut caption_points = painted_word_points(&pdf, caption_words).into_iter();
+    let captions = caption_words.map(|word| (word, caption_points.next().unwrap().1));
     let (boxes, page_height) = {
         let _native = pdfium_test_lock();
         let pdfium = Pdfium::default();
@@ -937,9 +853,9 @@ fn forward_fancyvrb_literal_captions_keep_their_original_line_regions() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let (pdf, source) = compile_out_of_tree_fixture(&root, &contents);
-        let copper = painted_word_points(&pdf, "LiteralCopper").1;
-        let nickel = painted_word_points(&pdf, "LiteralNickel").1;
-        let caption = painted_word_points(&pdf, "VisibleCopper").1;
+        let [copper, nickel, caption] =
+            painted_word_points(&pdf, ["LiteralCopper", "LiteralNickel", "VisibleCopper"])
+                .map(|(_, center)| center);
         let _native = pdfium_test_lock();
         for (line, column, expected) in [(8, 10, copper), (9, 1, nickel), (15, 1, caption)] {
             let request = synctex::resolve_forward_with_library(
@@ -983,8 +899,11 @@ Independent Copper owner
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let (pdf, source) = compile_out_of_tree_fixture(&root, contents);
-    assert_eq!(painted_word_occurrences(&pdf, "needle").len(), 3);
-    let expected = painted_word_points(&pdf, "Copper").1;
+    let [needles, copper] = with_painted_pdf(&pdf, |painted| {
+        ["needle", "Copper"].map(|word| painted.occurrences(word))
+    });
+    assert_eq!(needles.len(), 3);
+    let expected = sole_occurrence("Copper", copper).1;
     assert_eq!(expected.page, 2);
     let _native = pdfium_test_lock();
     for (prefix, selected) in [(r"\Discard{", "zeta"), (r"\DiscardUntil ", "gamma")] {
@@ -1034,12 +953,14 @@ Independent Copper owner
     let control_source = root.join("control.tex");
     fs::write(&control_source, "Independent NickelControl owner\n\n").unwrap();
     let (pdf, source) = compile_out_of_tree_fixture(&root, contents);
+    let [printed, copper, control] = with_painted_pdf(&pdf, |painted| {
+        ["gamma", "Copper", "NickelControl"].map(|word| painted.occurrences(word))
+    });
     // Only \Duplicate prints gamma; the queried \Discard argument prints none.
-    let printed = painted_word_occurrences(&pdf, "gamma");
     assert_eq!(printed.len(), 1);
     assert_eq!(printed[0].1.page, 2);
-    let copper = painted_word_points(&pdf, "Copper").1;
-    let expected_control = painted_word_points(&pdf, "NickelControl").1;
+    let copper = sole_occurrence("Copper", copper).1;
+    let expected_control = sole_occurrence("NickelControl", control).1;
     let _native = pdfium_test_lock();
     let query_line = contents
         .lines()
@@ -1286,11 +1207,13 @@ needle alpha beta gamma delta epsilon zeta
             &main_with_opening
         };
         let (pdf, _) = compile_out_of_tree_fixture(&root, fixture_main);
+        let [printed, copper, control] = with_painted_pdf(&pdf, |painted| {
+            ["gamma", "Copper", "NickelControl"].map(|word| painted.occurrences(word))
+        });
         // Neither captured argument prints gamma; only the main's Duplicate does.
-        let printed = painted_word_occurrences(&pdf, "gamma");
         assert_eq!(printed.len(), 1);
         assert_eq!(printed[0].1.page, 2);
-        let copper = painted_word_points(&pdf, "Copper").1;
+        let copper = sole_occurrence("Copper", copper).1;
         let (index, body) = contents
             .lines()
             .enumerate()
@@ -1298,7 +1221,7 @@ needle alpha beta gamma delta epsilon zeta
             .unwrap();
         let line = index as u32 + 1;
         let column = body.find("gamma").unwrap() as u32 + 1;
-        let expected_control = painted_word_points(&pdf, "NickelControl").1;
+        let expected_control = sole_occurrence("NickelControl", control).1;
         let _native = pdfium_test_lock();
         let coarse = resolve_forward(&pdf, &included, line, column).unwrap();
         assert_eq!(coarse.page, 2);
@@ -1422,10 +1345,12 @@ Cover page.
         let (pdf, main_source) =
             compile_out_of_tree_fixture(&root, &main.replace("% inherited binding", binding));
         assert_ne!(main_source, included);
-        let printed = painted_word_occurrences(&pdf, "gamma");
+        let [printed, control] = with_painted_pdf(&pdf, |painted| {
+            ["gamma", "NickelControl"].map(|word| painted.occurrences(word))
+        });
         assert_eq!(printed.len(), printed_count, "{name}");
         assert!(printed.iter().all(|(_, point)| point.page == 2), "{name}");
-        let expected_control = painted_word_points(&pdf, "NickelControl").1;
+        let expected_control = sole_occurrence("NickelControl", control).1;
         let column = contents.lines().next().unwrap().find("gamma").unwrap() as u32 + 1;
         let _native = pdfium_test_lock();
         for best_guess in [false, true] {
@@ -1476,7 +1401,7 @@ LiteralCopper keeps ordinary body context available.
     let (pdf, main_source) = compile_out_of_tree_fixture(&root, main);
     // These are genuine printed controls, not evidence that hashes trace TeX.
     // The existing multi-overlay fixture separately pins pages 2, 3, and 4.
-    for word in [
+    let words = [
         "LiteralCopper",
         "LayoutNickel",
         "LabelQuartz",
@@ -1484,8 +1409,8 @@ LiteralCopper keeps ordinary body context available.
         "RevealNebula",
         "ShiftCobalt",
         "ItemSilver",
-    ] {
-        let printed = painted_word_points(&pdf, word).1;
+    ];
+    for (word, (_, printed)) in words.into_iter().zip(painted_word_points(&pdf, words)) {
         assert_eq!(printed.page, 2, "{word}");
         let (index, row) = contents
             .lines()
@@ -1773,37 +1698,178 @@ fn real_synctex_revisions_failed_hit_tests_and_coarse_refinement() {
     assert!(result.is_err());
 }
 
+/// Runs `passes` pdflatex passes from `root`, writing `build/deck.pdf` and its SyncTeX.
+fn compile_to_build_deck(root: &Path, source: &Path, passes: u32) -> PathBuf {
+    for pass in 1..=passes {
+        let output = process::output(
+            Command::new("pdflatex")
+                .current_dir(root)
+                .args([
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-synctex=1",
+                    "-output-directory=build",
+                    "-jobname=deck",
+                ])
+                .arg(source),
+            &Operation::new(Duration::from_secs(30)),
+        )
+        .expect("pdflatex is required for the real SyncTeX fixture");
+        assert!(
+            output.status.success(),
+            "pass {pass}/{passes}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    root.join("build/deck.pdf")
+}
+
 fn compile_out_of_tree_fixture(root: &Path, contents: &str) -> (PathBuf, PathBuf) {
+    compile_out_of_tree_fixture_passes(root, contents, 1)
+}
+
+/// Cross-reference fixtures need a second pass before printed numbers settle.
+fn compile_out_of_tree_fixture_passes(
+    root: &Path,
+    contents: &str,
+    passes: u32,
+) -> (PathBuf, PathBuf) {
     fs::create_dir(root.join("sources")).unwrap();
     fs::create_dir(root.join("build")).unwrap();
     let source = root.join("sources/original.tex");
     fs::write(&source, contents).unwrap();
-    let output = process::output(
-        Command::new("pdflatex")
-            .current_dir(root)
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=1",
-                "-output-directory=build",
-                "-jobname=deck",
-            ])
-            .arg(&source),
-        &Operation::new(Duration::from_secs(30)),
-    )
-    .expect("pdflatex is required for the real SyncTeX fixture");
+    (compile_to_build_deck(root, &source, passes), source)
+}
+
+/// Writes one `--synctex-edit-batch` click request per point to `dir/points.jsonl`.
+fn write_inverse_requests(dir: &Path, points: &[synctex::InversePoint]) -> PathBuf {
+    let mut requests = String::new();
+    for point in points {
+        requests.push_str(
+            &serde_json::json!({
+                "page": point.page,
+                "x": point.x,
+                "y": point.y_from_top,
+            })
+            .to_string(),
+        );
+        requests.push('\n');
+    }
+    let path = dir.join("points.jsonl");
+    fs::write(&path, requests).unwrap();
+    path
+}
+
+/// Runs the real CLI inverse batch with `requests` on stdin and parses each JSONL reply.
+fn run_inverse_batch(
+    dir: &Path,
+    pdf: &Path,
+    requests: &Path,
+    best_guess: bool,
+) -> Vec<serde_json::Value> {
+    // Reuse bounded process-group supervision while supplying the fixture's batch stdin.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "exec \"$@\" < \"$0\""])
+        .arg(requests)
+        .arg(env!("CARGO_BIN_EXE_pdfterm"))
+        .arg(pdf)
+        .arg("--synctex-edit-batch")
+        .env("XDG_CONFIG_HOME", dir.join("cli-config"));
+    if best_guess {
+        cmd.arg("--synctex-best-guess");
+    }
+    let output = process::output(&mut cmd, &Operation::default()).unwrap();
     assert!(
         output.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stderr)
     );
-    (root.join("build/deck.pdf"), source)
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
-fn painted_word_occurrences(
-    pdf: &Path,
-    word: &str,
-) -> Vec<(synctex::InversePoint, synctex::InversePoint)> {
+/// Hit-test point and rectangle-center point of one painted word occurrence.
+type PaintedOccurrence = (synctex::InversePoint, synctex::InversePoint);
+
+/// One renderer and its prepared page keys, shared by every lookup in one fixture PDF.
+struct PaintedFixture {
+    worker: RenderWorker,
+    revision: DocumentRevision,
+    keys: Vec<(RenderKey, u32, u32)>,
+    last_request_id: u64,
+}
+
+impl PaintedFixture {
+    fn next_request_id(&mut self) -> u64 {
+        self.last_request_id += 1;
+        self.last_request_id
+    }
+
+    fn occurrences(&mut self, word: &str) -> Vec<PaintedOccurrence> {
+        let search_id = self.next_request_id();
+        self.worker
+            .find_visible(
+                1,
+                search_id,
+                self.revision,
+                word.to_owned(),
+                self.keys.clone(),
+            )
+            .unwrap();
+        let WorkerMessage::VisibleMatches {
+            request_id,
+            matches,
+            ..
+        } = message(&self.worker)
+        else {
+            panic!("expected painted fixture word matches");
+        };
+        assert_eq!(request_id, search_id, "superseded lookup for {word}");
+        assert!(!matches.is_empty(), "fixture word {word} must be painted");
+        let mut occurrences = Vec::with_capacity(matches.len());
+        for matched in &matches {
+            let left = matched.rects.iter().map(|rect| rect.left).min().unwrap();
+            let right = matched.rects.iter().map(|rect| rect.right).max().unwrap();
+            let top = matched.rects.iter().map(|rect| rect.top).min().unwrap();
+            let bottom = matched.rects.iter().map(|rect| rect.bottom).max().unwrap();
+            let mut points = [None, None];
+            for (index, (x, y)) in [matched.hit, ((left + right) / 2, (top + bottom) / 2)]
+                .into_iter()
+                .enumerate()
+            {
+                let point_id = self.next_request_id();
+                self.worker
+                    .page_point(self.revision, point_id, x, y, matched.key);
+                let WorkerMessage::PagePoint {
+                    request_id, result, ..
+                } = message(&self.worker)
+                else {
+                    panic!("expected fixture glyph point");
+                };
+                assert_eq!(request_id, point_id, "stale glyph point for {word}");
+                let click = result.unwrap();
+                let (context, offset) = click.text.unwrap().expect("fixture glyph must be hit");
+                assert!(
+                    context
+                        .match_indices(word)
+                        .any(|(start, word)| { (start..start + word.len()).contains(&offset) }),
+                    "hit offset {offset} in {context:?} is not inside fixture word {word}"
+                );
+                points[index] = Some(click.synctex);
+            }
+            occurrences.push((points[0].unwrap(), points[1].unwrap()));
+        }
+        occurrences
+    }
+}
+
+/// Opens `pdf` once under the PDFium fixture lock for a batch of painted-word lookups.
+/// `lookups` runs while that lock is held: only call `occurrences` there and make
+/// test assertions on the returned values, after the native document is closed.
+fn with_painted_pdf<T>(pdf: &Path, lookups: impl FnOnce(&mut PaintedFixture) -> T) -> T {
     let _native = pdfium_test_lock();
     let worker = RenderWorker::spawn(1, pdf.to_owned(), None);
     let (pages, _, _) = worker.wait_until_ready().unwrap();
@@ -1831,54 +1897,43 @@ fn painted_word_occurrences(
         };
         keys.push((key, frame.width, frame.height));
     }
-    worker
-        .find_visible(1, 1, revision, word.to_owned(), keys)
-        .unwrap();
-    let WorkerMessage::VisibleMatches { matches, .. } = message(&worker) else {
-        panic!("expected painted fixture word matches");
+    let mut fixture = PaintedFixture {
+        worker,
+        revision,
+        keys,
+        last_request_id: 0,
     };
-    assert!(!matches.is_empty(), "fixture word {word} must be painted");
-    let mut occurrences = Vec::with_capacity(matches.len());
-    for matched in &matches {
-        let left = matched.rects.iter().map(|rect| rect.left).min().unwrap();
-        let right = matched.rects.iter().map(|rect| rect.right).max().unwrap();
-        let top = matched.rects.iter().map(|rect| rect.top).min().unwrap();
-        let bottom = matched.rects.iter().map(|rect| rect.bottom).max().unwrap();
-        let mut points = [None, None];
-        for (index, (x, y)) in [matched.hit, ((left + right) / 2, (top + bottom) / 2)]
-            .into_iter()
-            .enumerate()
-        {
-            worker.page_point(revision, index as u64 + 2, x, y, matched.key);
-            let WorkerMessage::PagePoint { result, .. } = message(&worker) else {
-                panic!("expected fixture glyph point");
-            };
-            let click = result.unwrap();
-            let (context, offset) = click.text.unwrap().expect("fixture glyph must be hit");
-            assert!(
-                context
-                    .match_indices(word)
-                    .any(|(start, word)| { (start..start + word.len()).contains(&offset) }),
-                "hit offset {offset} in {context:?} is not inside fixture word {word}"
-            );
-            points[index] = Some(click.synctex);
-        }
-        occurrences.push((points[0].unwrap(), points[1].unwrap()));
-    }
-    // Finish native document destruction before releasing the fixture lock.
-    worker.close(1);
-    worker.page_point(revision, 4, 0, 0, matches[0].key);
-    let WorkerMessage::PagePoint { result, .. } = message(&worker) else {
+    let found = lookups(&mut fixture);
+    // Finish native document destruction before releasing the fixture lock. Close
+    // has no reply, so the next queued command acknowledges it; the closed-document
+    // answer itself is asserted by the real SyncTeX lifecycle test.
+    fixture.worker.close(1);
+    let drain_id = fixture.next_request_id();
+    let drain_key = fixture.keys[0].0;
+    fixture
+        .worker
+        .page_point(revision, drain_id, 0, 0, drain_key);
+    let WorkerMessage::PagePoint { request_id, .. } = message(&fixture.worker) else {
         panic!("expected closed native fixture reply");
     };
-    assert!(result.is_err());
-    occurrences
+    assert_eq!(request_id, drain_id);
+    found
 }
 
-fn painted_word_points(pdf: &Path, word: &str) -> (synctex::InversePoint, synctex::InversePoint) {
-    let mut occurrences = painted_word_occurrences(pdf, word);
+fn painted_word_occurrences(pdf: &Path, word: &str) -> Vec<PaintedOccurrence> {
+    with_painted_pdf(pdf, |painted| painted.occurrences(word))
+}
+
+fn sole_occurrence(word: &str, mut occurrences: Vec<PaintedOccurrence>) -> PaintedOccurrence {
     assert_eq!(occurrences.len(), 1, "fixture word {word} must be unique");
     occurrences.pop().unwrap()
+}
+
+/// Unique painted occurrence of each word, looked up through one fixture renderer.
+fn painted_word_points<const N: usize>(pdf: &Path, words: [&str; N]) -> [PaintedOccurrence; N] {
+    let mut found =
+        with_painted_pdf(pdf, |painted| words.map(|word| painted.occurrences(word))).into_iter();
+    words.map(|word| sole_occurrence(word, found.next().unwrap()))
 }
 
 #[test]
@@ -1907,8 +1962,9 @@ SecondSilver is another distinctive sentence here.
         "\\title{Wrong GlobalAurora Metadata Example}\n",
     )
     .unwrap();
-    for (word, page) in [("EarlyZephyr", 2), ("LateNebula", 3)] {
-        let (point, center) = painted_word_points(&pdf, word);
+    let [early, late, (global, _)] =
+        painted_word_points(&pdf, ["EarlyZephyr", "LateNebula", "GlobalAurora"]);
+    for (word, page, (point, center)) in [("EarlyZephyr", 2, early), ("LateNebula", 3, late)] {
         assert_eq!(point.page, page);
         let inverse = synctex::resolve_inverse(
             &pdf,
@@ -1944,11 +2000,10 @@ SecondSilver is another distinctive sentence here.
         assert!(!coarse.location.precise);
         assert!(coarse.warning.is_none());
     }
-    let (point, _) = painted_word_points(&pdf, "GlobalAurora");
-    assert_eq!(point.page, 1);
+    assert_eq!(global.page, 1);
     let metadata = synctex::resolve_inverse(
         &pdf,
-        point,
+        global,
         Some(("GlobalAurora Metadata Example", 0)),
         4,
         &Operation::default(),
@@ -1982,7 +2037,8 @@ Printed prose is visible here.
 ";
     let directory = tempfile::tempdir().unwrap();
     let (pdf, source) = compile_out_of_tree_fixture(directory.path(), contents);
-    let (point, _) = painted_word_points(&pdf, "Zephyr");
+    let [(point, _), display, printed] =
+        painted_word_points(&pdf, ["Zephyr", "DisplayAmber", "PrintedCopper"]);
     let coarse =
         synctex::resolve_inverse(&pdf, point, None, 4, &Operation::default(), false).unwrap();
     let inverse = synctex::resolve_inverse(
@@ -2012,8 +2068,7 @@ Printed prose is visible here.
         (0, 1, 1)
     );
     assert!(inverse.warning.is_none());
-    for word in ["DisplayAmber", "PrintedCopper"] {
-        let (point, _) = painted_word_points(&pdf, word);
+    for (word, (point, _)) in [("DisplayAmber", display), ("PrintedCopper", printed)] {
         let inverse = synctex::resolve_inverse(
             &pdf,
             point,
@@ -2144,7 +2199,7 @@ fn cli_saved_sources_preserve_relative_input_identity_across_directories() {
     )
     .unwrap();
     let pdf = build.join("main.pdf");
-    let (point, _) = painted_word_points(&pdf, "Copper");
+    let [(point, _)] = painted_word_points(&pdf, ["Copper"]);
 
     let forward = process::output(
         Command::new(env!("CARGO_BIN_EXE_pdfterm"))
@@ -2259,26 +2314,7 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
                     \\end{thebibliography}\n\
                     \\end{document}\n";
     let directory = tempfile::tempdir().unwrap();
-    let (pdf, source) = compile_out_of_tree_fixture(directory.path(), contents);
-    let second_pass = process::output(
-        Command::new("pdflatex")
-            .current_dir(directory.path())
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=1",
-                "-output-directory=build",
-                "-jobname=deck",
-            ])
-            .arg(&source),
-        &Operation::new(Duration::from_secs(30)),
-    )
-    .expect("pdflatex is required for the real SyncTeX fixture");
-    assert!(
-        second_pass.status.success(),
-        "{}",
-        String::from_utf8_lossy(&second_pass.stdout)
-    );
+    let (pdf, source) = compile_out_of_tree_fixture_passes(directory.path(), contents, 2);
     let source = source.canonicalize().unwrap();
     let (sec_line_idx, sec_row) = contents
         .lines()
@@ -2375,7 +2411,38 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
     let short_alpha_utf16 = short_alpha_row[..short_alpha_byte].encode_utf16().count() + 1;
     let short_alpha_char = short_alpha_row[..short_alpha_byte].chars().count() + 1;
 
-    let sec_occurrences = painted_word_occurrences(&pdf, "section");
+    let [
+        sec_occurrences,
+        itm,
+        lit,
+        tbl_lit,
+        math,
+        fn_math,
+        page,
+        hdr,
+        fn_ftr,
+        cite_par,
+        cite_itm,
+        short_math,
+        short_alpha,
+    ] = with_painted_pdf(&pdf, |painted| {
+        [
+            "section",
+            "Item",
+            "check",
+            "tableword",
+            "77",
+            "66",
+            "99",
+            "98",
+            "97",
+            "73",
+            "74",
+            "85",
+            "\u{03b1}",
+        ]
+        .map(|word| painted.occurrences(word))
+    });
     let (sec_hit, sec_center) = sec_occurrences[0];
     let (hdr_sec_hit, hdr_sec_center) = sec_occurrences
         .iter()
@@ -2387,91 +2454,61 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
         .iter()
         .find(|(hit, _)| hit.page == 5)
         .expect("expected page-5 footnote section reference");
-    let (itm_hit, itm_center) = painted_word_points(&pdf, "Item");
-    let (lit_hit, lit_center) = painted_word_points(&pdf, "check");
-    let (tbl_lit_hit, tbl_lit_center) = painted_word_points(&pdf, "tableword");
-    let (math_hit, math_center) = painted_word_points(&pdf, "77");
-    let (fn_math_hit, fn_math_center) = painted_word_points(&pdf, "66");
-    let (page_hit, page_center) = painted_word_points(&pdf, "99");
-    let (hdr_hit, hdr_center) = painted_word_points(&pdf, "98");
-    let (fn_ftr_hit, fn_ftr_center) = painted_word_points(&pdf, "97");
-    let &(cite_par_hit, cite_par_center) = painted_word_occurrences(&pdf, "73")
+    let (itm_hit, itm_center) = sole_occurrence("Item", itm);
+    let (lit_hit, lit_center) = sole_occurrence("check", lit);
+    let (tbl_lit_hit, tbl_lit_center) = sole_occurrence("tableword", tbl_lit);
+    let (math_hit, math_center) = sole_occurrence("77", math);
+    let (fn_math_hit, fn_math_center) = sole_occurrence("66", fn_math);
+    let (page_hit, page_center) = sole_occurrence("99", page);
+    let (hdr_hit, hdr_center) = sole_occurrence("98", hdr);
+    let (fn_ftr_hit, fn_ftr_center) = sole_occurrence("97", fn_ftr);
+    let &(cite_par_hit, cite_par_center) = cite_par
         .iter()
         .find(|(hit, _)| hit.page == 6)
         .expect("expected page-6 paragraph-start citation");
-    let &(cite_itm_hit, cite_itm_center) = painted_word_occurrences(&pdf, "74")
+    let &(cite_itm_hit, cite_itm_center) = cite_itm
         .iter()
         .find(|(hit, _)| hit.page == 7)
         .expect("expected page-7 item-start citation");
-    let (short_math_hit, short_math_center) = painted_word_points(&pdf, "85");
-    let (short_alpha_hit, short_alpha_center) = painted_word_points(&pdf, "\u{03b1}");
-    let mut requests = String::new();
-    for point in [
-        sec_hit,
-        sec_center,
-        itm_hit,
-        itm_center,
-        lit_hit,
-        lit_center,
-        tbl_lit_hit,
-        tbl_lit_center,
-        math_hit,
-        math_center,
-        fn_math_hit,
-        fn_math_center,
-        page_hit,
-        page_center,
-        fn2_sec_hit,
-        fn2_sec_center,
-        hdr_hit,
-        hdr_center,
-        fn_ftr_hit,
-        fn_ftr_center,
-        cite_par_hit,
-        cite_par_center,
-        cite_itm_hit,
-        cite_itm_center,
-        short_math_hit,
-        short_math_center,
-        short_alpha_hit,
-        short_alpha_center,
-        hdr_sec_hit,
-        hdr_sec_center,
-    ] {
-        requests.push_str(
-            &serde_json::json!({
-                "page": point.page,
-                "x": point.x,
-                "y": point.y_from_top,
-            })
-            .to_string(),
-        );
-        requests.push('\n');
-    }
-    let points = directory.path().join("points.jsonl");
-    fs::write(&points, requests).unwrap();
+    let (short_math_hit, short_math_center) = sole_occurrence("85", short_math);
+    let (short_alpha_hit, short_alpha_center) = sole_occurrence("\u{03b1}", short_alpha);
+    let requests = write_inverse_requests(
+        directory.path(),
+        &[
+            sec_hit,
+            sec_center,
+            itm_hit,
+            itm_center,
+            lit_hit,
+            lit_center,
+            tbl_lit_hit,
+            tbl_lit_center,
+            math_hit,
+            math_center,
+            fn_math_hit,
+            fn_math_center,
+            page_hit,
+            page_center,
+            fn2_sec_hit,
+            fn2_sec_center,
+            hdr_hit,
+            hdr_center,
+            fn_ftr_hit,
+            fn_ftr_center,
+            cite_par_hit,
+            cite_par_center,
+            cite_itm_hit,
+            cite_itm_center,
+            short_math_hit,
+            short_math_center,
+            short_alpha_hit,
+            short_alpha_center,
+            hdr_sec_hit,
+            hdr_sec_center,
+        ],
+    );
     for best_guess in [false, true] {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exec \"$@\" < \"$0\""])
-            .arg(&points)
-            .arg(env!("CARGO_BIN_EXE_pdfterm"))
-            .arg(&pdf)
-            .arg("--synctex-edit-batch")
-            .env("XDG_CONFIG_HOME", directory.path().join("cli-config"));
-        if best_guess {
-            cmd.arg("--synctex-best-guess");
-        }
-        let output = process::output(&mut cmd, &Operation::default()).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let results: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let results = run_inverse_batch(directory.path(), &pdf, &requests, best_guess);
         assert_eq!(results.len(), 30);
         for (idx, (word, line, byte, utf16, ch)) in [
             (
@@ -2695,26 +2732,7 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
                            \\end{document}\n";
     let beamer_dir = tempfile::tempdir().unwrap();
     let (beamer_pdf, beamer_source) =
-        compile_out_of_tree_fixture(beamer_dir.path(), beamer_contents);
-    let beamer_second = process::output(
-        Command::new("pdflatex")
-            .current_dir(beamer_dir.path())
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=1",
-                "-output-directory=build",
-                "-jobname=deck",
-            ])
-            .arg(&beamer_source),
-        &Operation::new(Duration::from_secs(30)),
-    )
-    .expect("pdflatex is required for the real beamer SyncTeX fixture");
-    assert!(
-        beamer_second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&beamer_second.stdout)
-    );
+        compile_out_of_tree_fixture_passes(beamer_dir.path(), beamer_contents, 2);
     let beamer_source = beamer_source.canonicalize().unwrap();
     let (frame_ref_idx, frame_ref_row) = beamer_contents
         .lines()
@@ -2730,44 +2748,18 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
         .unwrap();
     let rep_ref_line = rep_ref_idx + 1;
     let rep_ref_byte = rep_ref_row.find("sec:frame").unwrap();
-    let (b_sec_hit, b_sec_center) = painted_word_occurrences(&beamer_pdf, "71")[0];
-    let (b_math_hit, b_math_center) = painted_word_points(&beamer_pdf, "88");
-    let mut beamer_requests = String::new();
-    for point in [b_sec_hit, b_sec_center, b_math_hit, b_math_center] {
-        beamer_requests.push_str(
-            &serde_json::json!({
-                "page": point.page,
-                "x": point.x,
-                "y": point.y_from_top,
-            })
-            .to_string(),
-        );
-        beamer_requests.push('\n');
-    }
-    let beamer_points = beamer_dir.path().join("points.jsonl");
-    fs::write(&beamer_points, beamer_requests).unwrap();
+    let [b_sec, b_math] = with_painted_pdf(&beamer_pdf, |painted| {
+        ["71", "88"].map(|word| painted.occurrences(word))
+    });
+    let (b_sec_hit, b_sec_center) = b_sec[0];
+    let (b_math_hit, b_math_center) = sole_occurrence("88", b_math);
+    let beamer_requests = write_inverse_requests(
+        beamer_dir.path(),
+        &[b_sec_hit, b_sec_center, b_math_hit, b_math_center],
+    );
     for best_guess in [false, true] {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exec \"$@\" < \"$0\""])
-            .arg(&beamer_points)
-            .arg(env!("CARGO_BIN_EXE_pdfterm"))
-            .arg(&beamer_pdf)
-            .arg("--synctex-edit-batch")
-            .env("XDG_CONFIG_HOME", beamer_dir.path().join("cli-config"));
-        if best_guess {
-            cmd.arg("--synctex-best-guess");
-        }
-        let output = process::output(&mut cmd, &Operation::default()).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let results: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let results =
+            run_inverse_batch(beamer_dir.path(), &beamer_pdf, &beamer_requests, best_guess);
         assert_eq!(results.len(), 4);
         for idx in [0, 1] {
             let result = &results[idx];
@@ -2824,32 +2816,16 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
                                     \\end{frame}\n\
                                     \\end{document}\n";
     let beamer_foot_dir = tempfile::tempdir().unwrap();
-    let (beamer_foot_pdf, beamer_foot_source) =
-        compile_out_of_tree_fixture(beamer_foot_dir.path(), beamer_footline_contents);
-    let beamer_foot_second = process::output(
-        Command::new("pdflatex")
-            .current_dir(beamer_foot_dir.path())
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=1",
-                "-output-directory=build",
-                "-jobname=deck",
-            ])
-            .arg(&beamer_foot_source),
-        &Operation::new(Duration::from_secs(30)),
-    )
-    .expect("pdflatex is required for the beamer footline SyncTeX fixture");
-    assert!(
-        beamer_foot_second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&beamer_foot_second.stdout)
-    );
-    let &(foot_first_1_hit, foot_first_1_center) = painted_word_occurrences(&beamer_foot_pdf, "1")
+    let (beamer_foot_pdf, _) =
+        compile_out_of_tree_fixture_passes(beamer_foot_dir.path(), beamer_footline_contents, 2);
+    let [foot_ones, foot_twos] = with_painted_pdf(&beamer_foot_pdf, |painted| {
+        ["1", "2"].map(|word| painted.occurrences(word))
+    });
+    let &(foot_first_1_hit, foot_first_1_center) = foot_ones
         .iter()
         .find(|(hit, _)| hit.page == 1)
         .expect("expected page-1 footline frame number 1");
-    let foot_twos: Vec<_> = painted_word_occurrences(&beamer_foot_pdf, "2")
+    let foot_twos: Vec<_> = foot_twos
         .into_iter()
         .filter(|(hit, _)| hit.page == 2)
         .collect();
@@ -2881,27 +2857,8 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
                                     \\end{frame}\n\
                                     \\end{document}\n";
     let beamer_head_dir = tempfile::tempdir().unwrap();
-    let (beamer_head_pdf, beamer_head_source) =
-        compile_out_of_tree_fixture(beamer_head_dir.path(), beamer_headline_contents);
-    let beamer_head_second = process::output(
-        Command::new("pdflatex")
-            .current_dir(beamer_head_dir.path())
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=1",
-                "-output-directory=build",
-                "-jobname=deck",
-            ])
-            .arg(&beamer_head_source),
-        &Operation::new(Duration::from_secs(30)),
-    )
-    .expect("pdflatex is required for the beamer headline SyncTeX fixture");
-    assert!(
-        beamer_head_second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&beamer_head_second.stdout)
-    );
+    let (beamer_head_pdf, _) =
+        compile_out_of_tree_fixture_passes(beamer_head_dir.path(), beamer_headline_contents, 2);
     let head_words = painted_word_occurrences(&beamer_head_pdf, "Headerword");
     let &(head_first_hit, head_first_center) = head_words
         .iter()
@@ -2924,27 +2881,8 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
                                  \\end{frame}\n\
                                  \\end{document}\n";
     let beamer_pause_dir = tempfile::tempdir().unwrap();
-    let (beamer_pause_pdf, beamer_pause_source) =
-        compile_out_of_tree_fixture(beamer_pause_dir.path(), beamer_pause_contents);
-    let beamer_pause_second = process::output(
-        Command::new("pdflatex")
-            .current_dir(beamer_pause_dir.path())
-            .args([
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-synctex=1",
-                "-output-directory=build",
-                "-jobname=deck",
-            ])
-            .arg(&beamer_pause_source),
-        &Operation::new(Duration::from_secs(30)),
-    )
-    .expect("pdflatex is required for the beamer pause SyncTeX fixture");
-    assert!(
-        beamer_pause_second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&beamer_pause_second.stdout)
-    );
+    let (beamer_pause_pdf, _) =
+        compile_out_of_tree_fixture_passes(beamer_pause_dir.path(), beamer_pause_contents, 2);
     let pause_ones = painted_word_occurrences(&beamer_pause_pdf, "1");
     let pause_p1: Vec<_> = pause_ones
         .iter()
@@ -2991,42 +2929,9 @@ fn synctex_inverse_reference_commands_select_label_argument_start() {
         ),
         (beamer_pause_dir.path(), &beamer_pause_pdf, pause_pts),
     ] {
-        let mut reqs = String::new();
-        for pt in &pts {
-            reqs.push_str(
-                &serde_json::json!({
-                    "page": pt.page,
-                    "x": pt.x,
-                    "y": pt.y_from_top,
-                })
-                .to_string(),
-            );
-            reqs.push('\n');
-        }
-        let pts_file = dir_path.join("points.jsonl");
-        fs::write(&pts_file, reqs).unwrap();
+        let pts_file = write_inverse_requests(dir_path, &pts);
         for best_guess in [false, true] {
-            let mut cmd = Command::new("sh");
-            cmd.args(["-c", "exec \"$@\" < \"$0\""])
-                .arg(&pts_file)
-                .arg(env!("CARGO_BIN_EXE_pdfterm"))
-                .arg(pdf_path)
-                .arg("--synctex-edit-batch")
-                .env("XDG_CONFIG_HOME", dir_path.join("cli-config"));
-            if best_guess {
-                cmd.arg("--synctex-best-guess");
-            }
-            let output = process::output(&mut cmd, &Operation::default()).unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let results: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
+            let results = run_inverse_batch(dir_path, pdf_path, &pts_file, best_guess);
             assert_eq!(results.len(), pts.len());
             for (idx, result) in results.iter().enumerate() {
                 assert_eq!(result["ok"], true, "best={best_guess} idx={idx}: {result}");
@@ -3094,28 +2999,7 @@ fn imported_and_local_zero_arg_prose_macros_refine_to_invocation_without_stealin
     fs::write(&body_file, body_contents).unwrap();
     fs::write(&main_file, main_contents).unwrap();
 
-    for _ in 0..2 {
-        let compile = process::output(
-            Command::new("pdflatex")
-                .current_dir(directory.path())
-                .args([
-                    "-interaction=nonstopmode",
-                    "-halt-on-error",
-                    "-synctex=1",
-                    "-output-directory=build",
-                    "-jobname=deck",
-                ])
-                .arg(&main_file),
-            &Operation::new(Duration::from_secs(30)),
-        )
-        .expect("pdflatex is required for the real imported macro fixture");
-        assert!(
-            compile.status.success(),
-            "{}",
-            String::from_utf8_lossy(&compile.stdout)
-        );
-    }
-    let pdf = build_dir.join("deck.pdf");
+    let pdf = compile_to_build_deck(directory.path(), &main_file, 2);
     let body_source = body_file.canonicalize().unwrap();
     let defs_source = defs_file.canonicalize().unwrap();
 
@@ -3182,7 +3066,10 @@ fn imported_and_local_zero_arg_prose_macros_refine_to_invocation_without_stealin
     let fig_utf16 = fig_row[..fig_byte].encode_utf16().count() + 1;
     let fig_char = fig_row[..fig_byte].chars().count() + 1;
 
-    let qx_occurrences = painted_word_occurrences(&pdf, "QX");
+    let [qx_occurrences, thm_occurrences, fig_occurrences, twos] =
+        with_painted_pdf(&pdf, |painted| {
+            ["QX", "Theorem", "Figure", "2"].map(|word| painted.occurrences(word))
+        });
     assert!(
         qx_occurrences.len() >= 14,
         "expected plain, wrapped, separate-line, and tied QX occurrences, found {}",
@@ -3195,7 +3082,6 @@ fn imported_and_local_zero_arg_prose_macros_refine_to_invocation_without_stealin
     let (tie1_hit, tie1_center) = qx_occurrences[8];
     let (tie2_hit, tie2_center) = qx_occurrences[9];
 
-    let thm_occurrences = painted_word_occurrences(&pdf, "Theorem");
     assert_eq!(
         thm_occurrences.len(),
         2,
@@ -3204,7 +3090,6 @@ fn imported_and_local_zero_arg_prose_macros_refine_to_invocation_without_stealin
     let (thm_hdr_hit, thm_hdr_center) = thm_occurrences[0];
     let (thm_body_hit, thm_body_center) = thm_occurrences[1];
 
-    let fig_occurrences = painted_word_occurrences(&pdf, "Figure");
     assert_eq!(
         fig_occurrences.len(),
         2,
@@ -3213,10 +3098,7 @@ fn imported_and_local_zero_arg_prose_macros_refine_to_invocation_without_stealin
     let (fig_hdr_hit, fig_hdr_center) = fig_occurrences[0];
     let (fig_body_hit, fig_body_center) = fig_occurrences[1];
 
-    let two_page1: Vec<_> = painted_word_occurrences(&pdf, "2")
-        .into_iter()
-        .filter(|(hit, _)| hit.page == 1)
-        .collect();
+    let two_page1: Vec<_> = twos.into_iter().filter(|(hit, _)| hit.page == 1).collect();
     assert_eq!(
         two_page1.len(),
         3,
@@ -3226,70 +3108,40 @@ fn imported_and_local_zero_arg_prose_macros_refine_to_invocation_without_stealin
     let (vspace_cite_hit, vspace_cite_center) = two_page1[1];
     let (index_cite_hit, index_cite_center) = two_page1[2];
 
-    let mut requests = String::new();
-    for point in [
-        plain_hit,
-        plain_center,
-        wrap_hit,
-        wrap_center,
-        sep_macro_hit,
-        sep_macro_center,
-        sep_lit_hit,
-        sep_lit_center,
-        tie1_hit,
-        tie1_center,
-        tie2_hit,
-        tie2_center,
-        thm_body_hit,
-        thm_body_center,
-        fig_body_hit,
-        fig_body_center,
-        thm_hdr_hit,
-        thm_hdr_center,
-        fig_hdr_hit,
-        fig_hdr_center,
-        hspace_cite_hit,
-        hspace_cite_center,
-        vspace_cite_hit,
-        vspace_cite_center,
-        index_cite_hit,
-        index_cite_center,
-    ] {
-        requests.push_str(
-            &serde_json::json!({
-                "page": point.page,
-                "x": point.x,
-                "y": point.y_from_top,
-            })
-            .to_string(),
-        );
-        requests.push('\n');
-    }
-    let points = directory.path().join("points.jsonl");
-    fs::write(&points, requests).unwrap();
+    let requests = write_inverse_requests(
+        directory.path(),
+        &[
+            plain_hit,
+            plain_center,
+            wrap_hit,
+            wrap_center,
+            sep_macro_hit,
+            sep_macro_center,
+            sep_lit_hit,
+            sep_lit_center,
+            tie1_hit,
+            tie1_center,
+            tie2_hit,
+            tie2_center,
+            thm_body_hit,
+            thm_body_center,
+            fig_body_hit,
+            fig_body_center,
+            thm_hdr_hit,
+            thm_hdr_center,
+            fig_hdr_hit,
+            fig_hdr_center,
+            hspace_cite_hit,
+            hspace_cite_center,
+            vspace_cite_hit,
+            vspace_cite_center,
+            index_cite_hit,
+            index_cite_center,
+        ],
+    );
 
     for best_guess in [false, true] {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exec \"$@\" < \"$0\""])
-            .arg(&points)
-            .arg(env!("CARGO_BIN_EXE_pdfterm"))
-            .arg(&pdf)
-            .arg("--synctex-edit-batch")
-            .env("XDG_CONFIG_HOME", directory.path().join("cli-config"));
-        if best_guess {
-            cmd.arg("--synctex-best-guess");
-        }
-        let output = process::output(&mut cmd, &Operation::default()).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let results: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let results = run_inverse_batch(directory.path(), &pdf, &requests, best_guess);
         assert_eq!(results.len(), 26);
         for (idx, (word, line, byte, utf16, ch)) in [
             ("QX", plain_line, plain_byte, plain_utf16, plain_char),
