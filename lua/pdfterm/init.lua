@@ -286,22 +286,66 @@ local function with_saved_project(buffer, file, id, callback)
   end
   callback(p)
 end
+-- Inverse search may replace only a normal, unlocked file window whose buffer
+-- :hide can keep; terminals, floats and special or preview windows stay intact.
+local function replaceable(window)
+  local shown = vim.api.nvim_win_get_buf(window)
+  local discards = vim.bo[shown].modified and vim.bo[shown].bufhidden:match('^[udw]')
+  return vim.api.nvim_win_get_config(window).relative == '' and vim.bo[shown].buftype == ''
+    and not vim.wo[window].winfixbuf and not vim.wo[window].previewwindow and not discards
+end
+
+-- Return a window showing the source without entering any other window: reuse
+-- one already showing it (current, then this tab, then any tab; floats only when
+-- focused), else replace the focused, previous or first replaceable window in
+-- this tab, else split below the first normal one. Callers target the returned
+-- window explicitly, since user autocmds may redirect focus once it is entered.
+local function show_source(buffer)
+  local current, tab = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
+  local reuse, rank = nil, 4
+  for _, window in ipairs(vim.fn.win_findbuf(buffer)) do
+    local candidate = window == current and 1
+      or vim.api.nvim_win_get_config(window).relative ~= '' and 4
+      or vim.api.nvim_win_get_tabpage(window) == tab and 2 or 3
+    if candidate < rank then reuse, rank = window, candidate end
+  end
+  if reuse then
+    return reuse
+  end
+  local candidates = { current, vim.fn.win_getid(vim.fn.winnr('#')) }
+  vim.list_extend(candidates, vim.api.nvim_tabpage_list_wins(tab))
+  local anchor
+  for _, window in ipairs(candidates) do
+    if window ~= 0 and replaceable(window) then
+      -- BufLeave can redirect :buffer even within nvim_win_call. Ignore
+      -- only that event for this swap, then restore the user's setting.
+      local eventignore = vim.o.eventignore
+      vim.opt.eventignore:append('BufLeave')
+      local ok, failure = pcall(vim.api.nvim_win_call, window, function()
+        vim.cmd('hide buffer ' .. buffer)
+      end)
+      vim.o.eventignore = eventignore
+      if not ok then error(failure, 0) end
+      return window
+    end
+    if not anchor and window ~= 0 and vim.api.nvim_win_get_config(window).relative == '' then
+      anchor = window
+    end
+  end
+  return vim.api.nvim_open_win(buffer, false, { split = 'below', win = anchor })
+end
+
 local function inverse(location)
   if exiting then
     return
   end
   local buffer = vim.fn.bufadd(location.file)
-  local window = vim.fn.win_findbuf(buffer)[1]
-  if window then
-    vim.api.nvim_set_current_win(window)
-  else
-    vim.cmd('hide buffer ' .. buffer)
-  end
-  assert(vim.api.nvim_get_current_buf() == buffer, 'pdfterm: source activation selected a different buffer')
-  local total_lines = vim.api.nvim_buf_line_count(0)
+  local window = show_source(buffer)
+  assert(vim.api.nvim_win_get_buf(window) == buffer, 'pdfterm: source activation selected a different buffer')
+  local total_lines = vim.api.nvim_buf_line_count(buffer)
   local line = math.max(1, math.min(location.line, total_lines))
-  local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ''
-  vim.api.nvim_win_set_cursor(0, { line, math.min(location.byte_column, #text) })
+  local text = vim.api.nvim_buf_get_lines(buffer, line - 1, line, false)[1] or ''
+  vim.api.nvim_win_set_cursor(window, { line, math.min(location.byte_column, #text) })
   local boundary_warn = (location.line < 1 or location.line > total_lines)
     and string.format('inverse target line %d is outside buffer bounds (1..%d)', location.line, total_lines)
     or nil
@@ -323,7 +367,10 @@ local function inverse(location)
   else
     log_entry('INFO', 'position matched', context)
   end
-  vim.cmd('normal! zvzz')
+  vim.api.nvim_win_call(window, function()
+    vim.cmd('normal! zvzz')
+  end)
+  vim.api.nvim_set_current_win(window)
   if (options or setup_options).focus_on_inverse then
     if remote_session() or not M._source_terminal then
       notify(
