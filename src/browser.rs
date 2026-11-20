@@ -16,6 +16,18 @@ const MAX_RECURSIVE_DEPTH: usize = 32;
 const MAX_RECURSIVE_PDFS: usize = 10_000;
 const MAX_RECURSIVE_VISITED: usize = 50_000;
 
+/// Avoids `Utf32Str::new` returning raw UTF-8 bytes when non-ASCII combining
+/// marks follow ASCII base characters (e.g. macOS NFD filenames).
+pub(crate) fn utf32_str<'a>(text: &'a str, buffer: &'a mut Vec<char>) -> Utf32Str<'a> {
+    if text.is_ascii() {
+        Utf32Str::Ascii(text.as_bytes())
+    } else {
+        buffer.clear();
+        buffer.extend(nucleo_matcher::chars::graphemes(text));
+        Utf32Str::Unicode(buffer)
+    }
+}
+
 #[derive(Debug)]
 pub struct BrowserEntry {
     pub name: String,
@@ -385,7 +397,7 @@ impl BrowserState {
                         .map(|name| name.to_string_lossy())
                         .unwrap_or_else(|| entry.name.as_str().into());
                     let basename_score =
-                        pattern.score(Utf32Str::new(basename.as_ref(), buffer), matcher);
+                        pattern.score(utf32_str(basename.as_ref(), buffer), matcher);
                     let score = basename_score.or_else(|| {
                         let relative_path = entry
                             .path
@@ -398,7 +410,7 @@ impl BrowserState {
                             })
                             .unwrap_or(&entry.path)
                             .to_string_lossy();
-                        pattern.score(Utf32Str::new(&relative_path, buffer), matcher)
+                        pattern.score(utf32_str(&relative_path, buffer), matcher)
                     })?;
                     let basename_lower = basename.to_lowercase();
                     let match_tier = if basename_lower == query {
@@ -456,7 +468,7 @@ impl BrowserState {
         } = &mut *fuzzy;
         indices.clear();
         for pattern in term_patterns.iter() {
-            let haystack = Utf32Str::new(value, buffer);
+            let haystack = utf32_str(value, buffer);
             let _ = pattern.indices(haystack, matcher, indices);
         }
         indices.sort_unstable();

@@ -9969,5 +9969,27 @@ mod tests {
             .unwrap();
         assert_eq!(multi.pending_vertical_scroll, 0);
         assert_eq!(multi.smooth_scroll_remaining, 0);
+
+        // Decomposed UTF-8 (NFD) grapheme indices align in picker_entry_line.
+        let nfd_dir = parent_dir.join("nested");
+        let nfd_path = nfd_dir.join("e\u{301}tude.pdf");
+        std::fs::write(&nfd_path, b"%PDF-1.4\n").unwrap();
+        let mut nfd_browser = crate::browser::BrowserState::with_recents(nfd_dir, Vec::new());
+        nfd_browser.filter = "tu".into();
+        nfd_browser.rebuild_filter();
+        let nfd_entry = nfd_browser
+            .filtered_entries()
+            .find(|e| e.path == nfd_path)
+            .unwrap();
+        let colors = super::picker::PickerTheme::from(crate::theme::TOKYO_NIGHT_MOON);
+        let line = super::picker::picker_entry_line(nfd_entry, &nfd_browser, false, 40, colors);
+        let matched_fg = super::picker::picker_color(crate::theme::TOKYO_NIGHT_MOON.magenta);
+        let matched_text: String = line
+            .spans
+            .iter()
+            .filter(|s| s.style.fg == Some(matched_fg))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(matched_text, "tu");
     }
 }

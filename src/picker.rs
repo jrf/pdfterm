@@ -840,14 +840,13 @@ fn filter_outline_with(
     if filter.is_empty() {
         return (0..items.len()).collect();
     }
-    use nucleo_matcher::Utf32Str;
     use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
     let pattern = Pattern::parse(filter, CaseMatching::Ignore, Normalization::Smart);
     let mut scored: Vec<_> = items
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            let haystack = Utf32Str::new(&item.title, buffer);
+            let haystack = crate::browser::utf32_str(&item.title, buffer);
             pattern.score(haystack, matcher).map(|score| (index, score))
         })
         .collect();
@@ -2174,17 +2173,17 @@ pub(super) fn char_width(character: char) -> usize {
     Span::raw(&*character.encode_utf8(&mut buffer)).width()
 }
 
-/// Appends `character` to `spans`, extending the last span when it already
-/// carries `style` so runs of identically styled characters share one span.
-pub(super) fn push_styled_char(spans: &mut Vec<Span<'static>>, character: char, style: Style) {
+/// Appends `text` to `spans`, extending the last span when it already
+/// carries `style` so runs of identically styled graphemes share one span.
+pub(super) fn push_styled_str(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
     if let Some(last) = spans.last_mut()
         && last.style == style
         && let Cow::Owned(content) = &mut last.content
     {
-        content.push(character);
+        content.push_str(text);
         return;
     }
-    spans.push(Span::styled(String::from(character), style));
+    spans.push(Span::styled(text.to_owned(), style));
 }
 
 fn truncate_with_ellipsis(value: &str, max_width: usize, from_end: bool) -> String {
@@ -2274,14 +2273,18 @@ pub(super) fn picker_entry_line(
     let basename_start = if entry.is_dir || !browser.filter.is_empty() {
         0
     } else {
-        display_name
-            .char_indices()
-            .rev()
-            .find(|(_, character)| *character == '/')
-            .map_or(0, |(index, _)| display_name[..=index].chars().count())
+        display_name.rfind('/').map_or(0, |index| {
+            Span::raw(&display_name[..=index])
+                .styled_graphemes(Style::default())
+                .count()
+        })
     };
-    for (index, character) in display_name.chars().enumerate() {
-        let foreground = if matches.binary_search(&index).is_ok() {
+    for (index, grapheme) in Span::raw(display_name.as_str())
+        .styled_graphemes(Style::default())
+        .enumerate()
+    {
+        let matched = matches.binary_search(&index).is_ok();
+        let foreground = if matched {
             colors.matched
         } else if index < basename_start || entry.name == "../" {
             colors.text_dim
@@ -2293,10 +2296,10 @@ pub(super) fn picker_entry_line(
             colors.text
         };
         let mut style = Style::default().fg(foreground).bg(background);
-        if matches.binary_search(&index).is_ok() || (selected && index >= basename_start) {
+        if matched || (selected && index >= basename_start) {
             style = style.add_modifier(Modifier::BOLD);
         }
-        push_styled_char(&mut spans, character, style);
+        push_styled_str(&mut spans, grapheme.symbol, style);
     }
 
     let mut line = Line::from(spans);
@@ -2348,7 +2351,10 @@ pub(super) fn picker_entry_line(
             }
             if let Some(parent) = parent {
                 let matches = browser.match_indices(&parent);
-                for (index, character) in parent.chars().enumerate() {
+                for (index, grapheme) in Span::raw(parent.as_str())
+                    .styled_graphemes(Style::default())
+                    .enumerate()
+                {
                     let matched = matches.binary_search(&index).is_ok();
                     let mut style = Style::default()
                         .fg(if matched {
@@ -2360,7 +2366,7 @@ pub(super) fn picker_entry_line(
                     if matched {
                         style = style.add_modifier(Modifier::BOLD);
                     }
-                    push_styled_char(&mut line.spans, character, style);
+                    push_styled_str(&mut line.spans, grapheme.symbol, style);
                 }
             }
             used = width;
