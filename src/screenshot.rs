@@ -408,7 +408,7 @@ fn decompress(frame: &Frame) -> io::Result<Vec<u8>> {
         })
         .and_then(|n| n.checked_mul(3))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame dimensions overflow"))?;
-    let decoder = ZlibDecoder::new(frame.compressed_rgba.as_slice());
+    let decoder = ZlibDecoder::new(frame.compressed_rgb.as_slice());
     let mut rgb = Vec::with_capacity(expected);
     decoder.take(expected as u64 + 1).read_to_end(&mut rgb)?;
     if rgb.len() != expected {
@@ -722,7 +722,7 @@ mod tests {
                 source.extend_from_slice(&[x * 40, y * 40, 0]);
             }
         }
-        let compressed_rgba = crate::kitty::compress_rgba(&source).unwrap();
+        let compressed_rgb = crate::kitty::compress_rgba(&source).unwrap();
         let revision_file = tempfile::NamedTempFile::new().unwrap();
         let frame = Frame {
             key: RenderKey {
@@ -746,7 +746,7 @@ mod tests {
             page_width_pt: 4.0,
             page_height_pt: 4.0,
             content_bounds: [0.0, 0.0, 1.0, 1.0],
-            compressed_rgba,
+            compressed_rgb,
             render_elapsed: Duration::ZERO,
             dark_mode_elapsed: None,
             highlight_elapsed: None,
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(&pixels[3 * 4 * 4..3 * 4 * 4 + 4], &[0, 0, 0, 255]);
 
         let mut bad_frame = Frame {
-            compressed_rgba: crate::kitty::compress_rgba(&[0; 64]).unwrap(),
+            compressed_rgb: crate::kitty::compress_rgba(&[0; 64]).unwrap(),
             key: frame.key,
             revision: frame.revision,
             width: 4,
@@ -843,7 +843,7 @@ mod tests {
             )
             .is_err()
         );
-        bad_frame.compressed_rgba.clear();
+        bad_frame.compressed_rgb.clear();
     }
 
     #[test]

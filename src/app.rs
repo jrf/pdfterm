@@ -1093,7 +1093,7 @@ fn write_page_image(
     } else {
         kitty::transmit_compressed_rgb(
             output,
-            &frame.compressed_rgba,
+            &frame.compressed_rgb,
             frame.width,
             frame.height,
             placement,
@@ -5985,7 +5985,7 @@ mod tests {
             page_width_pt: 80.0,
             page_height_pt: 240.0,
             content_bounds: [0.0, 0.0, 1.0, 1.0],
-            compressed_rgba: crate::kitty::compress_rgba(&[255; 80 * 240 * 3]).unwrap(),
+            compressed_rgb: crate::kitty::compress_rgba(&[255; 80 * 240 * 3]).unwrap(),
             render_elapsed: std::time::Duration::ZERO,
             dark_mode_elapsed: None,
             highlight_elapsed: None,
@@ -6063,7 +6063,7 @@ mod tests {
         let frame = std::sync::Arc::get_mut(&mut neighbor).unwrap();
         frame.width = 160;
         frame.height = 120;
-        frame.compressed_rgba =
+        frame.compressed_rgb =
             crate::kitty::compress_rgba(&[220, 40, 80].repeat(160 * 120)).unwrap();
         app.tab_mut().cache.insert(key, neighbor);
         app.tab_mut().scroll_y = 245;
@@ -6390,7 +6390,7 @@ mod tests {
         let mut narrow = continuous_frame(narrow_key, revision, false);
         let first = std::sync::Arc::get_mut(&mut narrow).unwrap();
         first.width = 40;
-        first.compressed_rgba = crate::kitty::compress_rgba(&[255; 40 * 240 * 3]).unwrap();
+        first.compressed_rgb = crate::kitty::compress_rgba(&[255; 40 * 240 * 3]).unwrap();
         let wide = continuous_frame(wide_key, revision, false);
         app.tab_mut().cache.clear();
         app.tab_mut().cache.insert(narrow_key, narrow.clone());

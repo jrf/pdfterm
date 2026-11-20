@@ -229,7 +229,7 @@ pub struct Frame {
     pub page_height_pt: f32,
     /// Content bounds as fractions of the displayed, rotated page: left/top/right/bottom.
     pub content_bounds: [f32; 4],
-    pub compressed_rgba: Vec<u8>,
+    pub compressed_rgb: Vec<u8>,
     pub render_elapsed: Duration,
     pub dark_mode_elapsed: Option<Duration>,
     pub highlight_elapsed: Option<Duration>,
@@ -1602,14 +1602,14 @@ fn run_worker(
                 .or(uncached_rgba.as_deref())
                 .unwrap_or_else(|| &base_cache.as_ref().expect("cached base raster").rgba);
             let compression_started = Instant::now();
-            let compressed_rgba =
-                match crate::kitty::compress_rgba_as_rgb(rgba_bytes, width, height) {
-                    Ok(compressed) => compressed,
-                    Err(error) => {
-                        report_error("compress", &error)?;
-                        continue;
-                    }
-                };
+            let compressed_rgb = match crate::kitty::compress_rgba_as_rgb(rgba_bytes, width, height)
+            {
+                Ok(compressed) => compressed,
+                Err(error) => {
+                    report_error("compress", &error)?;
+                    continue;
+                }
+            };
             let compression_elapsed = compression_started.elapsed();
 
             if !is_current(&request, is_prefetch) {
@@ -1624,7 +1624,7 @@ fn run_worker(
                 page_width_pt: page.width().value,
                 page_height_pt: page.height().value,
                 content_bounds,
-                compressed_rgba,
+                compressed_rgb,
                 render_elapsed,
                 dark_mode_elapsed,
                 highlight_elapsed,
@@ -4490,7 +4490,7 @@ fn apply_dark_mode_link_contrast(
             let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
                 continue;
             };
-            for pixel in rgba[row].chunks_exact_mut(4) {
+            for pixel in rgba[row].as_chunks_mut::<4>().0 {
                 let original = [pixel[0], pixel[1], pixel[2]];
                 if !is_blue_link_ink(original, background, background_luminance) {
                     continue;
@@ -4572,7 +4572,7 @@ impl RectangleColorBuckets {
             let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
                 continue;
             };
-            for pixel in rgba[row].chunks_exact(4) {
+            for pixel in rgba[row].as_chunks::<4>().0 {
                 let key = (u16::from(pixel[0] >> 3) << 10)
                     | (u16::from(pixel[1] >> 3) << 5)
                     | u16::from(pixel[2] >> 3);
@@ -4626,7 +4626,7 @@ fn darkest_blue_link_ink(
         let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
             continue;
         };
-        for pixel in rgba[row].chunks_exact(4) {
+        for pixel in rgba[row].as_chunks::<4>().0 {
             let pixel = [pixel[0], pixel[1], pixel[2]];
             if !is_blue_link_ink(pixel, background, background_luminance) {
                 continue;
@@ -4722,7 +4722,7 @@ fn blend_rectangle(
         let Some(row) = rectangle_row_range(rgba.len(), width, y, left, right) else {
             continue;
         };
-        for pixel in rgba[row].chunks_exact_mut(4) {
+        for pixel in rgba[row].as_chunks_mut::<4>().0 {
             for (channel, highlight) in pixel[..3].iter_mut().zip(color) {
                 let original = u16::from(*channel);
                 *channel = ((original * (255 - alpha) + u16::from(highlight) * alpha) / 255) as u8;
@@ -4798,11 +4798,13 @@ mod tests {
     fn coordinate_rgba(frame: &super::Frame) -> Vec<u8> {
         use std::io::Read;
         let mut rgb = Vec::new();
-        flate2::read::ZlibDecoder::new(frame.compressed_rgba.as_slice())
+        flate2::read::ZlibDecoder::new(frame.compressed_rgb.as_slice())
             .read_to_end(&mut rgb)
             .unwrap();
         assert_eq!(rgb.len(), (frame.width * frame.height * 3) as usize);
-        rgb.chunks_exact(3)
+        rgb.as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|px| [px[0], px[1], px[2], 255])
             .collect()
     }
@@ -7738,7 +7740,7 @@ mod tests {
             })
             .unwrap();
         let highlighted = coordinate_frame(&worker);
-        assert_ne!(plain1.compressed_rgba, highlighted.compressed_rgba);
+        assert_ne!(plain1.compressed_rgb, highlighted.compressed_rgb);
         worker
             .render(super::RenderRequest {
                 key: base,
@@ -7746,7 +7748,7 @@ mod tests {
             })
             .unwrap();
         let plain2 = coordinate_frame(&worker);
-        assert_eq!(plain1.compressed_rgba, plain2.compressed_rgba);
+        assert_eq!(plain1.compressed_rgb, plain2.compressed_rgb);
         assert_eq!(plain2.render_elapsed, std::time::Duration::ZERO);
     }
 }

@@ -48,8 +48,13 @@ pub fn compress_rgba_as_rgb(rgba: &[u8], width: u32, height: u32) -> io::Result<
     let mut compressor = ZlibEncoder::new(Vec::with_capacity(rgba.len() / 16), Compression::fast());
     let mut rgb = [0u8; 6144];
     for block in rgba.chunks(8192) {
-        for (dst, src) in rgb.chunks_exact_mut(3).zip(block.chunks_exact(4)) {
-            dst.copy_from_slice(&src[..3]);
+        for (dst, src) in rgb
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(block.as_chunks::<4>().0)
+        {
+            *dst = [src[0], src[1], src[2]];
         }
         compressor.write_all(&rgb[..(block.len() / 4) * 3])?;
     }
