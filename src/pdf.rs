@@ -1016,20 +1016,22 @@ fn run_worker(
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::ExtractText { document_id, page }) => {
-                    if let Some(loaded) = documents.get_mut(&document_id) {
-                        let content = cached_page_text(
-                            &loaded.document,
-                            page,
-                            &mut loaded.text_cache,
-                            &mut loaded.font_cache,
-                        )
+                    let content = documents
+                        .get_mut(&document_id)
+                        .and_then(|loaded| {
+                            cached_page_text(
+                                &loaded.document,
+                                page,
+                                &mut loaded.text_cache,
+                                &mut loaded.font_cache,
+                            )
+                        })
                         .map_or_else(String::new, |text| text.raw.clone());
-                        send(WorkerMessage::Text {
-                            document_id,
-                            page,
-                            content,
-                        })?;
-                    }
+                    send(WorkerMessage::Text {
+                        document_id,
+                        page,
+                        content,
+                    })?;
                     continue;
                 }
                 WorkerTask::Command(WorkerCommand::VisibleMatches {

@@ -233,7 +233,11 @@ pub fn run(
                 WorkerMessage::OpenError { document_id, error } => {
                     app.fail_open(document_id, &error, &mut output)?
                 }
-                WorkerMessage::Text { content, .. } => app.copy_text(&content, &mut output)?,
+                WorkerMessage::Text {
+                    document_id,
+                    content,
+                    ..
+                } => app.copy_text(document_id, &content, &mut output)?,
                 WorkerMessage::PagePoint {
                     document_id,
                     page,
@@ -363,6 +367,7 @@ struct App {
     last_render_view: Option<RenderKey>,
     desired_key: Option<RenderKey>,
     pending: HashMap<RenderKey, bool>,
+    copying_text: bool,
     visible_page: Option<VisiblePage>,
     submitted_key: Option<RenderKey>,
     visible_pages: Vec<VisiblePage>,
@@ -1194,6 +1199,7 @@ impl App {
             last_render_view: None,
             desired_key: None,
             pending: HashMap::new(),
+            copying_text: false,
             visible_page: None,
             submitted_key: None,
             visible_pages: Vec::new(),
@@ -3482,16 +3488,13 @@ impl App {
         from_side_picker: bool,
         output: &mut impl Write,
     ) -> Result<bool, AppError> {
-        if key.modifiers == KeyModifiers::CONTROL {
-            let forward = match key.code {
-                KeyCode::Char('b' | 'u') => false,
-                KeyCode::Char('f' | 'd') => true,
-                _ => return Ok(false),
-            };
+        if key.modifiers == KeyModifiers::CONTROL
+            && let KeyCode::Char(ch @ ('b' | 'u' | 'f' | 'd')) = key.code
+        {
             if from_side_picker {
                 self.clear_picker_previews();
             }
-            self.move_view(Axis::Vertical, forward, true, true, output)?;
+            self.move_view(Axis::Vertical, matches!(ch, 'f' | 'd'), true, true, output)?;
             return Ok(true);
         }
         let code = normalize_shifted_key(key).code;
@@ -3758,6 +3761,7 @@ impl App {
                 .min(fast_wait);
         }
         if !self.pending.is_empty()
+            || self.copying_text
             || self.session.pending_open.is_some()
             || self.navigation.forward.is_some()
             || self.navigation.inverse.is_some()
@@ -3968,13 +3972,23 @@ impl App {
             let tab = self.tab();
             (tab.document_id, tab.page)
         };
+        self.copying_text = true;
         self.worker.extract_text(document_id, page);
         let viewport = self.viewport()?;
         self.draw_status(output, viewport, "copying page text...")?;
         Ok(())
     }
 
-    fn copy_text(&mut self, content: &str, output: &mut impl Write) -> Result<(), AppError> {
+    fn copy_text(
+        &mut self,
+        document_id: DocumentId,
+        content: &str,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        if self.tab().document_id != document_id {
+            return Ok(());
+        }
+        self.copying_text = false;
         let viewport = self.viewport()?;
         if content.trim().is_empty() {
             self.draw_status(output, viewport, "no selectable text on this page")?;
@@ -4359,10 +4373,10 @@ impl App {
         error: &str,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        self.pending.remove(&key);
         if generation < self.view_generation {
             return Ok(());
         }
+        let is_prefetch = self.pending.remove(&key) == Some(true);
         let mut active_failure = self.desired_key == Some(key);
         if self
             .pending_scale
@@ -4375,7 +4389,11 @@ impl App {
             self.missing_visible_page = None;
             active_failure = true;
         }
-        if key.document_id == self.tab().document_id && self.pending_vertical_scroll != 0 {
+        if !is_prefetch
+            && key.document_id == self.tab().document_id
+            && key.page.abs_diff(self.tab().page) <= 1
+            && self.pending_vertical_scroll != 0
+        {
             self.pending_vertical_scroll = 0;
             self.smooth_scroll_remaining = 0;
             active_failure = true;
@@ -5215,6 +5233,7 @@ impl App {
         self.desired_key = None;
         self.last_render_view = None;
         self.pending.clear();
+        self.copying_text = false;
         self.pending_vertical_scroll = 0;
         self.smooth_scroll_remaining = 0;
     }
@@ -9903,7 +9922,7 @@ mod tests {
             }
             assert!(got_key1);
 
-            // B12: Opening/switching tabs rolls back uncommitted search_picker preview on the outgoing tab.
+            // B12: Opening/switching/reloading tabs rolls back uncommitted picker preview on the active tab.
             live.session.tabs[0].page = 1;
             let mut sp = super::SearchPickerState::new(1);
             sp.preview_origin = Some(super::ViewPosition::top(0));
@@ -9917,6 +9936,23 @@ mod tests {
                     .preview_origin
                     .is_none()
             );
+            live.session.tabs[0].page = 1;
+            let mut lp = super::LinkPickerState::new(1);
+            lp.preview_origin = Some(super::ViewPosition::top(0));
+            live.link_picker = Some(lp);
+            live.session.pending_open = Some(super::session::PendingOpen::Reload {
+                document_id: super::INITIAL_DOCUMENT_ID,
+                fingerprint: rev,
+            });
+            live.finish_open(
+                super::INITIAL_DOCUMENT_ID,
+                2,
+                Vec::new(),
+                rev,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(live.tab().page, 0);
         }
 
         // B11: Kitty lowercase + SHIFT normalizes in picker navigation and filter editing.
@@ -9964,11 +10000,59 @@ mod tests {
 
         multi.pending_vertical_scroll = 12;
         multi.smooth_scroll_remaining = 8;
+        let k1 = multi.page_key(1, multi_vp);
+        multi.pending.insert(k0, false);
+        multi.pending.insert(k1, true);
+        multi
+            .receive_render_error(k0, multi.view_generation - 1, "stale", &mut Vec::new())
+            .unwrap();
+        assert!(multi.pending.contains_key(&k0));
+        assert_eq!(multi.pending_vertical_scroll, 12);
+        multi
+            .receive_render_error(k1, multi.view_generation, "prefetch", &mut Vec::new())
+            .unwrap();
+        assert_eq!(multi.pending_vertical_scroll, 12);
+        assert_eq!(multi.smooth_scroll_remaining, 8);
         multi
             .receive_render_error(k0, multi.view_generation, "zibble", &mut Vec::new())
             .unwrap();
         assert_eq!(multi.pending_vertical_scroll, 0);
         assert_eq!(multi.smooth_scroll_remaining, 0);
+
+        // Ctrl+End and Ctrl+Home navigate pages; copying_text keeps input_wait at fast_wait.
+        multi.pending.clear();
+        multi
+            .tab_mut()
+            .cache
+            .insert(k1, continuous_frame(k1, label_rev, false));
+        multi
+            .handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::End,
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(multi.tab().page, 1);
+        multi
+            .handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Home,
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(multi.tab().page, 0);
+        multi.pending.clear();
+        multi.request_copy(&mut Vec::new()).unwrap();
+        assert!(multi.copying_text);
+        assert_eq!(multi.input_wait(), std::time::Duration::from_millis(10));
+        multi
+            .copy_text(multi.tab().document_id, "zibble", &mut Vec::new())
+            .unwrap();
+        assert!(!multi.copying_text);
 
         // Decomposed UTF-8 (NFD) grapheme indices align in picker_entry_line.
         let nfd_dir = parent_dir.join("nested");

@@ -292,6 +292,9 @@ impl App {
                 let Some(index) = self.tab_index(document_id) else {
                     return Ok(());
                 };
+                if index == self.session.active_tab {
+                    self.restore_active_picker_preview();
+                }
                 self.clear_document_flash(document_id);
                 let tab = &mut self.session.tabs[index];
                 tab.watcher.accept(fingerprint);
