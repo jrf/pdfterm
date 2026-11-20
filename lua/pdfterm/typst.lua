@@ -878,7 +878,12 @@ function M.resolve(project, file, line, byte_column, callback)
         or { id = 'pdfterm.build.' .. id, title = 'pdfterm: ' .. vim.fs.basename(project.pdf) }
       local finished = false
       local function notify_build(status, level)
-        vim.notify(status, level, vim.tbl_extend('force', notification, { timeout = finished and 5000 or false }))
+        local opts = vim.tbl_extend('force', notification, { timeout = finished and 5000 or false })
+        if vim.in_fast_event() then
+          vim.schedule(function() vim.notify(status, level, opts) end)
+        else
+          vim.notify(status, level, opts)
+        end
       end
       pending_build = {
         notification = notification,
@@ -1040,8 +1045,16 @@ function M.resolve(project, file, line, byte_column, callback)
         end,
         on_exit = function()
           g.exited = true
-          if generation == g and not g.stopped then fail(g, 'Tinymist compiler exited') end
           cleanup(g)
+          if generation == g and not g.stopped then
+            if vim.in_fast_event() then
+              vim.schedule(function()
+                if generation == g and not g.stopped then fail(g, 'Tinymist compiler exited') end
+              end)
+            else
+              fail(g, 'Tinymist compiler exited')
+            end
+          end
         end,
       }, { cwd = project.cwd, detached = false })
       start_generation_timer(g)
