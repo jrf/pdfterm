@@ -1641,8 +1641,8 @@ dependencies = [
 
 [[package]]
 name = "synctex-parser"
-version = "0.1.2"
-source = "git+https://github.com/DavidLapous/synctex-parser?rev=0271f6a08afa1c24669307d3dedde45a05b0d482#0271f6a08afa1c24669307d3dedde45a05b0d482"
+version = "0.1.3"
+source = "git+https://github.com/DavidLapous/synctex-parser?rev=d304b5d8c47b03cdd25b60e29fdddc506f279218#d304b5d8c47b03cdd25b60e29fdddc506f279218"
 dependencies = [
  "flate2",
  "libc",

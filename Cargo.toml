@@ -20,7 +20,7 @@ pdfium-render = { version = "0.9.5", default-features = false, features = ["pdfi
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_29"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
-synctex-parser = { git = "https://github.com/DavidLapous/synctex-parser", rev = "0271f6a08afa1c24669307d3dedde45a05b0d482" }
+synctex-parser = { git = "https://github.com/DavidLapous/synctex-parser", rev = "d304b5d8c47b03cdd25b60e29fdddc506f279218" }
 thiserror = "2.0.17"
 png = "0.18.0"
 fontdb = "0.24.0"
