@@ -2,7 +2,7 @@
 local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root)
 
-local directory = assert(vim.uv.fs_mkdtemp(root .. '/.nvim-log-test-XXXXXX'))
+local directory = assert(vim.uv.fs_realpath(assert(vim.uv.fs_mkdtemp('/tmp/pdfterm-log-XXXXXX'))))
 vim.env.XDG_CACHE_HOME = directory .. '/cache'
 local binary = vim.env.PDFTERM_EXECUTABLE
   or (vim.fn.executable(root .. '/target/debug/pdfterm') == 1 and (root .. '/target/debug/pdfterm'))
