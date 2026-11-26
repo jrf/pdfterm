@@ -3676,7 +3676,7 @@ impl App {
             if !self.viewer.smooth_scroll {
                 self.pending_vertical_scroll += std::mem::take(&mut self.smooth_scroll_remaining);
                 if self.apply_vertical_scroll(viewport)? {
-                    self.request_current(output)?;
+                    self.present_scroll(viewport, output)?;
                 }
             }
             return Ok(());
@@ -3840,19 +3840,30 @@ impl App {
         self.smooth_scroll_remaining -= step;
         self.pending_vertical_scroll = step;
         if self.apply_vertical_scroll(viewport)? {
-            let key = self.render_key(viewport);
-            if self.desired_key == Some(key)
-                && let Some(frame) = self.tab().cache.get(&key).cloned()
-            {
-                // An offset-only tick needs placement, not a new render generation
-                // or another scan of the prefetch window.
-                self.draw_frame(&frame, viewport, output)?;
-            } else {
-                let rest = self.smooth_scroll_remaining;
-                self.request_current(output)?;
-                self.smooth_scroll_remaining = rest;
-            }
+            self.present_scroll(viewport, output)?;
         }
+        Ok(())
+    }
+
+    /// Shows an applied continuous scroll. Only a new render key or view needs
+    /// a fresh request; the draw still requests any newly visible page.
+    fn present_scroll(
+        &mut self,
+        viewport: Viewport,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let key = self.render_key(viewport);
+        if self.desired_key == Some(key)
+            && self.last_render_view == Some(self.render_view(key))
+            && let Some(frame) = self.tab().cache.get(&key).cloned()
+        {
+            // An offset-only change needs placement, not a new render generation
+            // that cancels in-flight visible renders, nor another prefetch scan.
+            return self.draw_frame(&frame, viewport, output);
+        }
+        let rest = self.smooth_scroll_remaining;
+        self.request_current(output)?;
+        self.smooth_scroll_remaining = rest;
         Ok(())
     }
 
@@ -4174,8 +4185,9 @@ impl App {
         self.viewer.smooth_scroll = !self.viewer.smooth_scroll;
         if !self.viewer.smooth_scroll && self.smooth_scroll_remaining != 0 {
             self.pending_vertical_scroll += std::mem::take(&mut self.smooth_scroll_remaining);
-            if self.apply_vertical_scroll(self.viewport()?)? {
-                self.request_current(output)?;
+            let viewport = self.viewport()?;
+            if self.apply_vertical_scroll(viewport)? {
+                self.present_scroll(viewport, output)?;
             }
         }
         let state = if self.viewer.smooth_scroll {
@@ -4274,6 +4286,16 @@ impl App {
         defaults.theme_warning
     }
 
+    /// Settings every page of the current view shares; a change invalidates the view.
+    fn render_view(&self, key: RenderKey) -> RenderKey {
+        RenderKey {
+            page: 0,
+            search_request_id: self.tab().search.active_highlight_id(),
+            selected_link_ordinal: None,
+            ..key
+        }
+    }
+
     pub(super) fn bump_generation(&mut self, invalidate_view: bool) {
         self.generation = self.generation.wrapping_add(1);
         if invalidate_view {
@@ -4337,12 +4359,7 @@ impl App {
         self.draw_tab_bar(output, viewport.columns)?;
         let key = self.render_key(viewport);
         self.desired_key = Some(key);
-        let signature = RenderKey {
-            page: 0,
-            search_request_id: self.tab().search.active_highlight_id(),
-            selected_link_ordinal: None,
-            ..key
-        };
+        let signature = self.render_view(key);
         let invalidate_view = self.last_render_view != Some(signature);
         self.bump_generation(invalidate_view);
         self.last_render_view = Some(signature);
@@ -6137,6 +6154,114 @@ mod tests {
         assert!(app.navigation.inverse.is_none());
         app.begin_inverse_search(mouse, &mut Vec::new()).unwrap();
         assert_eq!(app.navigation.inverse.as_ref().unwrap().page, 1);
+    }
+
+    #[test]
+    fn offset_only_continuous_scroll_keeps_the_visible_neighbor_render() {
+        let _native = crate::pdf::pdfium_test_lock();
+        let file = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        fs::write(file.path(), pdf).unwrap();
+        let worker = crate::pdf::RenderWorker::spawn(
+            super::INITIAL_DOCUMENT_ID,
+            file.path().to_owned(),
+            None,
+        );
+        let (pages, outline, revision) = worker.wait_until_ready().unwrap();
+        let config = toml::from_str("[viewer]\nprefetch_pages = 0\n").unwrap();
+        let mut app = super::App::new(
+            worker,
+            pages,
+            0,
+            file.path().to_owned(),
+            FileWatcher::from_revision(revision),
+            (outline, revision.pdf),
+            super::AppDefaults::from_config(&config, None),
+        );
+        let viewport = Viewport {
+            columns: 8,
+            rows: 20,
+            pixel_width: 80,
+            pixel_height: 200,
+            top: 1,
+            status_row: 21,
+        };
+        app.canvas_viewport = Some(viewport);
+        // Deliver worker frames until `key` arrives; returns its render generation.
+        let deliver = |app: &mut super::App, key: crate::pdf::RenderKey| {
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                assert!(Instant::now() < deadline, "no frame for page {}", key.page);
+                match app.worker.try_recv() {
+                    Ok(crate::pdf::WorkerMessage::Frame(frame)) => {
+                        let (delivered, generation) = (frame.key, frame.generation);
+                        app.receive_frame(frame, &mut Vec::new()).unwrap();
+                        if delivered == key {
+                            return generation;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        };
+
+        app.request_current(&mut Vec::new()).unwrap();
+        let (key0, key1) = (app.page_key(0, viewport), app.page_key(1, viewport));
+        deliver(&mut app, key0);
+        // Page 0 is displayed; the visible page 1 has a priority render in flight.
+        assert_eq!(app.pending.get(&key1), Some(&false));
+        let generation = app.generation;
+        let mut output = Vec::new();
+        for step in 1..=3 {
+            app.move_view(super::Axis::Vertical, true, false, true, &mut output)
+                .unwrap();
+            assert_eq!((app.tab().page, app.tab().scroll_y), (0, step * 10));
+        }
+        assert_eq!(
+            app.generation, generation,
+            "offset-only scrolls must not start a render generation"
+        );
+        assert_eq!(app.pending.get(&key1), Some(&false));
+        assert!(
+            !String::from_utf8_lossy(&output).contains("a=T"),
+            "offset-only scrolls only re-place cached page images"
+        );
+        // The original request completes and fills the visible gap.
+        assert_eq!(deliver(&mut app, key1), generation);
+        assert!(app.visible_pages.iter().any(|page| page.frame.key == key1));
+
+        // A new render key (crossing onto page 1) and a zoom still request afresh.
+        app.move_view(super::Axis::Vertical, true, true, true, &mut output)
+            .unwrap();
+        assert_eq!(app.tab().page, 1);
+        assert_eq!(app.desired_key, Some(key1));
+        assert_eq!(app.generation, generation + 1);
+        app.zoom_in(&mut output).unwrap();
+        let zoomed = app.render_key(viewport);
+        assert_ne!(zoomed.zoom, key1.zoom);
+        assert_eq!(app.desired_key, Some(zoomed));
+        assert_eq!(app.pending.get(&zoomed), Some(&false));
+        assert_eq!(deliver(&mut app, zoomed), app.generation);
     }
 
     #[test]
