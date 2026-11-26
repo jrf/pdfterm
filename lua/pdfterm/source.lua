@@ -30,11 +30,6 @@ local function read_prefix(path, limit, allow_truncate)
   return bytes, nil, M.saved_revision(stat), stat.size > count
 end
 
-function M.read_bytes(path, bound)
-  local bytes, reason, revision = read_prefix(path, bound, false)
-  return bytes, reason, revision
-end
-
 local function scalar_length(first)
   return first >= 194 and first <= 223 and 2
     or first >= 224 and first <= 239 and 3
