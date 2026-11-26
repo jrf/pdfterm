@@ -50,6 +50,7 @@ jobs:
         PDFTERM_EXECUTABLE="$PWD/target/debug/pdfterm" nvim --headless -u NONE -l tests/nvim_log.lua
         nvim --headless -u NONE -l tests/nvim_source.lua
         nvim --headless -u NONE -l tests/nvim_socket.lua
+        nvim --headless -u NONE -l tests/nvim_inverse_window.lua
     - name: Exercise terminal ownership completion
       run: nvim --headless -u NONE -l tests/nvim_terminal.lua
     - name: Exercise persistent Ghostty control with a fake worker
