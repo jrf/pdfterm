@@ -993,7 +993,7 @@ function M.setup(opts)
       intent()
       project.close()
       if close_listener then
-        close_listener()
+        pcall(close_listener)
       end
       if launch_process then
         local ok, error = pcall(launch_process.wait, launch_process)
