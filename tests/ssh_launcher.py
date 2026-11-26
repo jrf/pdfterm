@@ -105,8 +105,9 @@ class LauncherTests(unittest.TestCase):
 
     def close_forward(self):
         self.forward_stop.set()
+        # The 0.1 s accept timeout bounds this join; closing first races a live accept.
+        self.forward_thread.join()
         self.forward_listener.close()
-        self.forward_thread.join(timeout=1)
 
     def request(self, payload, authenticated=True):
         with socket.socket(socket.AF_UNIX) as client:
