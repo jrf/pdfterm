@@ -546,6 +546,7 @@ struct CachedBaseRaster {
 }
 
 impl CachedBaseRaster {
+    /// A dark raster includes static link contrast, drawn from its style and accent.
     fn matches(&self, key: RenderKey, revision: DocumentRevision) -> bool {
         self.revision == revision
             && (
@@ -565,7 +566,9 @@ impl CachedBaseRaster {
                 key.fit,
                 key.invert,
             )
-            && (!key.invert || self.key.dark_mode_style == key.dark_mode_style)
+            && (!key.invert
+                || (self.key.dark_mode_style, self.key.link_highlight)
+                    == (key.dark_mode_style, key.link_highlight))
     }
 }
 
@@ -1430,8 +1433,8 @@ fn run_worker(
                 &page,
                 loaded.page_cache.entry(request.key.page).or_default(),
             );
-            let mut uncached_rgba = None;
-            let (width, height, render_elapsed, dark_mode_elapsed) = if let Some(cached) =
+            let mut fresh_rgba = None;
+            let (width, height, render_elapsed, mut dark_mode_elapsed) = if let Some(cached) =
                 base_cache
                     .as_ref()
                     .filter(|cached| cached.matches(request.key, loaded.revision))
@@ -1468,17 +1471,7 @@ fn run_worker(
                 if !is_current(&request, is_prefetch) {
                     continue;
                 }
-                if !is_prefetch && (width as usize).saturating_mul(height as usize) <= 16_777_216 {
-                    base_cache = Some(CachedBaseRaster {
-                        key: request.key,
-                        revision: loaded.revision,
-                        width,
-                        height,
-                        rgba: raw_rgba,
-                    });
-                } else {
-                    uncached_rgba = Some(raw_rgba);
-                }
+                fresh_rgba = Some(raw_rgba);
                 (width, height, render_elapsed, dark_mode_elapsed)
             };
 
@@ -1503,8 +1496,37 @@ fn run_worker(
                 width,
                 height,
                 annotations,
-                request.key.invert,
+                request.key.invert && fresh_rgba.is_some(),
             );
+            let mut uncached_rgba = None;
+            if let Some(mut raw_rgba) = fresh_rgba {
+                // Static link contrast completes the dark base raster, so a cache
+                // hit needs no copy for it; `CachedBaseRaster::matches` covers its inputs.
+                if !dark_mode_link_rectangles.is_empty() {
+                    let started = Instant::now();
+                    apply_dark_mode_link_contrast(
+                        &mut raw_rgba,
+                        width,
+                        height,
+                        &dark_mode_link_rectangles,
+                        request.key.dark_mode_style,
+                        request.key.link_highlight,
+                    );
+                    dark_mode_elapsed =
+                        dark_mode_elapsed.map(|elapsed| elapsed + started.elapsed());
+                }
+                if !is_prefetch && (width as usize).saturating_mul(height as usize) <= 16_777_216 {
+                    base_cache = Some(CachedBaseRaster {
+                        key: request.key,
+                        revision: loaded.revision,
+                        width,
+                        height,
+                        rgba: raw_rgba,
+                    });
+                } else {
+                    uncached_rgba = Some(raw_rgba);
+                }
+            }
             let selected_link_rectangles =
                 selected_page_link_rectangles(&links, request.key.selected_link_ordinal);
             let flash = loaded
@@ -1530,7 +1552,6 @@ fn run_worker(
             let has_overlays = search_rectangles.is_some()
                 || (request.key.link_mode && !links.is_empty())
                 || !selected_link_rectangles.is_empty()
-                || !dark_mode_link_rectangles.is_empty()
                 || flash_rectangle.is_some();
             let mut overlay_rgba = has_overlays.then(|| {
                 uncached_rgba.take().unwrap_or_else(|| {
@@ -1543,16 +1564,6 @@ fn run_worker(
             });
             let highlight_elapsed = overlay_rgba.as_mut().map(|raw_rgba| {
                 let started = Instant::now();
-                if !dark_mode_link_rectangles.is_empty() {
-                    apply_dark_mode_link_contrast(
-                        raw_rgba,
-                        width,
-                        height,
-                        &dark_mode_link_rectangles,
-                        request.key.dark_mode_style,
-                        request.key.link_highlight,
-                    );
-                }
                 if let Some(rectangles) = search_rectangles {
                     apply_search_highlights(
                         &page,
@@ -7752,5 +7763,101 @@ mod tests {
         let plain2 = coordinate_frame(&worker);
         assert_eq!(plain1.compressed_rgb, plain2.compressed_rgb);
         assert_eq!(plain2.render_elapsed, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn dark_mode_link_contrast_is_baked_into_the_cached_base_raster() {
+        let _native = super::pdfium_test_lock();
+        // A white page whose only link covers a blue ink box.
+        let content = "0 0 0.3 rg 20 15 30 10 re f";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [5 0 R] /Contents 4 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Annot /Subtype /Link /Rect [10 10 80 30] /Border [0 0 0] /A << /S /URI /URI (https://example.invalid/zibble) >> >>".to_string(),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        let pdf = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        std::fs::write(pdf.path(), bytes).unwrap();
+        let worker = super::RenderWorker::spawn(1, pdf.path().to_path_buf(), None);
+        worker.wait_until_ready().unwrap();
+        worker.begin_generation(1);
+        let render = |key, prefetch: bool| {
+            let request = super::RenderRequest { key, generation: 1 };
+            if prefetch {
+                worker.prefetch(request);
+            } else {
+                worker.render(request).unwrap();
+            }
+            coordinate_frame(&worker)
+        };
+        let ink = |frame: &super::Frame| {
+            let rgba = coordinate_rgba(frame);
+            let (x, y) = (frame.width * 35 / 400, frame.height * 380 / 400);
+            let index = ((y * frame.width + x) * 4) as usize;
+            [rgba[index], rgba[index + 1], rgba[index + 2]]
+        };
+        // The document foreground is too faint here, so the link takes the accent.
+        let dark = super::RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 240,
+            height: 240,
+            zoom: 100,
+            fit: super::FitMode::Page,
+            invert: true,
+            dark_mode_style: DarkModeStyle::new([30, 30, 30], [100, 100, 100]),
+            search_request_id: 0,
+            search_highlight: [255, 255, 0],
+            link_mode: false,
+            link_highlight: [80, 160, 255],
+            selected_link_ordinal: None,
+        };
+        let linked = super::RenderKey {
+            link_mode: true,
+            ..dark
+        };
+        let fresh_linked = render(linked, true);
+        let miss = render(dark, false);
+        assert_eq!(ink(&miss), dark.link_highlight);
+        // Contrast alone composites nothing over the cached raster.
+        let hit = render(dark, false);
+        assert_eq!(hit.render_elapsed, std::time::Duration::ZERO);
+        assert!(hit.highlight_elapsed.is_none());
+        assert_eq!(hit.compressed_rgb, miss.compressed_rgb);
+        // Overlays on a hit stack above the baked contrast as on a fresh raster.
+        let cached_linked = render(linked, false);
+        assert_eq!(cached_linked.render_elapsed, std::time::Duration::ZERO);
+        assert_eq!(cached_linked.compressed_rgb, fresh_linked.compressed_rgb);
+        assert_ne!(cached_linked.compressed_rgb, hit.compressed_rgb);
+        // A new accent needs a new base raster, prefetched or on demand.
+        let accent = super::RenderKey {
+            link_highlight: [255, 120, 40],
+            ..dark
+        };
+        let prefetched = render(accent, true);
+        assert_eq!(ink(&prefetched), accent.link_highlight);
+        let rendered = render(accent, false);
+        assert_ne!(rendered.render_elapsed, std::time::Duration::ZERO);
+        assert_eq!(rendered.compressed_rgb, prefetched.compressed_rgb);
     }
 }
