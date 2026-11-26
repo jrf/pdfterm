@@ -11,7 +11,7 @@ use crate::pdf::FitMode;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    fit_mode: FitModeSetting,
+    fit_mode: FitMode,
     #[serde(alias = "invert")]
     dark_mode: bool,
     theme: Option<String>,
@@ -22,17 +22,10 @@ pub struct Config {
     synctex_enabled: Option<bool>,
     pub editor: crate::editor::Editor,
     forward_socket: Option<String>,
+    #[serde(skip)]
+    session: Option<String>,
     pub viewer: ViewerSettings,
     pub nvim: NvimSettings,
-}
-
-#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum FitModeSetting {
-    #[default]
-    Page,
-    Width,
-    Height,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
@@ -51,7 +44,7 @@ impl Config {
         Self::load_path(&path).map_err(|error| format!("{}: {error}", path.display()).into())
     }
 
-    fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(path.parent().ok_or("config path has no parent")?)?;
         match fs::OpenOptions::new()
             .write(true)
@@ -123,6 +116,7 @@ impl Config {
     /// Select named endpoints, or disable viewer control without changing the editor.
     pub fn select_session(&mut self, name: Option<&str>) -> io::Result<()> {
         let Some(name) = name else {
+            self.session = None;
             if let Some(socket) = self.forward_socket.as_mut() {
                 socket.clear();
             }
@@ -143,36 +137,19 @@ impl Config {
             .into_iter()
             .flatten()
         {
-            if value.is_empty() {
-                continue;
+            if let Some(selected) = prefixed_session_socket(name, value)? {
+                endpoints.push((value, selected));
             }
-            let path = Path::new(value);
-            let file = path
-                .file_name()
-                .ok_or_else(|| io::Error::other("socket path has no filename"))?;
-            let selected = path.with_file_name(format!("{name}-{}", file.to_string_lossy()));
-            if selected.as_os_str().as_encoded_bytes().len() > 103 {
-                return Err(io::Error::other(
-                    "named session socket path exceeds 103 bytes",
-                ));
-            }
-            endpoints.push((value, selected));
         }
         for (value, selected) in endpoints {
-            *value = selected
-                .into_os_string()
-                .into_string()
-                .map_err(|_| io::Error::other("socket path is not UTF-8"))?;
+            *value = selected;
         }
+        self.session = Some(name.to_owned());
         Ok(())
     }
 
     pub fn fit_mode(&self) -> FitMode {
-        match self.fit_mode {
-            FitModeSetting::Page => FitMode::Page,
-            FitModeSetting::Width => FitMode::Width,
-            FitModeSetting::Height => FitMode::Height,
-        }
+        self.fit_mode
     }
 
     pub fn dark_mode(&self) -> bool {
@@ -210,18 +187,62 @@ impl Config {
             .as_deref()
             .filter(|value| !value.is_empty())
     }
+
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+}
+
+pub(crate) fn prefixed_session_socket(name: &str, value: &str) -> io::Result<Option<String>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let path = Path::new(value);
+    let file = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("socket path has no filename"))?;
+    let selected = path.with_file_name(format!("{name}-{}", file.to_string_lossy()));
+    if selected.as_os_str().as_encoded_bytes().len() > 103 {
+        return Err(io::Error::other(
+            "named session socket path exceeds 103 bytes",
+        ));
+    }
+    selected
+        .into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| io::Error::other("socket path is not UTF-8"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.toml"))
 }
 
-pub(crate) fn config_root() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    absolute_env_dir(env::var_os("HOME"))
+}
+
+pub(crate) fn xdg_dir(env_key: &str, home_suffix: &str) -> Option<PathBuf> {
+    resolve_xdg_dir(env::var_os(env_key), env::var_os("HOME"), home_suffix)
+}
+
+fn absolute_env_dir(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base)
+        .filter(|path| path.is_absolute())
+}
+
+fn resolve_xdg_dir(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    home_suffix: &str,
+) -> Option<PathBuf> {
+    absolute_env_dir(xdg).or_else(|| absolute_env_dir(home).map(|base| base.join(home_suffix)))
+}
+
+pub(crate) fn config_root() -> Option<PathBuf> {
+    xdg_dir("XDG_CONFIG_HOME", ".config")
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
@@ -231,7 +252,7 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            fit_mode: FitModeSetting::default(),
+            fit_mode: FitMode::default(),
             dark_mode: false,
             theme: None,
             theme_catalog: None,
@@ -243,6 +264,7 @@ impl Default for Config {
                 path: "editor.sock".into(),
             },
             forward_socket: Some("forward.sock".into()),
+            session: None,
             viewer: ViewerSettings::default(),
             nvim: NvimSettings::default(),
         }
@@ -279,7 +301,7 @@ impl Default for ViewerSettings {
             smooth_scroll: false,
             scroll_frame_ms: 16,
             scroll_ease_divisor: 4,
-            scroll_step_percent: 12,
+            scroll_step_percent: 5,
             page_scroll_percent: 85,
             set_window_title: true,
             center_forward_search: true,
@@ -319,6 +341,7 @@ pub struct NvimSettings {
     pub focus_on_forward: bool,
     pub executable: String,
     pub attach_only: bool,
+    pub log_file: Option<String>,
     pub keys: NvimKeys,
 }
 
@@ -348,6 +371,7 @@ mod tests {
         assert_eq!(config.link_picker_split_percent(), 50);
         assert!(!config.nvim.focus_on_forward);
         assert!(!config.nvim.focus_on_inverse);
+        assert_eq!(config.nvim.log_file, None);
         assert_eq!(config.link_picker_layout(), LinkPickerLayout::Auto);
     }
 
@@ -358,6 +382,13 @@ mod tests {
                 .expect("config");
         assert!(config.nvim.focus_on_forward);
         assert!(config.nvim.focus_on_inverse);
+    }
+
+    #[test]
+    fn parses_nvim_log_file() {
+        let config: Config =
+            toml::from_str("[nvim]\nlog_file = \"/tmp/pdfterm.log\"\n").expect("config");
+        assert_eq!(config.nvim.log_file.as_deref(), Some("/tmp/pdfterm.log"));
     }
 
     #[test]
@@ -540,5 +571,21 @@ mod tests {
         ] {
             assert!(config.select_session(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn resolve_xdg_dir_ignores_empty_and_relative_home_or_xdg() {
+        assert_eq!(
+            super::resolve_xdg_dir(Some("".into()), Some("".into()), ".config"),
+            None
+        );
+        assert_eq!(
+            super::resolve_xdg_dir(Some("rel/cfg".into()), Some("rel/home".into()), ".config"),
+            None
+        );
+        assert_eq!(
+            super::resolve_xdg_dir(Some("".into()), Some("/synth/zibble".into()), ".config"),
+            Some(std::path::PathBuf::from("/synth/zibble/.config"))
+        );
     }
 }

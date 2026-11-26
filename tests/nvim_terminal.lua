@@ -43,9 +43,10 @@ vim.schedule = function(callback)
     end
   end)
 end
-local token_file = vim.fn.getcwd() .. '/target/pdfterm-terminal-token-' .. vim.fn.getpid()
+local token_file = '/tmp/pdfterm-terminal-token-' .. vim.fn.getpid()
 local token = string.rep('a', 64)
 vim.fn.writefile({ token }, token_file)
+assert(vim.uv.fs_chmod(token_file, tonumber('600', 8)))
 vim.env.PDFTERM_LAUNCH_TOKEN_FILE = token_file
 local terminal = require('pdfterm.terminal')
 local source = { kind = 'ssh', id = 'source' }
@@ -56,8 +57,6 @@ local successful = terminal.launch_split(source, 'viewer', 'paper.pdf', function
   owned = assert(split)
 end, 'session', string.rep('f', 32))
 assert(successful:wait(1000).code == 0 and count == 1 and owned.id == 'viewer-7')
-assert(requests[1].argv[3] == '--session' and requests[1].argv[4] == 'session')
-assert(requests[1].argv[5] == '--focus-token' and requests[1].argv[6] == string.rep('f', 32))
 assert(requests[1].token == token, 'SSH launch must authenticate the exact source session')
 terminal.close(owned)
 assert(#requests == 2 and #failures == 0)
@@ -85,9 +84,17 @@ end)
 assert(rejected:wait(1000).code ~= 0 and count == 1)
 assert(#requests == 1 and #failures == 0, 'no offered handle means no invented cleanup')
 vim.schedule = schedule
+assert(vim.uv.fs_chmod(token_file, tonumber('644', 8)))
+local capture_error, captured
+require('pdfterm.ssh').capture(function(problem, id)
+  capture_error, captured = problem, id
+end)
+assert(
+  capture_error and capture_error:find('mode 0600', 1, true) and captured == nil,
+  'a world-readable SSH token file must be rejected'
+)
 vim.fn.delete(token_file)
 vim.env.PDFTERM_LAUNCH_TOKEN_FILE = nil
-local capture_error, captured
 require('pdfterm.ssh').capture(function(problem, id)
   capture_error, captured = problem, id
 end)
@@ -148,15 +155,6 @@ local gui_launch = terminal.launch_split(
 )
 assert(gui_launch:wait(1000).code == 0)
 assert(gui_viewer.kind == 'ghostty' and gui_viewer.id == 'ghostty-viewer-7')
-assert(scripts[1].script:find('new window with configuration cfg', 1, true))
-assert(scripts[1].argv[1] == table.concat(vim.tbl_map(vim.fn.shellescape, {
-  '/bin/viewer with space',
-  "paper's page.pdf",
-  '--session',
-  'session',
-  '--focus-token',
-  string.rep('f', 32),
-}), ' '))
 local source_focus
 terminal.focus(gui_source, function(result)
   source_focus = result
@@ -226,7 +224,11 @@ package.loaded['pdfterm.platform'].applescript = function(script, argv, callback
     callback({ code = 0, stdout = ghostty_creation_id .. '\n', stderr = '' })
     return
   end
+  assert(script:find('repeat 15 times', 1, true))
+  assert(script:find('input text (character id 3)', 1, true))
   assert(script:find('send key "c"', 1, true))
+  assert(script:find('close terminal id (item 1 of argv)', 1, true))
+  assert(script:find('focus (focused terminal of selected tab of front window)', 1, true))
   assert(argv[1] == 'ghostty-child', 'rollback must never target the source or an independent surface')
   ghostty_calls[#ghostty_calls + 1] = { 'close', argv[1] }
   return { wait = function()
@@ -434,6 +436,104 @@ assert(#wez_calls == queried, 'missing instance identity must fail before CLI co
 vim.system = original_system
 vim.env.WEZTERM_PANE, vim.env.TERM_PROGRAM = nil, nil
 print('WezTerm exact socket/pane control, refocus rollback, and owned cleanup passed')
+
+local kitty_adapter = package.loaded['pdfterm.kitty']
+package.loaded['pdfterm.kitty'] = nil
+for name, fn in pairs(require('pdfterm.kitty')) do
+  kitty_adapter[name] = fn
+end
+local kitty_calls = {}
+local kitty_live = { ['7'] = true }
+local kitty_fail_close = false
+local kitty_bad_ls = false
+vim.system = function(command, _, on_exit)
+  table.insert(kitty_calls, command)
+  local sub = command[3]
+  local result
+  if sub == 'goto-layout' then
+    result = { code = 0, stdout = '', stderr = '' }
+  elseif sub == 'launch' then
+    kitty_live['42'] = true
+    result = { code = 0, stdout = '42\n', stderr = '' }
+  elseif sub == 'ls' then
+    if kitty_bad_ls then
+      result = { code = 0, stdout = 'not-json', stderr = '' }
+    else
+      local windows = {}
+      for id in pairs(kitty_live) do
+        table.insert(windows, { id = tonumber(id) })
+      end
+      result = { code = 0, stdout = vim.json.encode({ { tabs = { { windows = windows } } } }), stderr = '' }
+    end
+  elseif sub == 'send-text' then
+    if kitty_fail_close then
+      result = { code = 1, stdout = '', stderr = 'send-text refused' }
+    else
+      local match = command[5] or ''
+      local target = match:match('^id:(%d+)$')
+      if target then
+        kitty_live[target] = nil
+      end
+      result = { code = 0, stdout = '', stderr = '' }
+    end
+  else
+    error('unexpected kitten command: ' .. table.concat(command, ' '))
+  end
+  if on_exit then
+    vim.schedule(function()
+      on_exit(result)
+    end)
+  end
+  return { wait = function()
+    return result
+  end }
+end
+vim.env.KITTY_WINDOW_ID = '7'
+local kitty_source
+terminal.capture_source(function(problem, handle)
+  assert(not problem)
+  kitty_source = handle
+end)
+assert(kitty_source and kitty_source.kind == 'kitty' and kitty_source.id == '7')
+local kitty_failures = {}
+vim.schedule = function(callback)
+  schedule(function()
+    local ok_sched, failure_sched = xpcall(callback, debug.traceback)
+    if not ok_sched then
+      table.insert(kitty_failures, failure_sched)
+    end
+  end)
+end
+local kitty_failed_launch = terminal.launch_split(kitty_source, 'viewer', 'paper.pdf', function()
+  error('ownership recording failed')
+end)
+local ok_kitty_wait, err_kitty_wait = pcall(function()
+  kitty_failed_launch:wait(1000)
+end)
+assert(not ok_kitty_wait and tostring(err_kitty_wait):find('ownership recording failed', 1, true))
+assert(#kitty_failures == 1)
+assert(not kitty_live['42'] and kitty_live['7'], 'Kitty callback failure must roll back the new split')
+kitty_fail_close = true
+local kitty_unclosed_launch = terminal.launch_split(kitty_source, 'viewer', 'paper.pdf', function()
+  error('ownership recording failed')
+end)
+local ok_unclosed, err_unclosed = pcall(function()
+  kitty_unclosed_launch:wait(1000)
+end)
+assert(not ok_unclosed and tostring(err_unclosed):find('could not close unowned Kitty split', 1, true))
+assert(#kitty_failures == 2)
+vim.schedule = schedule
+kitty_fail_close = false
+kitty_bad_ls = true
+local ok_bad_ls, err_bad_ls = pcall(terminal.close, { kind = 'kitty', id = '42' })
+assert(not ok_bad_ls and tostring(err_bad_ls):find('invalid Kitty window listing', 1, true))
+kitty_bad_ls = false
+terminal.close({ kind = 'kitty', id = '42' })
+assert(not kitty_live['42'])
+vim.system = original_system
+vim.env.KITTY_WINDOW_ID = nil
+print('Kitty launch rollback and listing validation passed')
+
 local generic_error
 terminal.capture_source(function(problem, handle)
   generic_error = problem

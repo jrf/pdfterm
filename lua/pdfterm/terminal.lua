@@ -1,8 +1,43 @@
 -- Terminal control, not graphics: Kitty, Ghostty, and WezTerm render Kitty protocol.
 -- Handles identify exact surfaces; closing a handle gracefully quits its reader.
 local platform = require('pdfterm.platform')
+local M = {
+  root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h:h'),
+}
+package.loaded['pdfterm.terminal'] = M
+
+function M.shell_join(argv)
+  return table.concat(vim.tbl_map(function(arg)
+    return "'" .. tostring(arg):gsub("'", "'\\''") .. "'"
+  end, argv), ' ')
+end
+
+function M.rollback_result(id, problem, closed, close_error, label)
+  local result = { code = 1, stdout = closed and '' or id, stderr = problem }
+  if not closed then
+    result.unclosed = true
+    result.stderr = problem .. '; could not close unowned ' .. label .. ': ' .. tostring(close_error)
+  end
+  return result
+end
+
+function M.finish_launch(result, callback, close_fn, label)
+  local ok, failure = xpcall(callback, debug.traceback, result)
+  if ok then return end
+  local id = vim.trim(result.stdout or '')
+  if (result.code == 0 or result.unclosed) and id ~= '' then
+    local closed, close_error = pcall(close_fn, { id = id })
+    if not closed then
+      result.code, result.unclosed = 1, true
+      result.stderr = failure .. '; could not close unowned ' .. label .. ': ' .. tostring(close_error)
+      error(result.stderr)
+    end
+    result.unclosed = nil
+  end
+  error(failure)
+end
+
 local ghostty_control = require('pdfterm.ghostty')
-local M = {}
 local ghostty, neovide = {}, {}
 local adapters = {
   kitty = require('pdfterm.kitty'),
@@ -27,28 +62,27 @@ end run
 ]]
 
 local function finish_ghostty_launch(result, callback)
-  local ok, failure = xpcall(callback, debug.traceback, result)
-  if ok then
-    return
+  M.finish_launch(result, callback, ghostty.close, 'Ghostty surface')
+end
+
+-- Shared with scripts/pdfterm-ssh, which wraps the same body in the Ghostty tell block.
+local close_script_path = M.root .. '/scripts/ghostty-close.applescript'
+local close_script
+
+local function ensure_close_script()
+  if not close_script then
+    local file = assert(io.open(close_script_path, 'r'))
+    close_script = 'on run argv\ntell application "Ghostty"\n' .. file:read('*a') .. 'end tell\nend run\n'
+    file:close()
   end
-  local id = vim.trim(result.stdout or '')
-  if (result.code == 0 or result.unclosed) and id ~= '' then
-    local closed, close_error = pcall(ghostty.close, { id = id })
-    if not closed then
-      result.code, result.unclosed = 1, true
-      result.stderr = failure .. '; could not close unowned Ghostty surface: ' .. tostring(close_error)
-      error(result.stderr)
-    end
-    result.unclosed = nil
-  end
-  error(failure)
+  return close_script
 end
 
 function ghostty.launch(source, argv, callback)
-  local command = table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' ')
+  ensure_close_script()
   return platform.applescript(
     split_script,
-    { command, source.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' },
+    { M.shell_join(argv), source.id, vim.env.PATH, vim.env.XDG_CONFIG_HOME or '' },
     vim.schedule_wrap(function(split)
       if split.code ~= 0 then
         finish_ghostty_launch(split, callback)
@@ -69,16 +103,13 @@ function ghostty.launch(source, argv, callback)
           return
         end
         local closed, close_error = pcall(ghostty.close, { id = id })
-        local result = {
-          code = 1,
-          stdout = closed and '' or id,
-          stderr = 'pdfterm: could not refocus Ghostty source: ' .. (focus.stderr or ''),
-        }
-        if not closed then
-          result.unclosed = true
-          result.stderr = result.stderr .. '; could not close unowned Ghostty surface: ' .. tostring(close_error)
-        end
-        finish_ghostty_launch(result, callback)
+        finish_ghostty_launch(M.rollback_result(
+          id,
+          'pdfterm: could not refocus Ghostty source: ' .. (focus.stderr or ''),
+          closed,
+          close_error,
+          'Ghostty surface'
+        ), callback)
       end
       local focused, focus_error = pcall(ghostty.focus, source, vim.schedule_wrap(refocused))
       if not focused then
@@ -93,24 +124,7 @@ function ghostty.focus(source, callback)
 end
 
 function ghostty.close(split)
-  local result = platform
-    .applescript(
-      [[
-on run argv
-  tell application "Ghostty"
-    repeat 20 times
-      if not (exists terminal id (item 1 of argv)) then return
-      -- Ctrl-C quits the reader; another key dismisses Ghostty's retained exit screen.
-      send key "c" modifiers "control" to terminal id (item 1 of argv)
-      delay 0.1
-    end repeat
-    if exists terminal id (item 1 of argv) then error "owned PDF split did not exit"
-  end tell
-end run
-]],
-      { split.id }
-    )
-    :wait()
+  local result = platform.applescript(ensure_close_script(), { split.id }):wait()
   if result.code ~= 0 then
     error('pdfterm: could not close owned PDF split: ' .. (result.stderr or ''))
   end
@@ -123,6 +137,7 @@ function neovide.capture(callback)
 end
 
 function neovide.launch(_, argv, callback)
+  ensure_close_script()
   return platform.applescript(
     [[
 on run argv
@@ -137,7 +152,7 @@ on run argv
 end run
 ]],
     {
-      table.concat(vim.tbl_map(vim.fn.shellescape, argv), ' '),
+      M.shell_join(argv),
       vim.env.PATH,
       vim.env.XDG_CONFIG_HOME or '',
     },
@@ -207,7 +222,7 @@ end
 -- Callback runs before scheduling editor work so VimLeavePre can retain ownership
 -- even when it is waiting for an in-flight launch to finish.
 function M.launch_split(source, executable, pdf, callback, session, focus_token)
-  local argv = { executable, pdf }
+  local argv = { executable, pdf, '--synctex-best-guess' }
   if session then
     vim.list_extend(argv, { '--session', session })
   end

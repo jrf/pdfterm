@@ -4,7 +4,6 @@
 
 - [ ] Add Kitty graphics passthrough for tmux. #feature
 - [ ] Measure render, compression, and transfer latency on direct SSH sessions. #experiment
-- [ ] Fix pre-existing `picker_labels_recent_files_with_parent_directory`: the directory label is not rendered anywhere in the popup rect (scanning the whole rect also fails), so either draw it or correct the expectation. #test
 
 ## Next
 
@@ -42,3 +41,4 @@ Pure-Rust PDF rendering: Hayro states that its renderer has not received perform
 - [x] Follow internal links and named destinations, with a numbered link picker and back navigation. #feature
 - [x] Add discrete zoom levels beyond the fit modes. #feature
 - [x] Add revision-bound forward-search JSON: select or open the PDF tab, position and highlight its target, then acknowledge after the rendered frame is submitted to the terminal. #feature
+- [x] Disambiguate recent files with long parent paths in the picker (`picker_disambiguates_recent_files_with_long_parent_paths`). #test

@@ -1,7 +1,13 @@
 -- Run with PDFTERM_EXECUTABLE set, like tests/nvim.lua.
 local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root)
-local binary = assert(vim.env.PDFTERM_EXECUTABLE)
+local binary = assert(
+  vim.env.PDFTERM_EXECUTABLE
+    or (vim.fn.executable(root .. '/target/debug/pdfterm') == 1 and (root .. '/target/debug/pdfterm'))
+    or (vim.fn.executable(root .. '/target/release/pdfterm') == 1 and (root .. '/target/release/pdfterm'))
+    or (vim.fn.exepath('pdfterm') ~= '' and vim.fn.exepath('pdfterm')),
+  'set PDFTERM_EXECUTABLE to a built viewer'
+)
 local function wait(predicate)
   assert(vim.wait(10000, predicate, 2), 'session operation timed out')
 end
@@ -22,17 +28,22 @@ if case then
     return
   end
   local messages = {}
-  vim.notify = function(message)
+  vim.notify = function(message, level)
     messages[#messages + 1] = tostring(message)
   end
+  local clipboard_writes = 0
   local copied
+  local function record_clipboard_write()
+    clipboard_writes = clipboard_writes + 1
+  end
   vim.g.clipboard = {
     name = 'test clipboard',
     copy = {
       ['+'] = function(lines)
+        record_clipboard_write()
         copied = table.concat(lines, '\n')
       end,
-      ['*'] = function() end,
+      ['*'] = record_clipboard_write,
     },
     paste = {
       ['+'] = function() return {}, 'v' end,
@@ -112,10 +123,13 @@ if case then
     ticks = ticks + 1
   end)
   local pdf = directory .. '/a document\'s.pdf'
-  adapter.viewer_command(pdf)
-  wait(function()
-    return #messages > 0
+  local success, failure = pcall(function()
+    adapter.viewer_command(pdf)
+    wait(function()
+      return #messages > 0
+    end)
   end)
+  assert(success, failure)
   timer:stop()
   timer:close()
   if case ~= 'defaults' then
@@ -129,7 +143,10 @@ if case then
     return
   end
   local command = messages[1]
-  assert(copied == command, 'viewer command was not sent to clipboard')
+  assert(
+    clipboard_writes == 1 and copied == command,
+    'manual pairing did not copy its launch command'
+  )
   local resolved = vim
     .system({ '/bin/sh', '-c', command .. ' --print-config' }, { text = true })
     :wait(10000)
@@ -154,12 +171,14 @@ if case then
     return vim.api.nvim_buf_get_name(0) == source
   end)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 3 }), 'inverse-first pairing failed')
+  assert(clipboard_writes == 1 and copied == command, 'inverse navigation changed the clipboard')
   adapter.forward_search(pdf, '{}', { kind = 'kitty', id = '123' })
   wait(function()
     return #messages > 1
   end)
   assert(messages[2]:find('PdfTermViewerCommand', 1, true), messages[2])
   assert(messages[2]:match('viewer unavailable'), messages[2])
+  assert(clipboard_writes == 1 and copied == command, 'forward navigation changed the clipboard')
   print(vim.json.encode({
     case = case,
     setup_ns = setup_ns,

@@ -3,65 +3,10 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+pub use synctex_parser::{NAVIGATION_TIMEOUT, Operation};
 
-pub const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
-
-#[derive(Clone)]
-pub struct Operation {
-    cancelled: Arc<AtomicBool>,
-    deadline: Instant,
-}
-impl Operation {
-    pub fn new(timeout: Duration) -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            deadline: Instant::now() + timeout,
-        }
-    }
-    /// Keep the parent's cancellation while applying a shorter helper deadline.
-    pub fn limited(&self, timeout: Duration) -> Self {
-        Self {
-            cancelled: Arc::clone(&self.cancelled),
-            deadline: self.deadline.min(Instant::now() + timeout),
-        }
-    }
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-    pub fn remaining(&self) -> io::Result<Duration> {
-        self.check()?;
-        Ok(self.deadline.saturating_duration_since(Instant::now()))
-    }
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-    pub fn check(&self) -> io::Result<()> {
-        if self.cancelled.load(Ordering::Acquire) {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "navigation cancelled",
-            ))
-        } else if Instant::now() >= self.deadline {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "navigation timed out",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-}
-impl Default for Operation {
-    fn default() -> Self {
-        Self::new(NAVIGATION_TIMEOUT)
-    }
-}
 
 struct ChildGroup(Child);
 impl Drop for ChildGroup {
@@ -130,13 +75,31 @@ pub fn output(command: &mut Command, operation: &Operation) -> io::Result<Output
                 stderr: err,
             });
         }
-        std::thread::sleep(Duration::from_millis(2));
+        if out_done && err_done {
+            std::thread::sleep(Duration::from_millis(2));
+        } else {
+            let timeout = operation.remaining()?.min(Duration::from_millis(20));
+            let mut fds = [
+                libc::pollfd {
+                    fd: if out_done { -1 } else { stdout.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if err_done { -1 } else { stderr.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout.as_millis().max(1) as i32) };
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     #[test]
     fn stalled_and_noisy_helpers_are_bounded() {
         let started = Instant::now();

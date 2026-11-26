@@ -127,6 +127,20 @@ local ok, error = pcall(function()
 end)
 vim.fn.delete(directory, 'rf')
 assert(ok, error)
+if vim.uv.os_uname().sysname == 'Darwin' then
+  local source = table.concat(vim.fn.readfile(root .. '/scripts/ghostty-control.js'), '\n')
+  local probe = source
+    .. '\nfunction run() {\n'
+    .. '  const bytes = [];\n'
+    .. '  for (;;) { const b = $.getchar(); if (b === -1 || b === 10) break; bytes.push(b); }\n'
+    .. '  $.puts(JSON.parse(decodeUtf8(bytes)).id);\n'
+    .. '}\n'
+  local jxa = vim.system({ 'osascript', '-l', 'JavaScript', '-e', probe }, {
+    stdin = '{"id":"zibble-é-Ω-𐍈"}\n',
+    text = true,
+  }):wait()
+  assert(jxa.code == 0 and vim.trim(jxa.stdout) == 'zibble-é-Ω-𐍈', jxa.stderr)
+end
 print(
   'Ghostty helper regressions passed: 1024 routed requests, timeout, crash, malformed/oversized replies, editor exit'
 )

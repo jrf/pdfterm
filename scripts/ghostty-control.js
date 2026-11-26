@@ -3,19 +3,27 @@ ObjC.bindFunction('getchar', ['int', []]);
 ObjC.bindFunction('puts', ['int', ['char *']]);
 ObjC.bindFunction('fflush', ['int', ['void *']]);
 
+function decodeUtf8(bytes) {
+  let encoded = '';
+  for (let i = 0; i < bytes.length; i++) {
+    encoded += '%' + bytes[i].toString(16).padStart(2, '0');
+  }
+  return decodeURIComponent(encoded);
+}
+
 function run() {
   const ghostty = Application('com.mitchellh.ghostty');
-  let line = '';
+  const bytes = [];
   for (;;) {
     const byte = $.getchar();
     if (byte === -1) return;
     if (byte !== 10) {
-      if (line.length >= 4096) throw new Error('Ghostty request exceeds 4096 bytes');
-      line += String.fromCharCode(byte);
+      if (bytes.length >= 4096) throw new Error('Ghostty request exceeds 4096 bytes');
+      bytes.push(byte);
       continue;
     }
-    const request = JSON.parse(line);
-    line = '';
+    const request = JSON.parse(decodeUtf8(bytes));
+    bytes.length = 0;
     if (!Number.isSafeInteger(request.seq) || request.seq < 1) {
       throw new Error('Invalid Ghostty request sequence');
     }

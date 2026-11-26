@@ -9,16 +9,21 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub(crate) fn valid_socket_path(path: &str) -> bool {
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    !path.as_bytes().contains(&0) && path.len() < address.sun_path.len()
+}
+
 /// Cancellable connection, including a saturated Unix listener backlog.
 pub(crate) fn connect(path: &str, operation: &crate::process::Operation) -> io::Result<UnixStream> {
     use std::os::fd::FromRawFd;
     operation.check()?;
+    if !valid_socket_path(path) {
+        return Err(io::Error::other("invalid Unix socket path"));
+    }
     // Zero initialization supplies the trailing NUL and optional platform fields.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     let bytes = path.as_bytes();
-    if bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
-        return Err(io::Error::other("invalid Unix socket path"));
-    }
     address.sun_family = libc::AF_UNIX as _;
     for (to, from) in address.sun_path.iter_mut().zip(bytes) {
         *to = *from as _;
@@ -74,32 +79,55 @@ pub(crate) fn connect(path: &str, operation: &crate::process::Operation) -> io::
     }
 }
 
+pub(crate) fn poll_fd(
+    fd: std::os::fd::RawFd,
+    events: libc::c_short,
+    timeout_ms: i32,
+) -> io::Result<libc::c_short> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        descriptor.revents = 0;
+        let rc = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                if timeout_ms != 0 {
+                    return Ok(0);
+                }
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(if rc == 0 { 0 } else { descriptor.revents });
+    }
+}
+
+fn wait_fd(
+    fd: std::os::fd::RawFd,
+    events: libc::c_short,
+    operation: &crate::process::Operation,
+) -> io::Result<()> {
+    loop {
+        let timeout = operation.remaining()?.min(Duration::from_millis(50));
+        let revents = poll_fd(fd, events, timeout.as_millis().max(1) as i32)?;
+        operation.check()?;
+        if revents != 0 {
+            return Ok(());
+        }
+    }
+}
+
 fn wait_socket(
     stream: &UnixStream,
     events: libc::c_short,
     operation: &crate::process::Operation,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    loop {
-        let timeout = operation.remaining()?.min(Duration::from_millis(50));
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis().max(1) as i32) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        operation.check()?;
-        if ready > 0 {
-            return Ok(());
-        }
-    }
+    wait_fd(stream.as_raw_fd(), events, operation)
 }
 
 pub(crate) fn send(
@@ -128,6 +156,12 @@ pub(crate) fn send(
         }
     }
 }
+
+pub(crate) fn is_owned_with_mask(metadata: &fs::Metadata, forbidden_mode: u32) -> bool {
+    // SAFETY: geteuid takes no arguments and has no failure mode.
+    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & forbidden_mode == 0
+}
+
 /// Only the current user may traverse directories containing IPC or native code.
 pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
@@ -136,13 +170,34 @@ pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let metadata = fs::symlink_metadata(path)?;
-    // SAFETY: geteuid takes no arguments and has no failure mode.
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+    if !metadata.is_dir() || !is_owned_with_mask(&metadata, 0o077) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
                 "{} must be a real directory owned by the current user with mode 0700",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_private_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("socket path has no parent"))?;
+    let directory = fs::symlink_metadata(parent)?;
+    let socket = fs::symlink_metadata(path)?;
+    if !directory.is_dir()
+        || !is_owned_with_mask(&directory, 0o077)
+        || !socket.file_type().is_socket()
+        || !is_owned_with_mask(&socket, 0o077)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be a private current-user-owned socket",
                 path.display()
             ),
         ));
@@ -210,33 +265,52 @@ pub enum ViewerRequest {
     Forward(ForwardRequest),
     Screenshot(PathBuf),
     Focus(String),
+    Quit,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FocusRequest {
+struct ControlEnvelope {
     #[serde(rename = "type")]
     kind: String,
-    viewer_token: String,
+    path: Option<PathBuf>,
+    viewer_token: Option<String>,
 }
 
-fn parse_focus_request(payload: &str) -> io::Result<String> {
-    let request: FocusRequest = serde_json::from_str(payload)?;
-    if request.kind != "focus"
-        || request.viewer_token.len() != 32
-        || !request
+fn parse_control_request(payload: &str) -> Option<io::Result<ViewerRequest>> {
+    let control = serde_json::from_str::<ControlEnvelope>(payload).ok()?;
+    Some(match control.kind.as_str() {
+        "screenshot" if control.viewer_token.is_none() => {
+            let Some(path) = control.path else {
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "screenshot request has no path",
+                )));
+            };
+            validate_screenshot_path(&path).map(|()| ViewerRequest::Screenshot(path))
+        }
+        "focus" if control.path.is_none() => control
             .viewer_token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(io::Error::new(
+            .filter(|token| token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(ViewerRequest::Focus)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid focus request")),
+        "quit" if control.path.is_none() && control.viewer_token.is_none() => {
+            Ok(ViewerRequest::Quit)
+        }
+        _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid focus request",
-        ));
-    }
-    Ok(request.viewer_token)
+            "invalid control request",
+        )),
+    })
 }
+
+fn parse_viewer_request(payload: &str) -> io::Result<ViewerRequest> {
+    parse_control_request(payload)
+        .unwrap_or_else(|| parse_forward_request(payload).map(ViewerRequest::Forward))
+}
+
 pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One terminal reply per connection, including unwinding/normal viewer shutdown.
 pub struct ForwardReply(Option<UnixStream>);
@@ -251,18 +325,10 @@ impl ForwardReply {
         let Some(stream) = self.0.as_ref() else {
             return Ok(true);
         };
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
         // Poll the WRITE side: on macOS, a read-side HUP also occurs for the
         // normal request half-close, and events=0 does not report peer closure.
-        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0)
+        let revents = poll_fd(stream.as_raw_fd(), libc::POLLOUT, 0)?;
+        Ok(revents & (libc::POLLHUP | libc::POLLERR) != 0)
     }
 
     pub fn finish(&mut self, error: Option<String>) {
@@ -273,13 +339,7 @@ impl ForwardReply {
         let Some(mut stream) = self.0.take() else {
             return;
         };
-        let error = error.map(|message| {
-            if message.len() <= 512 {
-                message
-            } else {
-                format!("{}…", message.chars().take(512).collect::<String>())
-            }
-        });
+        let error = error.map(truncate_reply_error);
         let reply = ReplyBody {
             ok: error.is_none(),
             error: error.as_deref(),
@@ -298,20 +358,28 @@ impl ForwardReply {
     }
 }
 
+fn truncate_reply_error(message: String) -> String {
+    match message.char_indices().nth(512) {
+        Some((idx, _)) => format!("{}…", &message[..idx]),
+        None => message,
+    }
+}
+
 impl Drop for ForwardReply {
     fn drop(&mut self) {
         self.finish(Some("viewer stopped before request completion".into()));
     }
 }
 
-fn request_reply(
-    socket: &str,
-    bytes: &[u8],
+pub(crate) fn read_json_reply<R, T>(
+    stream: &mut R,
     kind: &str,
     operation: &crate::process::Operation,
-) -> io::Result<()> {
-    let mut stream = connect(socket, operation)?;
-    send(&mut stream, bytes, operation)?;
+) -> io::Result<T>
+where
+    R: Read + std::os::fd::AsRawFd,
+    T: serde::de::DeserializeOwned,
+{
     let mut response = [0; 4097];
     let mut length = 0;
     loop {
@@ -325,24 +393,48 @@ fn request_reply(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                wait_socket(&stream, libc::POLLIN, operation)?;
+                wait_fd(stream.as_raw_fd(), libc::POLLIN, operation)?;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
     operation.check()?;
+    if length > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{kind} reply exceeds 4096 bytes"),
+        ));
+    }
     let response = std::str::from_utf8(&response[..length]).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "stream did not contain valid UTF-8",
         )
     })?;
-    if length > 4096 {
-        return Err(io::Error::other(format!("{kind} reply exceeds 4096 bytes")));
-    }
-    let reply: Reply = serde_json::from_str(response)?;
+    let reply = serde_json::from_str(response)?;
     operation.check()?;
+    Ok(reply)
+}
+
+pub(crate) fn exchange<T: serde::de::DeserializeOwned>(
+    socket: &str,
+    bytes: &[u8],
+    kind: &str,
+    operation: &crate::process::Operation,
+) -> io::Result<T> {
+    let mut stream = connect(socket, operation)?;
+    send(&mut stream, bytes, operation)?;
+    read_json_reply(&mut stream, kind, operation)
+}
+
+fn request_reply(
+    socket: &str,
+    bytes: &[u8],
+    kind: &str,
+    operation: &crate::process::Operation,
+) -> io::Result<()> {
+    let reply: Reply = exchange(socket, bytes, kind, operation)?;
     if reply.ok {
         Ok(())
     } else {
@@ -359,14 +451,14 @@ pub fn forward(path: &str, request: &ForwardRequest) -> io::Result<()> {
     request.validate()?;
     request_reply(path, &serde_json::to_vec(request)?, "forward", &operation)
 }
-fn validate_screenshot_path(path: &Path) -> io::Result<()> {
+pub(crate) fn validate_screenshot_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "screenshot output path must be absolute",
         ));
     }
-    if path.exists() {
+    if fs::symlink_metadata(path).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("screenshot output already exists: {}", path.display()),
@@ -386,6 +478,9 @@ pub fn screenshot(socket: &str, path: &Path) -> io::Result<()> {
     )
 }
 
+// JSON escaping and path/word metadata need room beyond the 4096-byte warning.
+const MAX_VIEWER_REQUEST_BYTES: usize = 64 * 1024;
+
 /// Incremental request reads. A slow client never sleeps on the event thread.
 struct Incoming {
     stream: UnixStream,
@@ -404,10 +499,10 @@ impl Incoming {
                     );
                 }
                 Ok(n) => {
-                    if self.bytes.len() + n > 4096 {
+                    if self.bytes.len() + n > MAX_VIEWER_REQUEST_BYTES {
                         return Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "viewer request exceeds 4096 bytes",
+                            format!("viewer request exceeds {MAX_VIEWER_REQUEST_BYTES} bytes"),
                         )));
                     }
                     self.bytes.extend_from_slice(&buffer[..n]);
@@ -420,7 +515,7 @@ impl Incoming {
         (Instant::now() >= self.deadline).then(|| {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "viewer request did not reach EOF within 100ms",
+                "viewer request did not reach EOF within 5s",
             ))
         })
     }
@@ -437,37 +532,60 @@ impl ForwardListener {
             clients: Vec::new(),
         })
     }
+    pub fn has_in_flight_clients(&self) -> bool {
+        !self.clients.is_empty()
+    }
     /// Wake modal UI without consuming the request; the main loop owns delivery.
     pub fn has_pending(&self) -> io::Result<bool> {
         use std::os::fd::AsRawFd;
-        if !self.clients.is_empty() {
+        let now = Instant::now();
+        if self.clients.iter().any(|client| {
+            now >= client.deadline
+                || poll_fd(client.stream.as_raw_fd(), libc::POLLIN, 0).unwrap_or(0) != 0
+        }) {
             return Ok(true);
         }
-        let mut descriptor = libc::pollfd {
-            fd: self.listener.socket.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
-            return Err(io::Error::last_os_error());
+        if self.clients.len() >= 16 {
+            return Ok(false);
         }
-        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        let revents = poll_fd(self.listener.socket.as_raw_fd(), libc::POLLIN, 0)?;
+        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(io::Error::other("forward listener is unavailable"));
         }
-        Ok(descriptor.revents & libc::POLLIN != 0)
+        Ok(revents & libc::POLLIN != 0)
     }
     pub fn poll(&mut self) -> io::Result<Vec<(io::Result<ViewerRequest>, ForwardReply)>> {
-        for _ in self.clients.len()..16 {
+        while self.clients.len() < 16 {
             match self.listener.socket.accept() {
                 Ok((stream, _)) => {
-                    stream.set_nonblocking(true)?;
-                    self.clients.push(Incoming {
-                        stream,
-                        bytes: Vec::new(),
-                        deadline: Instant::now() + Duration::from_millis(100),
-                    });
+                    if stream.set_nonblocking(true).is_ok() {
+                        self.clients.push(Incoming {
+                            stream,
+                            bytes: Vec::new(),
+                            deadline: Instant::now() + REQUEST_READ_TIMEOUT,
+                        });
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                    ) =>
+                {
+                    break;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -476,27 +594,7 @@ impl ForwardListener {
         while index < self.clients.len() {
             if let Some(result) = self.clients[index].poll() {
                 let client = self.clients.remove(index);
-                let request = result.and_then(|payload| {
-                    let value: serde_json::Value = serde_json::from_str(&payload)?;
-                    match value.get("type").and_then(serde_json::Value::as_str) {
-                        Some("screenshot") => {
-                            let path = value
-                                .get("path")
-                                .and_then(serde_json::Value::as_str)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "screenshot request has no path",
-                                    )
-                                })?;
-                            let path = PathBuf::from(path);
-                            validate_screenshot_path(&path)?;
-                            Ok(ViewerRequest::Screenshot(path))
-                        }
-                        Some("focus") => parse_focus_request(&payload).map(ViewerRequest::Focus),
-                        _ => parse_forward_request(&payload).map(ViewerRequest::Forward),
-                    }
-                });
+                let request = result.and_then(|payload| parse_viewer_request(&payload));
                 ready.push((request, ForwardReply::new(client.stream)));
             } else {
                 index += 1;
@@ -553,18 +651,18 @@ mod tests {
     #[test]
     fn focus_request_is_strict_and_replies_without_a_viewer_token() {
         let token = "0123456789abcdef0123456789abcdef";
-        assert_eq!(
-            parse_focus_request(&format!(r#"{{"type":"focus","viewer_token":"{token}"}}"#))
+        assert!(matches!(
+            parse_viewer_request(&format!(r#"{{"type":"focus","viewer_token":"{token}"}}"#))
                 .unwrap(),
-            token
-        );
+            ViewerRequest::Focus(value) if value == token
+        ));
         for payload in [
             r#"{"type":"focus","viewer_token":"bad"}"#,
             r#"{"type":"focus","viewer_token":"0123456789abcdef0123456789abcdef","extra":true}"#,
             r#"{"type":"screenshot","viewer_token":"0123456789abcdef0123456789abcdef"}"#,
         ] {
             assert_eq!(
-                parse_focus_request(payload).unwrap_err().kind(),
+                parse_viewer_request(payload).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
         }
@@ -589,6 +687,34 @@ mod tests {
     }
 
     #[test]
+    fn quit_request_is_strict_and_replies_without_a_viewer_token() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private/quit.sock");
+        let mut listener = ForwardListener::bind(&path).unwrap();
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(br#"{"type":"quit"}"#).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (request, mut reply) = listener.poll().unwrap().into_iter().next().unwrap();
+        assert!(matches!(request.unwrap(), ViewerRequest::Quit));
+        reply.finish(None);
+        let mut payload = String::new();
+        client.read_to_string(&mut payload).unwrap();
+        let response: Reply = serde_json::from_str(&payload).unwrap();
+        assert!(response.ok);
+        assert!(response.error.is_none());
+        assert!(response._viewer_token.is_none());
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(br#"{"type":"quit","extra":true}"#)
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (request, _reply) = listener.poll().unwrap().into_iter().next().unwrap();
+        assert_eq!(request.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn abandoned_forward_reply_reports_failure_and_detects_disconnection() {
         let (mut client, server) = UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
@@ -601,7 +727,14 @@ mod tests {
 
         let (client, server) = UnixStream::pair().unwrap();
         let reply = ForwardReply::new(server);
+        let _ = client.shutdown(Shutdown::Both);
         drop(client);
+        // Concurrent test threads spawning subprocesses during the non-atomic
+        // socketpair()+FIOCLEX window on macOS can briefly inherit the fd until execve.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !reply.disconnected().unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(reply.disconnected().unwrap());
     }
 
@@ -657,6 +790,73 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "replacement");
     }
 
+    fn poll_viewer_request(
+        listener: &mut ForwardListener,
+    ) -> (io::Result<ViewerRequest>, ForwardReply) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut ready = listener.poll().unwrap();
+            if !ready.is_empty() {
+                assert_eq!(ready.len(), 1);
+                return ready.pop().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "viewer request was not dispatched"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn maximum_warning_forward_requests_dispatch_and_acknowledge() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("private/forward.sock");
+        let mut listener = ForwardListener::bind(&socket).unwrap();
+        let pdf = root.path().join("document.pdf");
+        fs::write(&pdf, b"revision fixture").unwrap();
+        for warning in [
+            "w".repeat(crate::synctex::MAX_WARNING_BYTES),
+            "\"\\".repeat(crate::synctex::MAX_WARNING_BYTES / 2),
+        ] {
+            let request = ForwardRequest {
+                revision: crate::synctex::PdfRevision::read(&pdf).unwrap(),
+                pdf: pdf.clone(),
+                page: 1,
+                h: 10.0,
+                v: 20.0,
+                width: 5.0,
+                height: 5.0,
+                word: Some(crate::synctex::ForwardWord {
+                    words: vec!["w".repeat(128); 7],
+                    selected: 3,
+                }),
+                inverse_search: Some(
+                    root.path()
+                        .join("private/inverse.sock")
+                        .display()
+                        .to_string(),
+                ),
+                best_guess: true,
+                warning: Some(warning),
+            };
+            request.validate().unwrap();
+            let payload = serde_json::to_vec(&request).unwrap();
+            assert!(payload.len() > 4096);
+            assert!(payload.len() <= MAX_VIEWER_REQUEST_BYTES);
+            let socket = socket.clone();
+            let expected = serde_json::to_value(&request).unwrap();
+            let client = std::thread::spawn(move || forward(socket.to_str().unwrap(), &request));
+            let (received, mut reply) = poll_viewer_request(&mut listener);
+            let ViewerRequest::Forward(received) = received.unwrap() else {
+                panic!("forward request was not dispatched");
+            };
+            assert_eq!(serde_json::to_value(received).unwrap(), expected);
+            reply.finish(None);
+            client.join().unwrap().unwrap();
+        }
+    }
+
     #[test]
     fn incomplete_clients_do_not_block_complete_requests_or_future_connections() {
         let root = tempfile::tempdir().unwrap();
@@ -678,18 +878,20 @@ mod tests {
             expired[0].0.as_ref().unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
-        let mut next = UnixStream::connect(&path).unwrap();
-        next.write_all(&vec![b'x'; 4097]).unwrap();
-        drop(next); // Also exercises a full peer close before acceptance on macOS.
-        let oversized = listener.poll().unwrap();
-        assert_eq!(oversized.len(), 1);
-        assert!(
-            oversized[0]
-                .0
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("4096")
+        let next = UnixStream::connect(&path).unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut next = next;
+            next.write_all(&vec![b'x'; MAX_VIEWER_REQUEST_BYTES + 1])
+                .unwrap();
+            drop(next); // Also exercises a full peer close on macOS.
+        });
+        let (oversized, _) = poll_viewer_request(&mut listener);
+        writer.join().unwrap();
+        let error = oversized.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!("viewer request exceeds {MAX_VIEWER_REQUEST_BYTES} bytes")
         );
     }
 
@@ -745,6 +947,8 @@ mod tests {
                 height: 5.0,
                 word: None,
                 inverse_search: None,
+                best_guess: false,
+                warning: None,
             };
             let output = root.path().join("capture.png");
             let expected = if kind == "forward" {
@@ -801,7 +1005,9 @@ mod tests {
                         Err(error)
                             if matches!(
                                 error.kind(),
-                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                                io::ErrorKind::BrokenPipe
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::NotConnected
                             ) =>
                         {
                             break;
@@ -951,6 +1157,31 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
             assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn reply_truncation_counts_chars_and_size_cap_precedes_utf8_and_dangling_symlink_rejected() {
+        let exact = "é".repeat(512);
+        assert_eq!(super::truncate_reply_error(exact.clone()), exact);
+        let over = "é".repeat(513);
+        assert_eq!(super::truncate_reply_error(over), format!("{exact}…"));
+
+        #[cfg(unix)]
+        {
+            let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            writer.write_all(&[0xffu8; 4097]).unwrap();
+            drop(writer);
+            let op = crate::process::Operation::new(Duration::from_secs(1));
+            let err = super::read_json_reply::<_, serde_json::Value>(&mut reader, "forward", &op)
+                .unwrap_err();
+            assert!(err.to_string().contains("exceeds 4096 bytes"), "{err}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("dangling.png");
+            std::os::unix::fs::symlink(dir.path().join("missing-target.png"), &link).unwrap();
+            let err = super::validate_screenshot_path(&link).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         }
     }
 }

@@ -18,6 +18,14 @@ pub enum Editor {
     },
 }
 
+#[derive(Serialize)]
+struct EditorLocation<'a> {
+    #[serde(flatten)]
+    location: &'a SourceLocation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'a str>,
+}
+
 impl Editor {
     pub(crate) fn socket_mut(&mut self) -> Option<&mut String> {
         match self {
@@ -32,11 +40,7 @@ impl Editor {
                 Err(io::Error::other("editor socket path must not be empty"))
             }
             Self::Command { argv } => {
-                if argv.is_empty() || argv[0].is_empty() || argv[0].contains(['{', '}']) {
-                    return Err(io::Error::other(
-                        "editor command requires a literal executable as argv[0]",
-                    ));
-                }
+                validate_command_head(argv)?;
                 let sample = SourceLocation {
                     file: String::new(),
                     line: 1,
@@ -54,16 +58,25 @@ impl Editor {
         }
     }
 
-    pub fn deliver(&self, location: &SourceLocation, operation: &Operation) -> io::Result<()> {
+    pub fn deliver(
+        &self,
+        location: &SourceLocation,
+        operation: &Operation,
+        warning: Option<&str>,
+    ) -> io::Result<()> {
         operation.check()?;
         match self {
             Self::None => Ok(()),
             Self::Socket { path } => {
                 let mut stream = crate::ipc::connect(path, operation)?;
-                crate::ipc::send(&mut stream, &serde_json::to_vec(location)?, operation)
+                crate::ipc::send(
+                    &mut stream,
+                    &serde_json::to_vec(&EditorLocation { location, warning })?,
+                    operation,
+                )
             }
             Self::Command { argv } => {
-                self.validate()?;
+                validate_command_head(argv)?;
                 let arguments = argv[1..]
                     .iter()
                     .map(|argument| expand(argument, location))
@@ -82,6 +95,15 @@ impl Editor {
             }
         }
     }
+}
+
+fn validate_command_head(argv: &[String]) -> io::Result<()> {
+    if argv.is_empty() || argv[0].is_empty() || argv[0].contains(['{', '}']) {
+        return Err(io::Error::other(
+            "editor command requires a literal executable as argv[0]",
+        ));
+    }
+    Ok(())
 }
 
 fn expand(template: &str, location: &SourceLocation) -> io::Result<String> {
@@ -139,7 +161,9 @@ mod tests {
             column_char: 3,
             precise: true,
         };
-        editor.deliver(&location, &Operation::default()).unwrap();
+        editor
+            .deliver(&location, &Operation::default(), None)
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
             format!("{}\n7:4:3:5:6\n", location.file)
@@ -148,7 +172,7 @@ mod tests {
             Editor::Command {
                 argv: vec!["false".into()]
             }
-            .deliver(&location, &Operation::default())
+            .deliver(&location, &Operation::default(), None)
             .is_err()
         );
         assert!(

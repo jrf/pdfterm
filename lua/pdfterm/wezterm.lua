@@ -95,33 +95,23 @@ function M.launch(source, argv, callback)
         return
       end
       remote(handle.socket, { 'activate-pane', '--pane-id', handle.pane }, vim.schedule_wrap(function(focus)
+        local terminal = require('pdfterm.terminal')
+        local encoded = encode(handle.socket, viewer)
         if focus.code ~= 0 then
           -- A successful split is provisional until the editor receives its handle.
           remote(handle.socket, { 'kill-pane', '--pane-id', viewer }, vim.schedule_wrap(function(rollback)
-            local problem = 'pdfterm: could not refocus WezTerm source: ' .. (focus.stderr or '')
-            if rollback.code ~= 0 then
-              -- Keep the exact handle for VimLeavePre if the provisional pane survived.
-              callback({
-                code = 1,
-                stdout = encode(handle.socket, viewer),
-                stderr = problem .. '; could not close unowned pane: ' .. (rollback.stderr or ''),
-                unclosed = true,
-              })
-            else
-              report(callback, problem)
-            end
+            callback(terminal.rollback_result(
+              encoded,
+              'pdfterm: could not refocus WezTerm source: ' .. (focus.stderr or ''),
+              rollback.code == 0,
+              rollback.stderr or '',
+              'pane'
+            ))
           end))
           return
         end
-        split.stdout = encode(handle.socket, viewer)
-        local accepted, failure = xpcall(callback, debug.traceback, split)
-        if not accepted then
-          local closed, close_error = pcall(M.close, { id = split.stdout })
-          if not closed then
-            error(failure .. '; could not close unowned WezTerm pane: ' .. tostring(close_error))
-          end
-          error(failure)
-        end
+        split.stdout = encoded
+        terminal.finish_launch(split, callback, M.close, 'WezTerm pane')
       end))
     end))
   end))
